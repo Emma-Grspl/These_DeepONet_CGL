@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Environnements virtuels
+venv/
+env/
+.env
+
+# Fichiers Systèmes
+.DS_Store
+Thumbs.db
+
+# Dossiers de sortie (On ne veut pas versionner les logs ou les checkpoints lourds)
+outputs/logs/
+outputs/checkpoints/
+outputs/plots/
+# On garde le dossier outputs mais pas son contenu, sauf un fichier vide pour git
+outputs/*
+!outputs/.gitkeep
+
+# IDE
+.vscode/
+.idea/
+
+# Fichiers zip de transfert
+*.zip

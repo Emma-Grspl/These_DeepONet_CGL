@@ -1,0 +1,56 @@
+experiment_name: "Gaussian_Diffraction_Linear"
+device: "cuda"
+
+physics:
+  wavelength: 0.0008
+  k: 7853.98
+  r_max: 20.0
+  z_max: 2000.0
+  bounds:
+    A: [0.1, 1.0]
+    w0: [0.5, 2.0]
+    f: [500.0, 10000.0]
+
+model:
+  branch_dim: 3
+  trunk_dim: 2
+  latent_dim: 128
+  fourier_scales: [1.0, 2.0, 5.0, 10.0, 20.0, 40.0, 80.0]
+  epsilon_curriculum: 0.01
+
+training:
+  batch_size_ic: 1024
+  batch_size_pde: 512
+
+  weights:
+    ic_loss: 10.0
+    pde_loss_divisor: 10000.0
+
+  ic_phase:
+    iterations: 5000
+    learning_rate: 1.0e-3
+    threshold: 0.01
+
+  zones:
+    zone_1:
+      limit: 300.0
+      step_size: 20.0
+      iterations: 3000
+      max_retries: 2
+      use_lbfgs: False
+      target_error: 0.03
+
+    zone_2:
+      limit: 1500.0
+      step_size: 5.0
+      iterations: 5000
+      max_retries: 3
+      use_lbfgs: True
+      target_error: 0.03
+
+    zone_3:
+      step_size: 10.0
+      iterations: 4000
+      max_retries: 3
+      use_lbfgs: False
+      target_error: 0.03
