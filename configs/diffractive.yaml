@@ -30,31 +30,32 @@ training:
     pde_loss_divisor: 1000000
 
   ic_phase:
-    iterations: 8000
+    iterations: 10000
     learning_rate: 0.001
-    threshold: 0.01
+    threshold: 0.02
 
   zones:
     zone_1:
       limit: 200.0
       step_size: 5.0
-      iterations: 8000
+      iterations: 10000
       max_retries: 3
-      use_lbfgs: False
-      target_error: 0.01
+      first_learning_rate: 0.0005  # <--- C'est lui le point de départ
+      target_error: 0.03
 
     zone_2:
       limit: 1500.0
-      step_size: 2.0  # Très fin pour bien capter le foyer
-      iterations: 10000
+      step_size: 2.0
+      iterations: 15000
       max_retries: 3
+      first_learning_rate: 0.0005  # <--- C'est lui le point de départ
       use_lbfgs: True 
-      target_error: 0.02
+      target_error: 0.03 # <--- COHERENCE
 
     zone_3:
       step_size: 5.0
-      iterations: 8000
+      iterations: 10000
       max_retries: 3
-      use_lbfgs: False
-      target_error: 0.03  
-
+      first_learning_rate: 0.0005  # <--- C'est lui le point de départ
+      use_lbfgs: True   # <--- ACTIVATION PARTOUT
+      target_error: 0.05

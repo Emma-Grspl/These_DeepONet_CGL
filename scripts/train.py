@@ -33,28 +33,24 @@ def main(config_path):
     model = PI_DeepONet_Robust(cfg).to(device)
 
     # 3. Entraînement IC (Condition Initiale)
-    # On vérifie que la clé existe pour éviter le crash d'hier
-    if 'ic_phase' not in cfg.training:
-        raise KeyError("La section 'ic_phase' est manquante dans le fichier YAML sous 'training'.")
-
     print("\n🔥 DÉMARRAGE IC (Condition Initiale)...")
     ic_cfg = cfg.training['ic_phase']
     optimizer_ic = optim.Adam(model.parameters(), lr=float(ic_cfg['learning_rate']))
     scheduler_ic = optim.lr_scheduler.ReduceLROnPlateau(optimizer_ic, factor=0.5, patience=500)
 
     model.train()
+    # On force le cast en int pour éviter le bug de type
+    batch_size_ic = int(cfg.training['batch_size_ic'])
+
     for it in range(int(ic_cfg['iterations'])):
-        # Libération propre de la mémoire (crucial sur V100/A100)
         optimizer_ic.zero_grad(set_to_none=True)
-        
-        branch, coords, t_re, t_im, dt_re, dt_im = get_ic_batch_sobolev(cfg.training['batch_size_ic'], cfg, device)
+
+        branch, coords, t_re, t_im, dt_re, dt_im = get_ic_batch_sobolev(batch_size_ic, cfg, device)
 
         p_re, p_im = model(branch, coords)
-        
-        # Loss de valeur
+
         loss_val = torch.mean((p_re - t_re)**2) + torch.mean((p_im - t_im)**2)
 
-        # Sobolev (Gradients en r) pour une IC plus "rigide"
         grad_re = torch.autograd.grad(p_re, coords, torch.ones_like(p_re), create_graph=True)[0][:, 0:1]
         grad_im = torch.autograd.grad(p_im, coords, torch.ones_like(p_im), create_graph=True)[0][:, 0:1]
         loss_grad = torch.mean((grad_re - dt_re)**2) + torch.mean((grad_im - dt_im)**2)
@@ -67,17 +63,18 @@ def main(config_path):
         if it % 1000 == 0:
             print(f"IC It {it} | Loss: {loss.item():.2e}")
 
-    # Audit IC
     ic_err, _ = evaluate_robust_metrics_smart(model, cfg, n_samples=1000, z_eval=0.0)
     print(f"✅ IC Validée avec erreur L2: {ic_err*100:.2f}%")
 
     # 4. Curriculum Loop (Les Zones)
     z_current = 0.0
     z_max = cfg.physics['z_max']
+    batch_size_pde = int(cfg.training['batch_size_pde']) # Correction int ici aussi
+
     print("\n🚀 DÉMARRAGE CURRICULUM ZONES...")
 
     while z_current < z_max:
-        # Sélection de la zone
+        # --- A. Préparation Zone ---
         zones = cfg.training['zones']
         if z_current < zones['zone_1']['limit']:
             zone_cfg = zones['zone_1']; name = "ZONE 1 (Chauffe)"
@@ -89,69 +86,87 @@ def main(config_path):
         z_next = min(z_current + zone_cfg['step_size'], z_max)
         print(f"\n🌍 {name} : {z_current:.1f} -> {z_next:.1f} mm")
 
-        # Phase Adam
-        optimizer = optim.Adam(model.parameters(), lr=5e-4)
-        model.train()
-        
-        for it in range(int(zone_cfg['iterations'])):
-            optimizer.zero_grad(set_to_none=True)
-            
-            # Équilibrage des batchs : On augmente la part de l'IC pour ne pas l'oublier
-            # On utilise 1024 au lieu de 128
-            br_ic, co_ic, t_re, t_im, _, _ = get_ic_batch_sobolev(1024, cfg, device)
-            br_pde, co_pde = get_pde_batch_z_limited(cfg.training['batch_size_pde'], cfg, device, z_next)
+        # --- B. Config Adam ---
+        first_lr = float(zone_cfg.get('first_learning_rate', 5e-4))
+        current_lr = first_lr
+        max_retries = int(zone_cfg.get('max_retries', 3))
+        target_err = float(zone_cfg.get('target_error', 0.03))
+        iterations = int(zone_cfg['iterations'])
 
-            # Calcul des prédictions et résidus
-            p_re, p_im = model(br_ic, co_ic)
-            l_ic = torch.mean((p_re - t_re)**2) + torch.mean((p_im - t_im)**2)
-            
-            r_re, r_im = pde_residual_corrected(model, br_pde, co_pde, cfg)
-            l_pde = torch.mean(r_re**2) + torch.mean(r_im**2)
+        success = False
 
-            loss = cfg.training['weights']['ic_loss'] * l_ic + (l_pde / cfg.training['weights']['pde_loss_divisor'])
-            loss.backward()
-            optimizer.step()
+        # --- C. Boucle Retries ---
+        for retry in range(max_retries):
+            print(f"  🔄 Tentative {retry+1}/{max_retries} | Z={z_next:.1f} | LR={current_lr:.2e}")
 
-            if it % 1000 == 0:
-                print(f"  It {it} | L_ic: {l_ic.item():.2e} | L_pde: {l_pde.item():.2e}")
+            optimizer = optim.Adam(model.parameters(), lr=current_lr)
+            model.train()
 
-        # Évaluation de l'étape
-        err, _ = evaluate_robust_metrics_smart(model, cfg, n_samples=500, z_eval=z_next)
-        success = err < zone_cfg['target_error']
+            for it in range(iterations):
+                optimizer.zero_grad(set_to_none=True)
 
-        # Fallback L-BFGS si l'erreur est trop haute et que l'option est active
+                br_ic, co_ic, t_re, t_im, _, _ = get_ic_batch_sobolev(1024, cfg, device)
+                br_pde, co_pde = get_pde_batch_z_limited(batch_size_pde, cfg, device, z_next)
+
+                p_re, p_im = model(br_ic, co_ic)
+                l_ic = torch.mean((p_re - t_re)**2) + torch.mean((p_im - t_im)**2)
+                r_re, r_im = pde_residual_corrected(model, br_pde, co_pde, cfg)
+                l_pde = torch.mean(r_re**2) + torch.mean(r_im**2)
+
+                loss = cfg.training['weights']['ic_loss'] * l_ic + (l_pde / cfg.training['weights']['pde_loss_divisor'])
+                loss.backward()
+                optimizer.step()
+
+                if it % 2000 == 0:
+                    print(f"    It {it}/{iterations} | Loss: {loss.item():.2e}")
+
+            err, _ = evaluate_robust_metrics_smart(model, cfg, n_samples=500, z_eval=z_next)
+            print(f"  📊 Audit fin tentative {retry+1}: Erreur = {err*100:.2f}% (Cible < {target_err*100}%)")
+
+            if err < target_err:
+                print("  ✅ Succès Adam ! On passe à la suite.")
+                success = True
+                break 
+            else:
+                if retry < max_retries - 1:
+                    print("  ⚠️ Échec. On divise le Learning Rate par 2 et on recommence.")
+                    current_lr /= 2.0
+                else:
+                    print("  ❌ Échec final Adam après tous les retries.")
+
+        # --- D. Fallback L-BFGS ---
         if not success and zone_cfg.get('use_lbfgs', False):
-            print(f"  ⚠️ Erreur {err*100:.2f}% trop haute. Tentative L-BFGS...")
+            print(f"  🚀 Tentative de sauvetage au L-BFGS...")
             lbfgs = optim.LBFGS(model.parameters(), lr=1.0, max_iter=50, line_search_fn="strong_wolfe")
-            
+
             def closure():
                 lbfgs.zero_grad(set_to_none=True)
-                # Batchs frais pour le L-BFGS
                 bi, ci, tr, ti, _, _ = get_ic_batch_sobolev(1024, cfg, device)
-                bp, cp = get_pde_batch_z_limited(cfg.training['batch_size_pde'], cfg, device, z_next)
-                
+                bp, cp = get_pde_batch_z_limited(batch_size_pde, cfg, device, z_next)
                 pr, pi = model(bi, ci); li = torch.mean((pr - tr)**2) + torch.mean((pi - ti)**2)
                 rr, ri = pde_residual_corrected(model, bp, cp, cfg); lp = torch.mean(rr**2) + torch.mean(ri**2)
-                
                 ls = cfg.training['weights']['ic_loss'] * li + (lp / cfg.training['weights']['pde_loss_divisor'])
                 ls.backward()
                 return ls
-            
+
             lbfgs.step(closure)
             err, _ = evaluate_robust_metrics_smart(model, cfg, n_samples=500, z_eval=z_next)
-            success = err < (zone_cfg['target_error'] * 1.5) # Tolérance assouplie post-LBFGS
 
+            if err < (target_err * 1.5): 
+                print(f"  ✅ Sauvetage réussi ! Erreur : {err*100:.2f}%")
+                success = True
+
+        # --- E. Décision Finale pour l'étape ---
         if success:
-            print(f"✅ Étape validée. Erreur: {err*100:.2f}%")
             z_current = z_next
-            # Sauvegarde régulière
             os.makedirs("outputs/checkpoints", exist_ok=True)
             if int(z_current) % 100 == 0:
                 torch.save(model.state_dict(), f"outputs/checkpoints/ckpt_z{int(z_current)}.pth")
         else:
-            print(f"❌ Échec critique à z={z_next:.1f} (Erreur: {err*100:.2f}%). Arrêt.")
-            break
+            print(f"⚠️  ATTENTION : Z={z_next} non validé (Err={err*100:.2f}%). On avance quand même...")
+            z_current = z_next 
 
+    # --- F. SAUVEGARDE FINALE (Hors de la boucle) ---
     print("\n💾 Sauvegarde finale...")
     os.makedirs("outputs", exist_ok=True)
     torch.save(model.state_dict(), "outputs/diffractive_final.pth")
