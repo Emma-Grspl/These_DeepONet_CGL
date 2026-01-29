@@ -22,25 +22,30 @@ model:
   epsilon_curriculum: 0.01
 
 training:
-  batch_size_ic: 8192    
-  batch_size_pde: 4096   
+  batch_size_ic: 8192   
+  batch_size_pde: 4064   
 
   weights:
     ic_loss: 10.0
-    pde_loss_divisor: 100
+    pde_loss_divisor: 1000000
+
+  ic_phase:
+    iterations: 8000
+    learning_rate: 0.001
+    threshold: 0.01
 
   zones:
     zone_1:
       limit: 200.0
       step_size: 5.0
-      iterations: 5000
+      iterations: 8000
       max_retries: 3
       use_lbfgs: False
       target_error: 0.01
 
     zone_2:
       limit: 1500.0
-      step_size: 2.0
+      step_size: 2.0  # Très fin pour bien capter le foyer
       iterations: 10000
       max_retries: 3
       use_lbfgs: True 
@@ -48,7 +53,8 @@ training:
 
     zone_3:
       step_size: 5.0
-      iterations: 4000
+      iterations: 8000
       max_retries: 3
       use_lbfgs: False
-      target_error: 0.03
+      target_error: 0.03  
+
