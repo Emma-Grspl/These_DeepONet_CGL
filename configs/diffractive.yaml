@@ -37,25 +37,25 @@ training:
   zones:
     zone_1:
       limit: 200.0
-      step_size: 5.0
-      iterations: 10000
-      max_retries: 3
+      step_size: 2.0
+      iterations: 3000
+      max_retries: 4
       first_learning_rate: 0.0005  # <--- C'est lui le point de départ
       target_error: 0.03
 
     zone_2:
       limit: 1500.0
-      step_size: 2.0
-      iterations: 15000
-      max_retries: 3
-      first_learning_rate: 0.0005  # <--- C'est lui le point de départ
+      step_size: 1.0
+      iterations: 5000
+      max_retries: 4
+      first_learning_rate: 0.0002  # <--- C'est lui le point de départ
       use_lbfgs: True 
-      target_error: 0.03 # <--- COHERENCE
+      target_error: 0.05 # <--- COHERENCE
 
     zone_3:
       step_size: 5.0
-      iterations: 10000
-      max_retries: 3
+      iterations: 5000
+      max_retries: 4
       first_learning_rate: 0.0005  # <--- C'est lui le point de départ
       use_lbfgs: True   # <--- ACTIVATION PARTOUT
       target_error: 0.05

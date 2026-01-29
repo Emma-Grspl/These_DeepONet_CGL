@@ -18,6 +18,7 @@ class Config:
     def __init__(self, dictionary):
         self.__dict__.update(dictionary)
 
+
 def main(config_path):
     # 1. Chargement Config
     print(f"📖 Chargement de {config_path}...")
@@ -39,7 +40,6 @@ def main(config_path):
     scheduler_ic = optim.lr_scheduler.ReduceLROnPlateau(optimizer_ic, factor=0.5, patience=500)
 
     model.train()
-    # On force le cast en int pour éviter le bug de type
     batch_size_ic = int(cfg.training['batch_size_ic'])
 
     for it in range(int(ic_cfg['iterations'])):
@@ -49,8 +49,20 @@ def main(config_path):
 
         p_re, p_im = model(branch, coords)
 
-        loss_val = torch.mean((p_re - t_re)**2) + torch.mean((p_im - t_im)**2)
+        # --- MODIFICATION LOSS IC ---
+        # 1. Loss sur le Module (Guide l'enveloppe)
+        mod_pred = torch.sqrt(p_re**2 + p_im**2 + 1e-12)
+        mod_true = torch.sqrt(t_re**2 + t_im**2 + 1e-12)
+        loss_mod = torch.mean((mod_pred - mod_true)**2)
 
+        # 2. Loss Classique (Complexe)
+        loss_complex = torch.mean((p_re - t_re)**2) + torch.mean((p_im - t_im)**2)
+
+        # 3. Combinaison
+        loss_val = loss_complex + loss_mod
+        # ----------------------------
+
+        # Loss Gradient (Sobolev) - On garde tel quel
         grad_re = torch.autograd.grad(p_re, coords, torch.ones_like(p_re), create_graph=True)[0][:, 0:1]
         grad_im = torch.autograd.grad(p_im, coords, torch.ones_like(p_im), create_graph=True)[0][:, 0:1]
         loss_grad = torch.mean((grad_re - dt_re)**2) + torch.mean((grad_im - dt_im)**2)
@@ -61,7 +73,7 @@ def main(config_path):
         scheduler_ic.step(loss.detach())
 
         if it % 1000 == 0:
-            print(f"IC It {it} | Loss: {loss.item():.2e}")
+            print(f"IC It {it} | Loss: {loss.item():.2e} (Mod: {loss_mod.item():.2e})")
 
     ic_err, _ = evaluate_robust_metrics_smart(model, cfg, n_samples=1000, z_eval=0.0)
     print(f"✅ IC Validée avec erreur L2: {ic_err*100:.2f}%")
@@ -69,7 +81,7 @@ def main(config_path):
     # 4. Curriculum Loop (Les Zones)
     z_current = 0.0
     z_max = cfg.physics['z_max']
-    batch_size_pde = int(cfg.training['batch_size_pde']) # Correction int ici aussi
+    batch_size_pde = int(cfg.training['batch_size_pde'])
 
     print("\n🚀 DÉMARRAGE CURRICULUM ZONES...")
 
@@ -108,11 +120,26 @@ def main(config_path):
                 br_ic, co_ic, t_re, t_im, _, _ = get_ic_batch_sobolev(1024, cfg, device)
                 br_pde, co_pde = get_pde_batch_z_limited(batch_size_pde, cfg, device, z_next)
 
+                # --- 1. Calcul l_ic AVEC MODULE ---
                 p_re, p_im = model(br_ic, co_ic)
-                l_ic = torch.mean((p_re - t_re)**2) + torch.mean((p_im - t_im)**2)
+                
+                # Module
+                mod_pred = torch.sqrt(p_re**2 + p_im**2 + 1e-12)
+                mod_true = torch.sqrt(t_re**2 + t_im**2 + 1e-12)
+                l_mod = torch.mean((mod_pred - mod_true)**2)
+                
+                # Complexe
+                l_complex = torch.mean((p_re - t_re)**2) + torch.mean((p_im - t_im)**2)
+                
+                # Total IC
+                l_ic = l_complex + l_mod
+                # ----------------------------------
+
+                # --- 2. Calcul l_pde (Classique) ---
                 r_re, r_im = pde_residual_corrected(model, br_pde, co_pde, cfg)
                 l_pde = torch.mean(r_re**2) + torch.mean(r_im**2)
 
+                # Loss Totale
                 loss = cfg.training['weights']['ic_loss'] * l_ic + (l_pde / cfg.training['weights']['pde_loss_divisor'])
                 loss.backward()
                 optimizer.step()
@@ -141,10 +168,21 @@ def main(config_path):
 
             def closure():
                 lbfgs.zero_grad(set_to_none=True)
+                
+                # Batchs
                 bi, ci, tr, ti, _, _ = get_ic_batch_sobolev(1024, cfg, device)
                 bp, cp = get_pde_batch_z_limited(batch_size_pde, cfg, device, z_next)
-                pr, pi = model(bi, ci); li = torch.mean((pr - tr)**2) + torch.mean((pi - ti)**2)
-                rr, ri = pde_residual_corrected(model, bp, cp, cfg); lp = torch.mean(rr**2) + torch.mean(ri**2)
+                
+                # Loss IC Modifiée
+                pr, pi = model(bi, ci)
+                m_pred = torch.sqrt(pr**2 + pi**2 + 1e-12)
+                m_true = torch.sqrt(tr**2 + ti**2 + 1e-12)
+                li = (torch.mean((pr - tr)**2) + torch.mean((pi - ti)**2)) + torch.mean((m_pred - m_true)**2)
+                
+                # Loss PDE
+                rr, ri = pde_residual_corrected(model, bp, cp, cfg)
+                lp = torch.mean(rr**2) + torch.mean(ri**2)
+                
                 ls = cfg.training['weights']['ic_loss'] * li + (lp / cfg.training['weights']['pde_loss_divisor'])
                 ls.backward()
                 return ls
@@ -166,7 +204,7 @@ def main(config_path):
             print(f"⚠️  ATTENTION : Z={z_next} non validé (Err={err*100:.2f}%). On avance quand même...")
             z_current = z_next 
 
-    # --- F. SAUVEGARDE FINALE (Hors de la boucle) ---
+    # --- F. SAUVEGARDE FINALE ---
     print("\n💾 Sauvegarde finale...")
     os.makedirs("outputs", exist_ok=True)
     torch.save(model.state_dict(), "outputs/diffractive_final.pth")
