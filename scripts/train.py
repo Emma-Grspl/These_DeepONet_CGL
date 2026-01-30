@@ -72,7 +72,7 @@ def main(config_path):
         optimizer_ic.step()
         scheduler_ic.step(loss.detach())
 
-        if it % 1000 == 0:
+        if it % 500 == 0:
             print(f"IC It {it} | Loss: {loss.item():.2e} (Mod: {loss_mod.item():.2e})")
 
     ic_err, _ = evaluate_robust_metrics_smart(model, cfg, n_samples=1000, z_eval=0.0)
@@ -113,8 +113,9 @@ def main(config_path):
 
             optimizer = optim.Adam(model.parameters(), lr=current_lr)
             model.train()
-
-            for it in range(iterations):
+            base_iters = int(zone_cfg['iterations'])
+            current_iterations = base_iters + (retry * 2000)
+            for it in range(current_iterations):
                 optimizer.zero_grad(set_to_none=True)
 
                 br_ic, co_ic, t_re, t_im, _, _ = get_ic_batch_sobolev(1024, cfg, device)
@@ -144,7 +145,7 @@ def main(config_path):
                 loss.backward()
                 optimizer.step()
 
-                if it % 2000 == 0:
+                if it % 500 == 0:
                     print(f"    It {it}/{iterations} | Loss: {loss.item():.2e}")
 
             err, _ = evaluate_robust_metrics_smart(model, cfg, n_samples=500, z_eval=z_next)
@@ -198,7 +199,7 @@ def main(config_path):
         if success:
             z_current = z_next
             os.makedirs("outputs/checkpoints", exist_ok=True)
-            if int(z_current) % 100 == 0:
+            if int(z_current) % 50 == 0:
                 torch.save(model.state_dict(), f"outputs/checkpoints/ckpt_z{int(z_current)}.pth")
         else:
             print(f"⚠️  ATTENTION : Z={z_next} non validé (Err={err*100:.2f}%). On avance quand même...")
