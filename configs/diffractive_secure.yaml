@@ -37,26 +37,35 @@ training:
   zones:
     zone_1:
       limit: 200.0
-      step_size: 5.0
+      step_size: 2.0
       iterations: 2000
       max_retries: 4
-      first_learning_rate: 0.0005  
+      first_learning_rate: 0.0002  
       use_lbfgs: True
       target_error: 0.05
 
     zone_2:
-      limit: 800.0
+      limit: 500.0
       step_size: 2.0
-      iterations: 4000
-      max_retries: 4
-      first_learning_rate: 0.0002
+      iterations: 3500
+      max_retries: 6
+      first_learning_rate: 0.0001
       use_lbfgs: True
       target_error: 0.05
 
     zone_3:
-      step_size: 10.0
+      limit: 560.0
+      step_size: 1.0
+      iterations: 3000
+      max_retries: 6
+      first_learning_rate: 0.00005
+      use_lbfgs: True
+      target_error: 0.10
+
+    zone_4:
+      step_size: 8.0
       iterations: 2000
       max_retries: 4
-      first_learning_rate: 0.0005
+      first_learning_rate: 0.0003
       use_lbfgs: True
       target_error: 0.05
