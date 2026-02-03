@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=DeepONet_ADR      # Nom du job
+#SBATCH --job-name=DeepONet_CGL      # Nom du job
 #SBATCH --output=slurm/log/%x_%j.out # %x=nom du job, %j=ID du job
 #SBATCH --error=slurm/log/%x_%j.err
 #SBATCH -A fdb@v100                  # <--- Ton compte projet
