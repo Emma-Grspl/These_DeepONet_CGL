@@ -249,32 +249,43 @@ def train_step_cgle(model, cfg, t_max, n_iters):
 
 # --- 4. MAIN TRAINER ---
 
+# --- 4. MAIN TRAINER ---
+
 def train_cgle_curriculum(model, cfg):
     # Gestion robustesse dossier save
     if isinstance(cfg, dict):
         save_dir = cfg['training'].get('save_dir', "outputs/checkpoints_cgl")
         ic_iter = int(cfg['training']['ic_phase']['iterations'])
+        
         t_max_phys = cfg['physics']['t_max']
         dt_step = cfg['time_marching'].get('dt_step', 0.5)
         iters_per_step = cfg['time_marching'].get('iters_per_step', 3000)
     else:
         # Si ConfigObj
-        save_dir = cfg.training.get('save_dir', "outputs/checkpoints_cgl")
-        ic_iter = int(cfg.ic_phase['iterations']) # Ta modification ici !
+        # 1. On récupère le dictionnaire 'training' via l'attribut
+        training_dict = cfg.training 
+        
+        save_dir = training_dict.get('save_dir', "outputs/checkpoints_cgl")
+        
+        # 2. CORRECTION ICI : ic_phase est DANS training_dict
+        ic_iter = int(training_dict['ic_phase']['iterations']) 
+        
         t_max_phys = cfg.physics['t_max']
+        
+        # time_marching est à la racine (suite à notre modif yaml)
+        # Mais attention si tu utilises ConfigObj, time_marching est un attribut qui contient un dict
         dt_step = cfg.time_marching.get('dt_step', 0.5)
         iters_per_step = cfg.time_marching.get('iters_per_step', 3000)
 
     os.makedirs(save_dir, exist_ok=True)
     
-    # 1. Warmup IC (TA VERSION)
+    # 1. Warmup IC
     print("🧊 WARMUP (IC Only)...")
     print(f"   Iterations: {ic_iter}")
     
     optimizer = optim.Adam(model.parameters(), lr=1e-3)
     for i in range(ic_iter):
         optimizer.zero_grad()
-        # Note : get_ic_batch renvoie 6 valeurs, on unpack juste ce qu'il faut
         br_ic, co_ic, tr_re, tr_im, _, _ = get_ic_batch_cgle(4096, cfg, next(model.parameters()).device)
         
         p_re, p_im = model(br_ic, co_ic)
