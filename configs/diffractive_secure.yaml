@@ -53,7 +53,7 @@ training:
       use_lbfgs: True
       target_error: 0.05
 
-    zone_3:
+    zone_transit:
       limit: 560.0
       step_size: 1.0
       iterations: 3000
