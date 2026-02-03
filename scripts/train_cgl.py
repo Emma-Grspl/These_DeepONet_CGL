@@ -6,35 +6,46 @@ import torch
 from datetime import datetime
 
 # --- GESTION DES CHEMINS ---
-# Indispensable pour que Python trouve 'src' quand on lance depuis la racine ou un dossier script
 project_root = os.getcwd()
 sys.path.append(project_root)
 
 # --- IMPORTS ---
 try:
+    # CORRECTION 1 : Attention à la casse (CGL vs cgle)
     from src.models.CGL_PI_DeepOnet import CGL_PI_DeepONet
-    from src.training.trainer_cgle import train_cgle_curriculum
+    from src.training.trainer_CGL import train_cgle_curriculum 
     print("✅ Imports CGL réussis.")
 except ImportError as e:
     print(f"❌ Erreur d'import : {e}")
-    print("Vérifiez que vous êtes bien à la racine du projet (là où il y a le dossier src).")
+    print("Vérifiez que vous êtes bien à la racine du projet et que les noms de fichiers (CGL/cgle) correspondent.")
     sys.exit(1)
 
 # --- HELPER CONFIG ---
 class ConfigObj:
-    """Transforme un dictionnaire en objet (cfg.physics.alpha au lieu de cfg['physics']['alpha'])"""
+    """
+    Wrapper hybride : permet l'accès cfg.key ET cfg['key'].
+    Utile car certains scripts utilisent l'un ou l'autre.
+    """
     def __init__(self, dictionary):
+        self._dict = dictionary
         for key, value in dictionary.items():
             if isinstance(value, dict):
-                setattr(self, key, value) # Pas récursif ici pour simplifier, mais suffisant pour cfg.physics['alpha']
+                # On ne récursive pas pour garder l'accès dict sur les enfants (ex: cfg.physics['alpha'])
+                setattr(self, key, value) 
             else:
                 setattr(self, key, value)
-        self.__dict__.update(dictionary)
+    
+    def __getitem__(self, item):
+        return self._dict[item]
+    
+    def get(self, key, default=None):
+        return self._dict.get(key, default)
 
 def main():
-    # 0. ARGUMENTS (Permet de changer de yaml via Slurm)
+    # 0. ARGUMENTS
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, default="configs/cgle.yaml", help="Chemin vers le fichier de config YAML")
+    # CORRECTION 2 : Nom du fichier yaml par défaut
+    parser.add_argument("--config", type=str, default="configs/cgl_config.yaml", help="Chemin vers le fichier de config YAML")
     args = parser.parse_args()
 
     # 1. SETUP DOSSIER DE SAUVEGARDE
@@ -42,8 +53,12 @@ def main():
     run_name = f"CGL_run_{timestamp}"
     run_dir = os.path.join(project_root, "results", run_name)
     os.makedirs(run_dir, exist_ok=True)
+    
+    # On crée aussi un sous-dossier pour les checkpoints intermédiaires
+    ckpt_dir = os.path.join(run_dir, "checkpoints")
+    os.makedirs(ckpt_dir, exist_ok=True)
 
-    print(f"🚀 Lancement Entraînement CGL (Jean Zay / Local)")
+    print(f"🚀 Lancement Entraînement CGL")
     print(f"📁 Dossier de sortie : {run_dir}")
 
     # 2. CHARGEMENT CONFIG
@@ -55,10 +70,15 @@ def main():
     with open(args.config, 'r') as f:
         yaml_data = yaml.safe_load(f)
     
-    # On injecte le dossier de sauvegarde dans la config pour que le trainer l'utilise
+    # INJECTION DU SAVE DIR DANS LA CONFIG
+    # Pour que le trainer sache où enregistrer
     if 'training' not in yaml_data: yaml_data['training'] = {}
-    yaml_data['training']['save_dir'] = run_dir
+    yaml_data['training']['save_dir'] = ckpt_dir 
     
+    # Sauvegarde de la config utilisée dans le dossier de résultat (Bonne pratique !)
+    with open(os.path.join(run_dir, "config_used.yaml"), 'w') as f:
+        yaml.dump(yaml_data, f)
+
     # Création de l'objet Config
     cfg = ConfigObj(yaml_data)
 
@@ -75,12 +95,12 @@ def main():
 
     # 4. INITIALISATION MODÈLE
     print("🏗️  Initialisation du modèle CGL_PI_DeepONet...")
+    # Le modèle attend le dictionnaire brut ou l'objet ConfigObj (ça marche car ConfigObj a __getitem__)
     model = CGL_PI_DeepONet(cfg).to(device)
 
     # 5. ENTRAÎNEMENT
     try:
         # On passe la main au Curriculum Trainer
-        # Note : Le trainer va utiliser cfg.training['save_dir'] pour les checkpoints
         train_cgle_curriculum(model, cfg)
 
         # 6. SAUVEGARDE FINALE

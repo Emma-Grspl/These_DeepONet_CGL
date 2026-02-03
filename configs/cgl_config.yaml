@@ -1,71 +1,52 @@
-experiment_name: "NLSE_Full_Physics"
+experiment_name: "CGL_Generalist_Solver"
 device: "cuda"
 
 physics:
-  wavelength: 0.0008  # 800nm
-  k: 7853.98
-  r_max: 20.0
-  z_max: 2000.0       # On verra si le filament va jusque là !
-  bounds:
-    A: [0.1, 1.0]
-    w0: [0.5, 2.0]
-    f: [500.0, 10000.0]
+  x_domain: [-20, 20]
+  t_max: 10.0
   
-  # Coefficients spécifiques NLSE
-  coefficients:
-    K: 8
-    C_kerr: 1.0186
-    C_plasma: 1.0552
-    C_abs: 3.4925e-06
+  bounds:
+    A: [0.1, 3.0]
+    w0: [0.5, 6.0]
+    x0: [0.0, 0.0]
+    k: [-2.0, 2.0]
+
+  equation_params:
+    alpha: [0.0, 1.0]
+    beta: [-1.5, 1.5]
+    mu: [-0.5, 1.0]
+    V: [-2.0, 2.0]
 
 model:
-  branch_dim: 3
-  trunk_dim: 2
+  branch_input_dim: 9 
+  trunk_input_dim: 2
   latent_dim: 256
+  
   branch_layers: [256, 256, 256, 256, 256]
-  trunk_layers: [256, 256, 256, 256, 256]
-  activation: "tanh"  # Tanh est souvent plus robuste pour les non-linéarités fortes
+  trunk_layers: [256, 256, 256, 256]
+  
+  activation: "silu"
+  
+  fourier_dim: 64
+  fourier_scales: [1.0, 2.0, 5.0, 10.0, 20.0, 40.0]
 
 training:
-  batch_size_ic: 8192    
-  batch_size_pde: 4064    
+  batch_size_ic: 4096   
+  batch_size_pde: 4096   
 
   weights:
-    ic_loss: 10.0
-    pde_loss_divisor: 1000  # On divise moins car les résidus NLSE sont plus petits
+    ic_loss: 150.0      # Très fort, c'est bien pour ancrer le système
+    pde_loss: 80.0
+    bc_loss: 50.0
 
   ic_phase:
     iterations: 10000
-    learning_rate: 0.001
+    learning_rate: 0.0002 # Un peu bas, mais sûr. Si c'est trop lent, passe à 0.001
 
-  # Stratégie de zones adaptée à la physique visualisée
-  zones:
-    # 1. L'Approche (Gaussienne propre)
-    # On va vite pour gagner du temps calcul
-    zone_1:
-      limit: 250.0
-      step_size: 5.0        # On tente 5mm (c'est facile ici)
-      iterations: 2000
-      max_retries: 3
-      first_learning_rate: 0.0005   
-      target_error: 0.05    # Ici on exige de la précision
-
-    # 2. Le Mur du Son (Le "Collapse")
-    # C'est là que le pic se forme et que la phase explose
-    zone_collapse:
-      limit: 600.0
-      step_size: 1.0        # Pas de 1mm OBLIGATOIRE
-      iterations: 5000      # Il faut bcp d'itérations pour apprendre le chaos
-      max_retries: 6        # On s'acharne si ça rate
-      first_learning_rate: 0.0001
-      target_error: 0.1   # On accepte 20% d'erreur (c'est très bruité !)
-
-    # 3. L'Autoroute (Le Filament établi)
-    # Le profil reste "sale" mais ne change plus trop de forme
-    zone_filamentation:
-      limit: 2000.0
-      step_size: 2.0        # On reste prudent (2mm)
-      iterations: 3000
-      max_retries: 5
-      first_learning_rate: 0.0001
-      target_error: 0.1
+# --- ATTENTION : CE BLOC DOIT ÊTRE À LA RACINE (PAS D'INDENTATION) ---
+time_marching:
+  dt_step: 0.2        
+  iters_per_step: 7000  
+  
+  # Audit params
+  audit_threshold: 0.05
