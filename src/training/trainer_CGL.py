@@ -14,16 +14,10 @@ from src.utils.solver_cgl import get_ground_truth_CGL
 # ==============================================================================
 
 def audit_global_fast(model, cfg, t_max, threshold=0.05, n_samples=20):
-    """
-    Audit rapide : Prend n_samples aléatoires (tous types confondus) 
-    et vérifie si l'erreur moyenne est sous le seuil.
-    Retourne: (Success: bool, Mean_Error: float)
-    """
     device = next(model.parameters()).device
     model.eval()
     errors = []
     
-    # Gestion robustesse accès config
     if isinstance(cfg, dict):
         eq_p = cfg['physics']['equation_params']
         bounds = cfg['physics']['bounds']
@@ -33,33 +27,21 @@ def audit_global_fast(model, cfg, t_max, threshold=0.05, n_samples=20):
         bounds = cfg.physics['bounds']
         x_domain = cfg.physics['x_domain']
 
-    # On teste n_samples fois avec des params aléatoires
     for _ in range(n_samples):
         try:
-            # 1. Tirage aléatoire des paramètres
             alpha = np.random.uniform(eq_p['alpha'][0], eq_p['alpha'][1])
             beta  = np.random.uniform(eq_p['beta'][0],  eq_p['beta'][1])
             mu    = np.random.uniform(eq_p['mu'][0],    eq_p['mu'][1])
             V     = np.random.uniform(eq_p['V'][0],     eq_p['V'][1])
-            
             A = np.random.uniform(bounds['A'][0], bounds['A'][1])
             w0 = 10**np.random.uniform(np.log10(bounds['w0'][0]), np.log10(bounds['w0'][1]))
-            x0 = 0.0 
-            k  = 1.0 
-            # Type aléatoire parmi 0, 1, 2
-            type_id = np.random.choice([0, 1, 2])
+            x0, k = 0.0, 1.0
+            type_id = np.random.choice([0, 1, 2]) 
 
-            p_dict = {
-                'alpha': alpha, 'beta': beta, 'mu': mu, 'V': V,
-                'A': A, 'w0': w0, 'x0': x0, 'k': k, 'type': type_id
-            }
+            p_dict = {'alpha': alpha, 'beta': beta, 'mu': mu, 'V': V, 'A': A, 'w0': w0, 'x0': x0, 'k': k, 'type': type_id}
             
-            # 2. Vérité Terrain
-            X_grid, T_grid, U_true_cplx = get_ground_truth_CGL(
-                p_dict, x_domain[0], x_domain[1], t_max, Nx=256, Nt=None
-            )
+            X_grid, T_grid, U_true_cplx = get_ground_truth_CGL(p_dict, x_domain[0], x_domain[1], t_max, Nx=256, Nt=None)
             
-            # 3. Prédiction
             X_flat, T_flat = X_grid.flatten(), T_grid.flatten()
             xt_tensor = torch.tensor(np.stack([X_flat, T_flat], axis=1), dtype=torch.float32).to(device)
             p_vec = np.array([alpha, beta, mu, V, A, w0, x0, k, float(type_id)])
@@ -73,20 +55,13 @@ def audit_global_fast(model, cfg, t_max, threshold=0.05, n_samples=20):
             norm_true = np.linalg.norm(U_true) + 1e-7
             err = np.linalg.norm(U_true - u_pred_cplx) / norm_true
             errors.append(err)
-            
-        except Exception:
-            continue # Si le solveur plante sur un cas extrême, on ignore
+        except Exception: continue
 
-    if not errors: return False, 1.0 # Cas pathologique
-    
+    if not errors: return False, 1.0
     mean_err = np.mean(errors)
-    success = mean_err < threshold
-    return success, mean_err
+    return mean_err < threshold, mean_err
 
 def diagnose_cgle(model, cfg, t_max, threshold=0.05, n_per_type=10):
-    """
-    Audit Spécifique : Renvoie la liste des types qui échouent (Gaussian, Sech, Tanh).
-    """
     device = next(model.parameters()).device
     model.eval()
     failed_types = []
@@ -181,7 +156,7 @@ def compute_cgle_loss(model, branch_pde, coords_pde, pde_params, branch_ic, coor
 # 3. BOUCLE D'ENTRAÎNEMENT (RETRY LOGIC)
 # ==============================================================================
 
-def train_step_cgle(model, cfg, t_max, n_iters):
+def train_step_cgle(model, cfg, t_max, n_iters, threshold=0.05):
     device = next(model.parameters()).device
     
     # Params
@@ -189,32 +164,25 @@ def train_step_cgle(model, cfg, t_max, n_iters):
         base_lr = float(cfg['training']['ic_phase']['learning_rate'])
         batch_size_pde = int(cfg['training']['batch_size_pde'])
         batch_size_ic = int(cfg['training']['batch_size_ic'])
-        audit_threshold = cfg['time_marching'].get('audit_threshold', 0.05)
         max_retry = cfg['training'].get('max_retry', 3) 
     else:
         base_lr = float(cfg.training['ic_phase']['learning_rate'])
         batch_size_pde = int(cfg.training['batch_size_pde'])
         batch_size_ic = int(cfg.training['batch_size_ic'])
-        audit_threshold = cfg.time_marching.get('audit_threshold', 0.05)
         max_retry = cfg.training.get('max_retry', 3)
 
-    print(f"\n🔵 PALIER t=[0, {t_max:.2f}] (iters={n_iters}, retry={max_retry})")
+    print(f"\n🔵 PALIER t=[0, {t_max:.2f}] (iters base={n_iters}, retry={max_retry})")
 
-    # --------------------------------------------------------------------------
-    # PHASE 1 : ENTRAINEMENT GLOBAL (Boucle Retry)
-    # --------------------------------------------------------------------------
     global_success = False
     current_lr = base_lr
 
     for attempt in range(max_retry):
         
-        # --- MODE LBFGS (Dernière chance) ---
+        # --- MODE LBFGS ---
         if attempt == max_retry - 1:
             print(f"  👉 Tentative Globale {attempt+1}/{max_retry} : LBFGS Finisher")
             optimizer = optim.LBFGS(model.parameters(), lr=0.2, max_iter=100, tolerance_grad=1e-5, line_search_fn="strong_wolfe")
-            
-            # Pas de boucle n_iters, LBFGS a sa propre boucle interne
-            for _ in range(50): # 20 steps LBFGS (re-sampling batch)
+            for _ in range(20): 
                 br_pde, co_pde, pde_params = get_pde_batch_cgle(batch_size_pde, cfg, device, t_limit=t_max)
                 br_ic, co_ic, tr_ic_re, tr_ic_im, _, _ = get_ic_batch_cgle(batch_size_ic, cfg, device)
                 def closure():
@@ -227,36 +195,31 @@ def train_step_cgle(model, cfg, t_max, n_iters):
                 except: pass
 
         # --- MODE ADAM ---
-        # --- MODE ADAM ---
         else:
             print(f"  👉 Tentative Globale {attempt+1}/{max_retry} : Adam (LR={current_lr:.2e})")
             optimizer = optim.Adam(model.parameters(), lr=current_lr)
             model.train()
             
-            # CORRECTION ICI : On augmente en fonction de l'essai actuel (attempt)
-            # On booste de +3000 itérations à chaque retry car le LR baisse
+            # Augmentation de la durée à chaque échec
             current_iters = int(n_iters + (3000 * attempt))
-            
             print(f"     ⏳ Durée étendue à {current_iters} itérations.")
-
+            
             for i in range(current_iters):
                 optimizer.zero_grad(set_to_none=True)
                 br_pde, co_pde, pde_params = get_pde_batch_cgle(batch_size_pde, cfg, device, t_limit=t_max)
                 br_ic, co_ic, tr_ic_re, tr_ic_im, _, _ = get_ic_batch_cgle(batch_size_ic, cfg, device)
                 
                 loss = compute_cgle_loss(model, br_pde, co_pde, pde_params, br_ic, co_ic, tr_ic_re, tr_ic_im, cfg)
-                
                 if torch.isnan(loss): 
                     print("    💀 Loss NaN. Break.")
                     break
-                
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
-                
                 if (i+1)%1000==0: print(f"    Iter {i+1}/{current_iters} | Loss: {loss.item():.2e}")
+
         # --- AUDIT GLOBAL RAPIDE ---
-        success, err = audit_global_fast(model, cfg, t_max, threshold=audit_threshold)
+        success, err = audit_global_fast(model, cfg, t_max, threshold=threshold)
         
         if success:
             print(f"    📊 Audit Global OK ({err:.2%}). Passage au check spécifique...")
@@ -268,7 +231,6 @@ def train_step_cgle(model, cfg, t_max, n_iters):
                 current_lr *= 0.5
                 print(f"    ↘️  Decay LR : {current_lr:.2e}")
 
-    # Si même le global a échoué après tous les retries, c'est mort.
     if not global_success: 
         print("🛑 Echec Global. Abandon du step.")
         return False
@@ -276,23 +238,21 @@ def train_step_cgle(model, cfg, t_max, n_iters):
     # --------------------------------------------------------------------------
     # PHASE 2 : DIAGNOSTIC SPÉCIFIQUE
     # --------------------------------------------------------------------------
-    # On ne lance ça QUE si le global a réussi
-    failed_types = diagnose_cgle(model, cfg, t_max, threshold=audit_threshold)
-
+    failed_types = diagnose_cgle(model, cfg, t_max, threshold=threshold)
     if not failed_types:
         print("  ✅ Validation Totale : Tous types OK.")
         return True
 
     # --------------------------------------------------------------------------
-    # PHASE 3 : CORRECTION CIBLÉE (Focus Loop)
+    # PHASE 3 : CORRECTION CIBLÉE
     # --------------------------------------------------------------------------
     print(f"\n🚑 Correction Ciblée nécessaire sur {failed_types}...")
     current_lr = base_lr 
-    n_iters_focus = n_iters + 3000
     
     for attempt in range(max_retry):
         
-        # --- LBFGS FOCUS ---
+        n_iters_focus = int((n_iters + 3000) + (3000 * attempt))
+        
         if attempt == max_retry - 1:
             print(f"  ☢️ [Focus Loop] Tentative {attempt+1}/{max_retry} : LBFGS Ultimate")
             optimizer = optim.LBFGS(model.parameters(), lr=0.2, max_iter=200, tolerance_grad=1e-7, line_search_fn="strong_wolfe")
@@ -307,10 +267,8 @@ def train_step_cgle(model, cfg, t_max, n_iters):
                     return loss
                 try: optimizer.step(closure)
                 except: pass
-
-        # --- ADAM FOCUS ---
         else:
-            print(f"  🚑 [Focus Loop] Tentative {attempt+1}/{max_retry} : Adam (LR={current_lr:.2e})")
+            print(f"  🚑 [Focus Loop] Tentative {attempt+1}/{max_retry} : Adam (LR={current_lr:.2e}, Iters={n_iters_focus})")
             optimizer = optim.Adam(model.parameters(), lr=current_lr)
             for i in range(n_iters_focus):
                 optimizer.zero_grad(set_to_none=True)
@@ -323,9 +281,7 @@ def train_step_cgle(model, cfg, t_max, n_iters):
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
 
-        # --- RE-DIAGNOSTIC ---
-        failed_now = diagnose_cgle(model, cfg, t_max, threshold=audit_threshold)
-        
+        failed_now = diagnose_cgle(model, cfg, t_max, threshold=threshold)
         if not failed_now:
             print(f"  ✅ Correction réussie à la tentative {attempt+1} !")
             return True
@@ -333,7 +289,7 @@ def train_step_cgle(model, cfg, t_max, n_iters):
             print(f"  ❌ Toujours des erreurs: {failed_now}")
             if attempt < max_retry - 2: current_lr *= 0.5
 
-    # Check Final avec tolérance relaxée
+    # Check Final Relaxé
     failed_final = diagnose_cgle(model, cfg, t_max, threshold=0.08)
     if not failed_final:
         print("✅ Validé in-extremis (Tolérance relaxée).")
@@ -343,24 +299,22 @@ def train_step_cgle(model, cfg, t_max, n_iters):
     return False
 
 # ==============================================================================
-# 4. MAIN TRAINER
+# 4. MAIN TRAINER (GESTION DES ZONES)
 # ==============================================================================
 
 def train_cgle_curriculum(model, cfg):
-    # Gestion robustesse
     if isinstance(cfg, dict):
         save_dir = cfg['training'].get('save_dir', "outputs/checkpoints_cgl")
         ic_iter = int(cfg['training']['ic_phase']['iterations'])
         t_max_phys = cfg['physics']['t_max']
-        dt_step = cfg['time_marching'].get('dt_step', 0.05)
-        iters_per_step = cfg['time_marching'].get('iters_per_step', 3000)
+        # On récupère les zones du yaml
+        zones = cfg['time_marching'].get('zones', [])
     else:
         training_dict = cfg.training 
         save_dir = training_dict.get('save_dir', "outputs/checkpoints_cgl")
         ic_iter = int(training_dict['ic_phase']['iterations']) 
         t_max_phys = cfg.physics['t_max']
-        dt_step = cfg.time_marching.get('dt_step', 0.05)
-        iters_per_step = cfg.time_marching.get('iters_per_step', 3000)
+        zones = cfg.time_marching.get('zones', [])
 
     os.makedirs(save_dir, exist_ok=True)
     device = next(model.parameters()).device
@@ -369,8 +323,6 @@ def train_cgle_curriculum(model, cfg):
     # 1. WARMUP (IC Only)
     # --------------------------------------------------------------------------
     print("🧊 WARMUP (IC Only)...")
-    
-    # Phase A : Adam
     print(f"   👉 Phase A : Adam ({ic_iter} iters)")
     optimizer = optim.Adam(model.parameters(), lr=1e-3)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=1000, verbose=True)
@@ -392,7 +344,6 @@ def train_cgle_curriculum(model, cfg):
         scheduler.step(loss)
         if i % 2000 == 0: print(f"   Warmup Adam {i}/{ic_iter} | Loss: {loss.item():.2e}")
 
-    # Phase B : L-BFGS Fixe
     print(f"   👉 Phase B : L-BFGS (Finition)")
     batch_size_lbfgs = 4096 * 4 
     br_ic_fix, co_ic_fix, tr_re_fix, tr_im_fix, _, _ = get_ic_batch_cgle(batch_size_lbfgs, cfg, device)
@@ -410,17 +361,45 @@ def train_cgle_curriculum(model, cfg):
     print("✅ Warmup terminé.")
 
     # --------------------------------------------------------------------------
-    # 2. TIME MARCHING
+    # 2. TIME MARCHING PAR ZONES
     # --------------------------------------------------------------------------
-    current_t = dt_step
-    while current_t <= t_max_phys + 1e-9:
-        success = train_step_cgle(model, cfg, current_t, n_iters=iters_per_step)
-        if not success:
-            print("🛑 Echec critique. Arrêt.")
-            break
-        
-        ckpt_path = os.path.join(save_dir, f"ckpt_t{current_t:.2f}.pth")
-        torch.save(model.state_dict(), ckpt_path)
-        current_t += dt_step
+    
+    # Si pas de zones définies, on crée une zone par défaut (fallback)
+    if not zones:
+        print("⚠️ Aucune zone détectée, utilisation de la config par défaut.")
+        zones = [{'t_end': t_max_phys, 'dt': 0.05, 'iters': 3000, 'audit_threshold': 0.05}]
 
-    print("🏁 Fin.")
+    current_t = 0.0
+    
+    for zone in zones:
+        z_end = zone['t_end']
+        z_dt = zone['dt']
+        z_iters = zone['iters']
+        z_thresh = zone.get('audit_threshold', 0.05)
+        
+        print(f"\n🚀 ENTRÉE DANS LA ZONE : t_end={z_end}, dt={z_dt}, iters={z_iters}")
+
+        # On avance dans le temps tant qu'on est dans la zone
+        # On utilise une petite tolérance pour l'arrondi float
+        while current_t < z_end - 1e-9:
+            
+            # Prochain pas
+            next_t = current_t + z_dt
+            
+            # Si le pas dépasse la fin de zone, on cape (optionnel, mais propre)
+            if next_t > z_end + 1e-9:
+                next_t = z_end
+            
+            # Lancement de l'entraînement
+            success = train_step_cgle(model, cfg, next_t, n_iters=z_iters, threshold=z_thresh)
+            
+            if not success:
+                print("🛑 Echec critique du Time Marching. Arrêt.")
+                return # On quitte tout
+
+            # Sauvegarde et incrément
+            current_t = next_t
+            ckpt_path = os.path.join(save_dir, f"ckpt_t{current_t:.2f}.pth")
+            torch.save(model.state_dict(), ckpt_path)
+
+    print("🏁 Fin de toutes les zones. Entraînement terminé.")

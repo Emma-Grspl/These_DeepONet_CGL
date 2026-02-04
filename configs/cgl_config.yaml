@@ -34,8 +34,8 @@ training:
   batch_size_ic: 4096   
   batch_size_pde: 4096   
   
-  # --- NOUVEAU PARAMÈTRE ---
-  max_retry: 4          # Nombre de tentatives Adam (avec division du LR) avant L-BFGS
+  # Nombre de tentatives Adam avant L-BFGS
+  max_retry: 4          
   
   weights:
     ic_loss: 150.0      
@@ -43,14 +43,30 @@ training:
     bc_loss: 50.0
 
   ic_phase:
-    # On a augmenté ces valeurs pour que le Warmup Adam + LBFGS soit efficace
-    iterations: 20000    # Augmenté de 10k à 20k
-    learning_rate: 0.001 # Augmenté de 0.0002 à 0.001 pour converger plus vite avant LBFGS
+    iterations: 20000    
+    learning_rate: 0.001 
 
-# --- ATTENTION : CE BLOC DOIT ÊTRE À LA RACINE (PAS D'INDENTATION) ---
+# --- NOUVELLE CONFIGURATION : ZONES TEMPORELLES ---
+# On remplace l'ancien bloc time_marching par celui-ci :
 time_marching:
-  dt_step: 0.05        
-  iters_per_step: 5000  
-  
-  # Audit params
-  audit_threshold: 0.05
+  zones:
+    # ZONE 1 : Démarrage chirurgical (t=0 à 0.5)
+    # C'est ici que tu avais bloqué. On passe dt à 0.01.
+    - t_end: 0.5
+      dt: 0.01        
+      iters: 3000     
+      audit_threshold: 0.05
+
+    # ZONE 2 : Accélération (t=0.5 à 2.0)
+    # Une fois la dynamique lancée, on reprend ton pas de 0.05
+    - t_end: 2.0
+      dt: 0.05
+      iters: 4000
+      audit_threshold: 0.05
+
+    # ZONE 3 : Vitesse de croisière (t=2.0 à 10.0)
+    # Le système est établi, on peut faire des grands sauts
+    - t_end: 10.0
+      dt: 0.1
+      iters: 6000
+      audit_threshold: 0.06
