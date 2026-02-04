@@ -11,7 +11,6 @@ class MultiScaleFourierFeatureEncoding(nn.Module):
         self.scales = torch.tensor(scales).float()
         
         # Création des fréquences (B)
-        # On projette in_dim vers num_features
         B = torch.randn(num_features, in_dim) * self.scales.view(-1, 1).mean()
         self.register_buffer('B', B)
         self.out_dim = num_features * 2 # Sin + Cos
@@ -19,6 +18,48 @@ class MultiScaleFourierFeatureEncoding(nn.Module):
     def forward(self, x):
         proj = 2.0 * np.pi * x @ self.B.t()
         return torch.cat([torch.sin(proj), torch.cos(proj)], dim=-1)
+
+# --- NOUVEAU : BLOC MODIFIÉ ---
+class ModifiedMLP(nn.Module):
+    """
+    Architecture avec connexions résiduelles et injection d'input (Wang et al.).
+    Empêche le gradient de disparaître et force le respect des paramètres physiques.
+    """
+    def __init__(self, input_dim, hidden_layers, output_dim, activation=nn.SiLU()):
+        super().__init__()
+        self.activation = activation
+        self.input_dim = input_dim
+        
+        # Encodeurs U et V (portes d'injection)
+        self.U_encoder = nn.Linear(input_dim, hidden_layers[0])
+        self.V_encoder = nn.Linear(input_dim, hidden_layers[0])
+        
+        self.layers = nn.ModuleList()
+        # Première couche
+        self.layers.append(nn.Linear(input_dim, hidden_layers[0]))
+        
+        # Couches cachées
+        for i in range(len(hidden_layers) - 1):
+            self.layers.append(nn.Linear(hidden_layers[i], hidden_layers[i+1]))
+            
+        # Couche de sortie
+        self.output_layer = nn.Linear(hidden_layers[-1], output_dim)
+
+    def forward(self, x):
+        # On calcule les portes d'injection U et V à partir de l'input x
+        U = self.activation(self.U_encoder(x))
+        V = self.activation(self.V_encoder(x))
+        
+        # Première couche standard
+        H = self.activation(self.layers[0](x))
+        
+        # Pour chaque couche suivante, on mixe l'info H avec l'input (U, V)
+        for layer in self.layers[1:]:
+            Z = self.activation(layer(H))
+            # Formule de réinjection : H_new = (1 - Z) * U + Z * V
+            H = (1 - Z) * U + Z * V
+            
+        return self.output_layer(H)
 
 class CGL_PI_DeepONet(nn.Module):
     def __init__(self, cfg):
@@ -48,73 +89,51 @@ class CGL_PI_DeepONet(nn.Module):
 
         x_min, x_max = x_domain
 
-        # 2. Buffers de Normalisation (Branch Inputs - Equation Params)
+        # Buffers de Normalisation
         self.register_buffer('alpha_min', torch.tensor(eq_p['alpha'][0]))
         self.register_buffer('alpha_max', torch.tensor(eq_p['alpha'][1]))
-
         self.register_buffer('beta_min', torch.tensor(eq_p['beta'][0]))
         self.register_buffer('beta_max', torch.tensor(eq_p['beta'][1]))
-
         self.register_buffer('mu_min', torch.tensor(eq_p['mu'][0]))
         self.register_buffer('mu_max', torch.tensor(eq_p['mu'][1]))
-
         self.register_buffer('V_min', torch.tensor(eq_p['V'][0]))
         self.register_buffer('V_max', torch.tensor(eq_p['V'][1]))
 
-        # Buffers de Normalisation (Branch Inputs - IC Params)
         self.register_buffer('A_min', torch.tensor(b['A'][0]))
         self.register_buffer('A_max', torch.tensor(b['A'][1]))
-        
         self.register_buffer('w0_min', torch.tensor(b['w0'][0]))
         self.register_buffer('w0_max', torch.tensor(b['w0'][1]))
-        
         self.register_buffer('x0_min', torch.tensor(b['x0'][0]))
         self.register_buffer('x0_max', torch.tensor(b['x0'][1]))
-        
         self.register_buffer('k_min', torch.tensor(b['k'][0]))
         self.register_buffer('k_max', torch.tensor(b['k'][1]))
 
-        # Buffers Normalisation (Trunk Inputs)
         self.register_buffer('x_min', torch.tensor(x_min))
         self.register_buffer('x_max', torch.tensor(x_max))
         self.register_buffer('t_max', torch.tensor(t_max))
 
-        # 3. BRANCH NET
+        # --- BRANCH NET (Modified) ---
         self.branch_input_dim = 9 
-        
-        layers_b = []
-        prev_dim = self.branch_input_dim
-        for h_dim in branch_arch:
-            layers_b.append(nn.Linear(prev_dim, h_dim))
-            layers_b.append(nn.SiLU()) 
-            prev_dim = h_dim
-        layers_b.append(nn.Linear(prev_dim, 2 * latent_dim)) # x2 pour Réel/Imaginaire
-        self.branch_net = nn.Sequential(*layers_b)
+        self.branch_net = ModifiedMLP(
+            input_dim=self.branch_input_dim,
+            hidden_layers=branch_arch,
+            output_dim=2 * latent_dim
+        )
 
-        # 4. TRUNK NET
+        # --- TRUNK NET (Modified) ---
         self.trunk_input_dim = 2
-        
         self.trunk_encoding = MultiScaleFourierFeatureEncoding(self.trunk_input_dim, fourier_dim, scales)
         
-        layers_t = []
-        prev_dim = self.trunk_encoding.out_dim 
-        for h_dim in trunk_arch:
-            layers_t.append(nn.Linear(prev_dim, h_dim))
-            layers_t.append(nn.SiLU())
-            prev_dim = h_dim
-        layers_t.append(nn.Linear(prev_dim, latent_dim))
-        self.trunk_net = nn.Sequential(*layers_t)
+        self.trunk_net = ModifiedMLP(
+            input_dim=self.trunk_encoding.out_dim,
+            hidden_layers=trunk_arch,
+            output_dim=latent_dim
+        )
         
         self.latent_dim = latent_dim
 
     def normalize_linear(self, x, x_min, x_max):
-        """
-        Normalisation robuste entre -1 et 1.
-        Fonctionne avec des Tenseurs OU des Floats (grâce à l'absence de torch.where).
-        """
         denom = x_max - x_min
-        # On ajoute simplement epsilon pour éviter la division par zéro
-        # C'est compatible float (python) et tensor (pytorch)
         return 2.0 * (x - x_min) / (denom + 1e-9) - 1.0
 
     def normalize_log(self, x, x_min, x_max):
@@ -123,29 +142,19 @@ class CGL_PI_DeepONet(nn.Module):
                                      torch.log10(torch.abs(x_max) + 1e-9))
 
     def forward(self, params, coords):
-        # params: [alpha, beta, mu, V, A, w0, x0, k, type]
-        
-        # 1. Normalisation Branch (Equation Params)
         norm_alpha = self.normalize_linear(params[:, 0:1], self.alpha_min, self.alpha_max)
         norm_beta  = self.normalize_linear(params[:, 1:2], self.beta_min, self.beta_max)
         norm_mu    = self.normalize_linear(params[:, 2:3], self.mu_min, self.mu_max)
         norm_V     = self.normalize_linear(params[:, 3:4], self.V_min, self.V_max)
-
-        # Normalisation Branch (IC Params)
         norm_A     = self.normalize_linear(params[:, 4:5], self.A_min, self.A_max)
         norm_w0    = self.normalize_log(params[:, 5:6], self.w0_min, self.w0_max)
         norm_x0    = self.normalize_linear(params[:, 6:7], self.x0_min, self.x0_max)
         norm_k     = self.normalize_linear(params[:, 7:8], self.k_min, self.k_max)
-        
-        # C'est ICI que ça plantait avant (0.0 et 2.0 sont des floats)
-        # Avec la nouvelle méthode normalize_linear, ça passe crème !
         norm_type  = self.normalize_linear(params[:, 8:9], 0.0, 2.0)
 
-        # Concaténation
         params_norm = torch.cat([norm_alpha, norm_beta, norm_mu, norm_V, 
                                  norm_A, norm_w0, norm_x0, norm_k, norm_type], dim=1)
 
-        # 2. Normalisation Trunk
         x_raw = coords[:, 0:1]
         t_raw = coords[:, 1:2]
         
@@ -154,13 +163,10 @@ class CGL_PI_DeepONet(nn.Module):
             self.normalize_linear(t_raw, 0.0, self.t_max) 
         ], dim=1)
 
-        # 3. Forward Pass
         B = self.branch_net(params_norm)             
         T = self.trunk_net(self.trunk_encoding(coords_norm))
         
-        # 4. Dot Product
         B_re, B_im = torch.split(B, self.latent_dim, dim=1)
-
         out_re = torch.sum(B_re * T, dim=1, keepdim=True)
         out_im = torch.sum(B_im * T, dim=1, keepdim=True)
 

@@ -38,13 +38,13 @@ training:
   max_retry: 4          
   
   weights:
-    ic_loss: 150.0      
-    pde_loss: 80.0
-    bc_loss: 50.0
+    ic_loss: 20.0    # On garde les poids réduits, c'est mieux
+    pde_loss: 10.0
+    bc_loss: 5.0
 
   ic_phase:
-    iterations: 20000    
-    learning_rate: 0.001 
+    iterations: 20000
+    learning_rate: 0.001
 
 # --- NOUVELLE CONFIGURATION : ZONES TEMPORELLES ---
 # On remplace l'ancien bloc time_marching par celui-ci :
@@ -54,19 +54,19 @@ time_marching:
     # C'est ici que tu avais bloqué. On passe dt à 0.01.
     - t_end: 0.5
       dt: 0.01        
-      iters: 3000     
+      iters: 10000     
       audit_threshold: 0.05
 
     # ZONE 2 : Accélération (t=0.5 à 2.0)
     # Une fois la dynamique lancée, on reprend ton pas de 0.05
     - t_end: 2.0
       dt: 0.05
-      iters: 4000
+      iters: 8000
       audit_threshold: 0.05
 
     # ZONE 3 : Vitesse de croisière (t=2.0 à 10.0)
     # Le système est établi, on peut faire des grands sauts
     - t_end: 10.0
       dt: 0.1
-      iters: 6000
+      iters: 7000
       audit_threshold: 0.06
