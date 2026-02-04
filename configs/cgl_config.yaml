@@ -38,9 +38,9 @@ training:
   max_retry: 4          
   
   weights:
-    ic_loss: 20.0    # On garde les poids réduits, c'est mieux
-    pde_loss: 10.0
-    bc_loss: 5.0
+    ic_loss: 2.0    # On garde les poids réduits, c'est mieux
+    pde_loss: 0.5
+    bc_loss: 0.25
 
   ic_phase:
     iterations: 20000

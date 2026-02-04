@@ -40,9 +40,20 @@ def audit_global_fast(model, cfg, t_max, threshold=0.05, n_samples=20):
 
             p_dict = {'alpha': alpha, 'beta': beta, 'mu': mu, 'V': V, 'A': A, 'w0': w0, 'x0': x0, 'k': k, 'type': type_id}
             
-            X_grid, T_grid, U_true_cplx = get_ground_truth_CGL(p_dict, x_domain[0], x_domain[1], t_max, Nx=256, Nt=None)
+            # Pour l'audit t=0, on génère quand même une petite séquence mais on ne regarde que le début
+            # Si t_max=0, le solveur peut planter, donc on met un petit t
+            audit_t = t_max if t_max > 1e-5 else 0.01
+            X_grid, T_grid, U_true_cplx = get_ground_truth_CGL(p_dict, x_domain[0], x_domain[1], audit_t, Nx=256, Nt=None)
             
-            X_flat, T_flat = X_grid.flatten(), T_grid.flatten()
+            if t_max < 1e-5: # Cas spécial Audit IC (t=0)
+                # On ne prend que la première ligne temporelle (t=0)
+                X_flat = X_grid[0, :]
+                T_flat = np.zeros_like(X_flat)
+                U_true = U_true_cplx[0, :]
+            else:
+                X_flat, T_flat = X_grid.flatten(), T_grid.flatten()
+                U_true = U_true_cplx.flatten()
+
             xt_tensor = torch.tensor(np.stack([X_flat, T_flat], axis=1), dtype=torch.float32).to(device)
             p_vec = np.array([alpha, beta, mu, V, A, w0, x0, k, float(type_id)])
             p_tensor = torch.tensor(p_vec, dtype=torch.float32).unsqueeze(0).repeat(len(X_flat), 1).to(device)
@@ -51,7 +62,6 @@ def audit_global_fast(model, cfg, t_max, threshold=0.05, n_samples=20):
                 u_re, u_im = model(p_tensor, xt_tensor)
                 u_pred_cplx = (u_re + 1j * u_im).cpu().numpy().flatten()
             
-            U_true = U_true_cplx.flatten()
             norm_true = np.linalg.norm(U_true) + 1e-7
             err = np.linalg.norm(U_true - u_pred_cplx) / norm_true
             errors.append(err)
@@ -92,10 +102,19 @@ def diagnose_cgle(model, cfg, t_max, threshold=0.05, n_per_type=10):
             p_dict = {'alpha': alpha, 'beta': beta, 'mu': mu, 'V': V, 'A': A, 'w0': w0, 'x0': x0, 'k': k, 'type': type_id}
             
             try:
-                X_grid, T_grid, U_true_cplx = get_ground_truth_CGL(p_dict, x_domain[0], x_domain[1], t_max, Nx=256, Nt=None)
+                audit_t = t_max if t_max > 1e-5 else 0.01
+                X_grid, T_grid, U_true_cplx = get_ground_truth_CGL(p_dict, x_domain[0], x_domain[1], audit_t, Nx=256, Nt=None)
+                
+                if t_max < 1e-5: # Cas IC
+                    X_flat = X_grid[0, :]
+                    T_flat = np.zeros_like(X_flat)
+                    U_true = U_true_cplx[0, :]
+                else:
+                    X_flat, T_flat = X_grid.flatten(), T_grid.flatten()
+                    U_true = U_true_cplx.flatten()
+
             except: continue
 
-            X_flat, T_flat = X_grid.flatten(), T_grid.flatten()
             xt_tensor = torch.tensor(np.stack([X_flat, T_flat], axis=1), dtype=torch.float32).to(device)
             p_vec = np.array([alpha, beta, mu, V, A, w0, x0, k, float(type_id)])
             p_tensor = torch.tensor(p_vec, dtype=torch.float32).unsqueeze(0).repeat(len(X_flat), 1).to(device)
@@ -104,7 +123,6 @@ def diagnose_cgle(model, cfg, t_max, threshold=0.05, n_per_type=10):
                 u_re, u_im = model(p_tensor, xt_tensor)
                 u_pred = (u_re + 1j * u_im).cpu().numpy().flatten()
             
-            U_true = U_true_cplx.flatten()
             err = np.linalg.norm(U_true - u_pred) / (np.linalg.norm(U_true) + 1e-7)
             errors.append(err)
 
@@ -307,7 +325,6 @@ def train_cgle_curriculum(model, cfg):
         save_dir = cfg['training'].get('save_dir', "outputs/checkpoints_cgl")
         ic_iter = int(cfg['training']['ic_phase']['iterations'])
         t_max_phys = cfg['physics']['t_max']
-        # On récupère les zones du yaml
         zones = cfg['time_marching'].get('zones', [])
     else:
         training_dict = cfg.training 
@@ -358,13 +375,24 @@ def train_cgle_curriculum(model, cfg):
     
     try: lbfgs_ic.step(closure_ic)
     except: pass
+    
     print("✅ Warmup terminé.")
+
+    # --- AJOUT : AUDIT DE LA CONDITION INITIALE (t=0) ---
+    print("\n📊 AUDIT FINAL DE LA CONDITION INITIALE (t=0)...")
+    # On met un threshold très bas (1%) car la CI doit être parfaite.
+    failed_ic = diagnose_cgle(model, cfg, t_max=0.0, threshold=0.01)
+    
+    if not failed_ic:
+        print("🎉 La Condition Initiale est apprise à la perfection (< 1%).")
+    else:
+        print(f"⚠️ Attention : La CI n'est pas parfaite sur les types {failed_ic}.")
+        print("   On espère que le Time Marching corrigera ça, sinon il faudra ajouter du Sobolev.")
 
     # --------------------------------------------------------------------------
     # 2. TIME MARCHING PAR ZONES
     # --------------------------------------------------------------------------
     
-    # Si pas de zones définies, on crée une zone par défaut (fallback)
     if not zones:
         print("⚠️ Aucune zone détectée, utilisation de la config par défaut.")
         zones = [{'t_end': t_max_phys, 'dt': 0.05, 'iters': 3000, 'audit_threshold': 0.05}]
@@ -379,27 +407,35 @@ def train_cgle_curriculum(model, cfg):
         
         print(f"\n🚀 ENTRÉE DANS LA ZONE : t_end={z_end}, dt={z_dt}, iters={z_iters}")
 
-        # On avance dans le temps tant qu'on est dans la zone
-        # On utilise une petite tolérance pour l'arrondi float
         while current_t < z_end - 1e-9:
             
-            # Prochain pas
+            # 1. Calcul du prochain temps cible
             next_t = current_t + z_dt
             
-            # Si le pas dépasse la fin de zone, on cape (optionnel, mais propre)
+            # Capage pour ne pas dépasser la fin de zone
             if next_t > z_end + 1e-9:
                 next_t = z_end
             
-            # Lancement de l'entraînement
+            # 2. Entraînement sur ce pas de temps
             success = train_step_cgle(model, cfg, next_t, n_iters=z_iters, threshold=z_thresh)
             
             if not success:
                 print("🛑 Echec critique du Time Marching. Arrêt.")
-                return # On quitte tout
+                return 
 
-            # Sauvegarde et incrément
+            # 3. Validation du pas
             current_t = next_t
-            ckpt_path = os.path.join(save_dir, f"ckpt_t{current_t:.2f}.pth")
-            torch.save(model.state_dict(), ckpt_path)
+            
+            # 4. SAUVEGARDE DU CHECKPOINT
+            ckpt_name = f"ckpt_t{current_t:.2f}.pth"
+            ckpt_path = os.path.join(save_dir, ckpt_name)
+            
+            torch.save({
+                't': current_t,
+                'model_state_dict': model.state_dict(),
+                'config': cfg._dict if hasattr(cfg, '_dict') else cfg
+            }, ckpt_path)
+            
+            print(f"   💾 Checkpoint sauvegardé : {ckpt_name}")
 
     print("🏁 Fin de toutes les zones. Entraînement terminé.")
