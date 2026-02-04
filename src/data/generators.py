@@ -1,3 +1,5 @@
+import numpy as np   # <--- C'est cette ligne qui manque !
+import torch
 def get_ic_batch_cgle(batch_size, cfg, device):
     """
     Génère un batch pour la Condition Initiale (t=0) AVEC les dérivées spatiales (Sobolev).
