@@ -159,10 +159,11 @@ def diagnose_cgle(model, cfg, t_max, threshold=0.05, n_per_type=10):
     return failed_types
 
 # ==============================================================================
-# 2. FONCTION LOSS
+# 2. FONCTIONS LOSS (Standard + Sobolev)
 # ==============================================================================
 
 def compute_cgle_loss(model, branch_pde, coords_pde, pde_params, branch_ic, coords_ic, u_true_ic_re, u_true_ic_im, cfg):
+    """Loss standard pour le Time Marching (PDE + IC + BC)"""
     # Loss PDE
     r_re, r_im = pde_residual_cgle(model, branch_pde, coords_pde, pde_params, cfg)
     loss_pde = torch.mean(r_re**2 + r_im**2)
@@ -192,6 +193,31 @@ def compute_cgle_loss(model, branch_pde, coords_pde, pde_params, branch_ic, coor
     else: weights = cfg.training['weights']
 
     return weights['pde_loss'] * loss_pde + weights['ic_loss'] * loss_ic + weights.get('bc_loss', 1.0) * loss_bc_masked
+
+def compute_sobolev_ic_loss(model, br_ic, co_ic, true_u_re, true_u_im, true_ux_re, true_ux_im):
+    """Loss Sobolev Spéciale pour le Warmup (Valeurs + Dérivées)"""
+    # 1. On active le gradient sur les coordonnées (x, t)
+    co_ic.requires_grad_(True)
+    
+    # 2. Prédiction
+    pred_re, pred_im = model(br_ic, co_ic)
+    
+    # 3. Loss Valeurs (L2 classique)
+    loss_val = torch.mean((pred_re - true_u_re)**2 + (pred_im - true_u_im)**2)
+    
+    # 4. Calcul des Dérivées Prédites (d/dx)
+    # co_ic[:, 0] est x. On veut d(pred)/dx
+    grad_re = torch.autograd.grad(pred_re.sum(), co_ic, create_graph=True)[0]
+    grad_im = torch.autograd.grad(pred_im.sum(), co_ic, create_graph=True)[0]
+    
+    pred_ux_re = grad_re[:, 0:1] # Dérivée par rapport à x
+    pred_ux_im = grad_im[:, 0:1] # Dérivée par rapport à x
+    
+    # 5. Loss Sobolev (Gradient)
+    loss_grad = torch.mean((pred_ux_re - true_ux_re)**2 + (pred_ux_im - true_ux_im)**2)
+    
+    # On pondère un peu moins le gradient (0.1) pour ne pas étouffer l'apprentissage des valeurs
+    return loss_val + 0.1 * loss_grad
 
 # ==============================================================================
 # 3. BOUCLE D'ENTRAÎNEMENT (RETRY LOGIC)
@@ -225,6 +251,7 @@ def train_step_cgle(model, cfg, t_max, n_iters, threshold=0.05):
             optimizer = optim.LBFGS(model.parameters(), lr=0.2, max_iter=100, tolerance_grad=1e-5, line_search_fn="strong_wolfe")
             for _ in range(20): 
                 br_pde, co_pde, pde_params = get_pde_batch_cgle(batch_size_pde, cfg, device, t_limit=t_max)
+                # Note: On ignore les dérivées ici (_, _)
                 br_ic, co_ic, tr_ic_re, tr_ic_im, _, _ = get_ic_batch_cgle(batch_size_ic, cfg, device)
                 def closure():
                     optimizer.zero_grad()
@@ -248,6 +275,7 @@ def train_step_cgle(model, cfg, t_max, n_iters, threshold=0.05):
             for i in range(current_iters):
                 optimizer.zero_grad(set_to_none=True)
                 br_pde, co_pde, pde_params = get_pde_batch_cgle(batch_size_pde, cfg, device, t_limit=t_max)
+                # Note: On ignore les dérivées ici (_, _)
                 br_ic, co_ic, tr_ic_re, tr_ic_im, _, _ = get_ic_batch_cgle(batch_size_ic, cfg, device)
                 
                 loss = compute_cgle_loss(model, br_pde, co_pde, pde_params, br_ic, co_ic, tr_ic_re, tr_ic_im, cfg)
@@ -360,60 +388,77 @@ def train_cgle_curriculum(model, cfg):
     device = next(model.parameters()).device
     
     # --------------------------------------------------------------------------
-    # 1. WARMUP (IC Only)
+    # 1. WARMUP ROBUSTE (IC Only + Sobolev + Retry Loop)
     # --------------------------------------------------------------------------
-    print("🧊 WARMUP (IC Only)...")
-    print(f"   👉 Phase A : Adam ({ic_iter} iters)")
-    optimizer = optim.Adam(model.parameters(), lr=1e-3)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=1000, verbose=True)
+    print("🧊 WARMUP ROBUSTE (Sobolev + Retry Loop)...")
+    
+    ic_lr = 1e-3
+    ic_attempts = 3
+    ic_success = False
 
-    for i in range(ic_iter):
-        optimizer.zero_grad()
-        br_ic, co_ic, tr_re, tr_im, _, _ = get_ic_batch_cgle(4096, cfg, device)
-        p_re, p_im = model(br_ic, co_ic)
-        loss = torch.mean((p_re - tr_re)**2 + (p_im - tr_im)**2)
+    for attempt in range(ic_attempts):
+        print(f"\n👉 Tentative Warmup {attempt+1}/{ic_attempts} (LR={ic_lr:.1e})")
         
-        if torch.isnan(loss):
-             print("💀 NaN. Reset.")
-             for pg in optimizer.param_groups: pg['lr'] *= 0.1
-             continue
+        # A. Phase Adam (Sobolev)
+        optimizer = optim.Adam(model.parameters(), lr=ic_lr)
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2000)
         
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
-        scheduler.step(loss)
-        if i % 2000 == 0: print(f"   Warmup Adam {i}/{ic_iter} | Loss: {loss.item():.2e}")
+        # On augmente les itérations si on retry
+        current_iters = ic_iter + (5000 * attempt)
+        
+        for i in range(current_iters):
+            optimizer.zero_grad()
+            # Note : get_ic_batch_cgle renvoie maintenant 6 valeurs !
+            br, co, u_re, u_im, ux_re, ux_im = get_ic_batch_cgle(4096, cfg, device)
+            
+            # Utilisation de la loss Sobolev (Valeurs + Dérivées)
+            loss = compute_sobolev_ic_loss(model, br, co, u_re, u_im, ux_re, ux_im)
+            
+            if torch.isnan(loss):
+                 print("💀 NaN during Warmup. Resetting optimizer.")
+                 for pg in optimizer.param_groups: pg['lr'] *= 0.1
+                 continue
+            
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            scheduler.step(loss)
+            
+            if (i+1) % 5000 == 0: 
+                print(f"   Iter {i+1}/{current_iters} | Sobolev Loss: {loss.item():.2e}")
 
-    print(f"   👉 Phase B : L-BFGS (Finition)")
-    batch_size_lbfgs = 4096 * 4 
-    br_ic_fix, co_ic_fix, tr_re_fix, tr_im_fix, _, _ = get_ic_batch_cgle(batch_size_lbfgs, cfg, device)
-    
-    lbfgs_ic = optim.LBFGS(model.parameters(), lr=0.5, max_iter=2000, tolerance_grad=1e-9, line_search_fn="strong_wolfe")
-    def closure_ic():
-        lbfgs_ic.zero_grad()
-        p_re, p_im = model(br_ic_fix, co_ic_fix)
-        loss = torch.mean((p_re - tr_re_fix)**2 + (p_im - tr_im_fix)**2)
-        loss.backward()
-        return loss
-    
-    try: lbfgs_ic.step(closure_ic)
-    except: pass
-    
-    print("✅ Warmup terminé.")
+        # B. Phase L-BFGS (Finition Sobolev)
+        print(f"   👉 Finition L-BFGS (Sobolev)")
+        lbfgs = optim.LBFGS(model.parameters(), lr=0.5, max_iter=2000, line_search_fn="strong_wolfe")
+        
+        # Batch fixe pour LBFGS (plus grand pour plus de précision)
+        br_fix, co_fix, ure_fix, uim_fix, uxre_fix, uxim_fix = get_ic_batch_cgle(8192, cfg, device)
+        
+        def closure_ic():
+            lbfgs.zero_grad()
+            loss = compute_sobolev_ic_loss(model, br_fix, co_fix, ure_fix, uim_fix, uxre_fix, uxim_fix)
+            loss.backward()
+            return loss
+        try: lbfgs.step(closure_ic)
+        except: pass
 
-    # --- AJOUT : AUDIT DE LA CONDITION INITIALE (t=0) ---
-    print("\n📊 AUDIT FINAL DE LA CONDITION INITIALE (t=0)...")
-    # On met un threshold très bas (1%) car la CI doit être parfaite.
-    failed_ic = diagnose_cgle(model, cfg, t_max=0.0, threshold=0.01, n_per_type=100))
-    
-    if failed_ic:
-        # 🛑 KILL SWITCH (Arrêt d'urgence)
-        print(f"\n🛑 ARRET D'URGENCE : La Condition Initiale dépasse 3% d'erreur sur les types {failed_ic}.")
-        print("   📉 Le modèle part trop mal pour espérer réussir la dynamique.")
-        print("   🔌 Arrêt immédiat pour économiser le GPU.")
-        return # Quitte la fonction train_cgle_curriculum et arrête tout.
-    
-    print("🎉 La Condition Initiale est valide (< 3%). Lancement du Time Marching...")
+        # C. Audit Strict
+        print("   📊 Audit de validation...")
+        # Seuil très strict : 1.5% (car on veut la perfection)
+        failed_ic = diagnose_cgle(model, cfg, t_max=0.0, threshold=0.015, n_per_type=100)
+        
+        if not failed_ic:
+            print("🎉 Condition Initiale validée (< 1.5%). On passe à la suite.")
+            ic_success = True
+            break
+        else:
+            print(f"⚠️ Echec Warmup (Types ratés: {failed_ic}). On recommence plus doucement.")
+            ic_lr *= 0.5 # On divise le LR par 2 pour la prochaine tentative
+
+    if not ic_success:
+        print("\n🛑 ECHEC FATAL DU WARMUP. Impossible d'apprendre la CI correctement.")
+        print("   Arrêt du script pour éviter le gaspillage.")
+        return
 
     # --------------------------------------------------------------------------
     # 2. TIME MARCHING PAR ZONES
@@ -443,6 +488,7 @@ def train_cgle_curriculum(model, cfg):
                 next_t = z_end
             
             # 2. Entraînement sur ce pas de temps
+            # Attention: train_step_cgle gère l'ignorance des dérivées via get_ic_batch_cgle
             success = train_step_cgle(model, cfg, next_t, n_iters=z_iters, threshold=z_thresh)
             
             if not success:
