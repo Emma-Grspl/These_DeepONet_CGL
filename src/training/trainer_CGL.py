@@ -227,25 +227,34 @@ def train_step_cgle(model, cfg, t_max, n_iters):
                 except: pass
 
         # --- MODE ADAM ---
+        # --- MODE ADAM ---
         else:
             print(f"  👉 Tentative Globale {attempt+1}/{max_retry} : Adam (LR={current_lr:.2e})")
             optimizer = optim.Adam(model.parameters(), lr=current_lr)
             model.train()
             
-            for i in range(n_iters):
+            # CORRECTION ICI : On augmente en fonction de l'essai actuel (attempt)
+            # On booste de +3000 itérations à chaque retry car le LR baisse
+            current_iters = int(n_iters + (3000 * attempt))
+            
+            print(f"     ⏳ Durée étendue à {current_iters} itérations.")
+
+            for i in range(current_iters):
                 optimizer.zero_grad(set_to_none=True)
                 br_pde, co_pde, pde_params = get_pde_batch_cgle(batch_size_pde, cfg, device, t_limit=t_max)
                 br_ic, co_ic, tr_ic_re, tr_ic_im, _, _ = get_ic_batch_cgle(batch_size_ic, cfg, device)
                 
                 loss = compute_cgle_loss(model, br_pde, co_pde, pde_params, br_ic, co_ic, tr_ic_re, tr_ic_im, cfg)
+                
                 if torch.isnan(loss): 
                     print("    💀 Loss NaN. Break.")
                     break
+                
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
-                if (i+1)%1000==0: print(f"    Iter {i+1} | Loss: {loss.item():.2e}")
-
+                
+                if (i+1)%1000==0: print(f"    Iter {i+1}/{current_iters} | Loss: {loss.item():.2e}")
         # --- AUDIT GLOBAL RAPIDE ---
         success, err = audit_global_fast(model, cfg, t_max, threshold=audit_threshold)
         
