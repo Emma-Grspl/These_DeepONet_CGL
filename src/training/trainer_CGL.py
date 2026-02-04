@@ -77,6 +77,7 @@ def diagnose_cgle(model, cfg, t_max, threshold=0.05, n_per_type=10):
     failed_types = []
     types_map = {0: "Gaussian", 1: "Sech", 2: "Tanh"}
     
+    # Récupération des bornes pour générer des params aléatoires
     if isinstance(cfg, dict):
         eq_p = cfg['physics']['equation_params']
         bounds = cfg['physics']['bounds']
@@ -88,33 +89,49 @@ def diagnose_cgle(model, cfg, t_max, threshold=0.05, n_per_type=10):
 
     print(f"      🔎 Diagnostic Spécifique (t_max={t_max:.2f})...")
 
+    # Grille spatiale fixe pour le diagnostic
+    x_vals = np.linspace(x_domain[0], x_domain[1], 256)
+    
     for type_id, type_name in types_map.items():
         errors = []
         for _ in range(n_per_type):
+            # Paramètres aléatoires
             alpha = np.random.uniform(eq_p['alpha'][0], eq_p['alpha'][1])
             beta  = np.random.uniform(eq_p['beta'][0],  eq_p['beta'][1])
             mu    = np.random.uniform(eq_p['mu'][0],    eq_p['mu'][1])
             V     = np.random.uniform(eq_p['V'][0],     eq_p['V'][1])
+            
             A = np.random.uniform(bounds['A'][0], bounds['A'][1])
             w0 = 10**np.random.uniform(np.log10(bounds['w0'][0]), np.log10(bounds['w0'][1]))
-            x0, k = 0.0, 1.0
+            x0, k = 0.0, 1.0 # On garde simple pour l'audit
 
-            p_dict = {'alpha': alpha, 'beta': beta, 'mu': mu, 'V': V, 'A': A, 'w0': w0, 'x0': x0, 'k': k, 'type': type_id}
-            
-            try:
-                audit_t = t_max if t_max > 1e-5 else 0.01
-                X_grid, T_grid, U_true_cplx = get_ground_truth_CGL(p_dict, x_domain[0], x_domain[1], audit_t, Nx=256, Nt=None)
+            # --- CORRECTION : VÉRITÉ TERRAIN ---
+            if t_max < 1e-5:
+                # CAS T=0 : On utilise la formule Analytique Exacte (comme l'entraînement)
+                X_flat = x_vals
+                T_flat = np.zeros_like(X_flat)
                 
-                if t_max < 1e-5: # Cas IC
-                    X_flat = X_grid[0, :]
-                    T_flat = np.zeros_like(X_flat)
-                    U_true = U_true_cplx[0, :]
-                else:
+                # Formules CGL 1D
+                if type_id == 0:   # Gaussian
+                    U_true = A * np.exp(-((X_flat - x0)**2) / (w0**2)) * np.exp(1j * k * X_flat)
+                elif type_id == 1: # Sech
+                    U_true = A / np.cosh((X_flat - x0) / w0) * np.exp(1j * k * X_flat)
+                elif type_id == 2: # Tanh (Hole/Shock)
+                    U_true = A * np.tanh((X_flat - x0) / w0) * np.exp(1j * k * X_flat)
+                
+                # Convertir en complex numpy
+                U_true = U_true.astype(np.complex64)
+                
+            else:
+                # CAS T>0 : On utilise le Solveur
+                p_dict = {'alpha': alpha, 'beta': beta, 'mu': mu, 'V': V, 'A': A, 'w0': w0, 'x0': x0, 'k': k, 'type': type_id}
+                try:
+                    X_grid, T_grid, U_true_cplx = get_ground_truth_CGL(p_dict, x_domain[0], x_domain[1], t_max, Nx=256, Nt=None)
                     X_flat, T_flat = X_grid.flatten(), T_grid.flatten()
                     U_true = U_true_cplx.flatten()
+                except: continue
 
-            except: continue
-
+            # --- PRÉDICTION ---
             xt_tensor = torch.tensor(np.stack([X_flat, T_flat], axis=1), dtype=torch.float32).to(device)
             p_vec = np.array([alpha, beta, mu, V, A, w0, x0, k, float(type_id)])
             p_tensor = torch.tensor(p_vec, dtype=torch.float32).unsqueeze(0).repeat(len(X_flat), 1).to(device)
@@ -123,10 +140,16 @@ def diagnose_cgle(model, cfg, t_max, threshold=0.05, n_per_type=10):
                 u_re, u_im = model(p_tensor, xt_tensor)
                 u_pred = (u_re + 1j * u_im).cpu().numpy().flatten()
             
-            err = np.linalg.norm(U_true - u_pred) / (np.linalg.norm(U_true) + 1e-7)
+            # --- CALCUL ERREUR ---
+            norm_true = np.linalg.norm(U_true)
+            if norm_true < 1e-6: norm_true = 1e-6 # Sécurité division
+            
+            err = np.linalg.norm(U_true - u_pred) / norm_true
             errors.append(err)
 
         mean_err = np.mean(errors) if errors else 1.0
+        
+        # Affichage
         if mean_err > threshold:
             print(f"      ❌ {type_name}: Err = {mean_err:.2%}")
             failed_types.append(type_id)
@@ -381,13 +404,16 @@ def train_cgle_curriculum(model, cfg):
     # --- AJOUT : AUDIT DE LA CONDITION INITIALE (t=0) ---
     print("\n📊 AUDIT FINAL DE LA CONDITION INITIALE (t=0)...")
     # On met un threshold très bas (1%) car la CI doit être parfaite.
-    failed_ic = diagnose_cgle(model, cfg, t_max=0.0, threshold=0.01)
+    failed_ic = diagnose_cgle(model, cfg, t_max=0.0, threshold=0.01, n_per_type=100))
     
-    if not failed_ic:
-        print("🎉 La Condition Initiale est apprise à la perfection (< 1%).")
-    else:
-        print(f"⚠️ Attention : La CI n'est pas parfaite sur les types {failed_ic}.")
-        print("   On espère que le Time Marching corrigera ça, sinon il faudra ajouter du Sobolev.")
+    if failed_ic:
+        # 🛑 KILL SWITCH (Arrêt d'urgence)
+        print(f"\n🛑 ARRET D'URGENCE : La Condition Initiale dépasse 3% d'erreur sur les types {failed_ic}.")
+        print("   📉 Le modèle part trop mal pour espérer réussir la dynamique.")
+        print("   🔌 Arrêt immédiat pour économiser le GPU.")
+        return # Quitte la fonction train_cgle_curriculum et arrête tout.
+    
+    print("🎉 La Condition Initiale est valide (< 3%). Lancement du Time Marching...")
 
     # --------------------------------------------------------------------------
     # 2. TIME MARCHING PAR ZONES
