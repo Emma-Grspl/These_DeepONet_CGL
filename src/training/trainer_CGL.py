@@ -96,10 +96,14 @@ def audit_global_fast(model, cfg, t_max, threshold=0.05, n_samples=30):
             }
             
             audit_t = t_max if t_max > 1e-5 else 0.0
+            
             if audit_t < 1e-5: # Warmup T=0
+                # On simule un tout petit pas de temps (0.01) juste pour initialiser le solveur
                 X_grid, T_grid, U_true_cplx = get_ground_truth_CGL(p_dict, x_domain[0], x_domain[1], 0.01, Nx=128, Nt=None)
-                U_true = U_true_cplx[0, :] # On prend la ligne 0
-                X_flat = X_grid[0, :]
+                
+                # CORRECTION CRITIQUE ICI : [:, 0] (Espace entier, Temps 0)
+                U_true = U_true_cplx[:, 0] 
+                X_flat = X_grid[:, 0]
                 T_flat = np.zeros_like(X_flat)
             else:
                 X_grid, T_grid, U_true_cplx = get_ground_truth_CGL(p_dict, x_domain[0], x_domain[1], audit_t, Nx=128, Nt=None)
@@ -113,9 +117,14 @@ def audit_global_fast(model, cfg, t_max, threshold=0.05, n_samples=30):
                 ur, ui = model(p_t, xt_t)
                 up = (ur + 1j*ui).cpu().numpy().flatten()
             
-            err = np.linalg.norm(U_true - up) / (np.linalg.norm(U_true) + 1e-7)
+            # Sécurité anti-division par zéro si U_true est vide ou nul
+            norm_true = np.linalg.norm(U_true)
+            if norm_true < 1e-9: norm_true = 1e-9
+            
+            err = np.linalg.norm(U_true - up) / norm_true
             errors.append(err)
-        except: continue
+        except Exception as e: 
+            continue
 
     if not errors: return False, 1.0
     mean_err = np.mean(errors)
