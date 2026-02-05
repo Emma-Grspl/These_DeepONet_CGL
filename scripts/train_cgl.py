@@ -11,26 +11,24 @@ sys.path.append(project_root)
 
 # --- IMPORTS ---
 try:
-    # CORRECTION 1 : Attention à la casse (CGL vs cgle)
-    from src.models.CGL_PI_DeepOnet import CGL_PI_DeepONet
+    # CORRECTION : On pointe vers le bon fichier (cgl_deeponet.py)
+    from src.models.cgl_deeponet import CGL_PI_DeepONet
     from src.training.trainer_CGL import train_cgle_curriculum 
     print("✅ Imports CGL réussis.")
 except ImportError as e:
     print(f"❌ Erreur d'import : {e}")
-    print("Vérifiez que vous êtes bien à la racine du projet et que les noms de fichiers (CGL/cgle) correspondent.")
+    print("Vérifiez que le fichier src/models/cgl_deeponet.py existe bien.")
     sys.exit(1)
 
 # --- HELPER CONFIG ---
 class ConfigObj:
     """
     Wrapper hybride : permet l'accès cfg.key ET cfg['key'].
-    Utile car certains scripts utilisent l'un ou l'autre.
     """
     def __init__(self, dictionary):
         self._dict = dictionary
         for key, value in dictionary.items():
             if isinstance(value, dict):
-                # On ne récursive pas pour garder l'accès dict sur les enfants (ex: cfg.physics['alpha'])
                 setattr(self, key, value) 
             else:
                 setattr(self, key, value)
@@ -44,7 +42,6 @@ class ConfigObj:
 def main():
     # 0. ARGUMENTS
     parser = argparse.ArgumentParser()
-    # CORRECTION 2 : Nom du fichier yaml par défaut
     parser.add_argument("--config", type=str, default="configs/cgl_config.yaml", help="Chemin vers le fichier de config YAML")
     args = parser.parse_args()
 
@@ -54,7 +51,7 @@ def main():
     run_dir = os.path.join(project_root, "results", run_name)
     os.makedirs(run_dir, exist_ok=True)
     
-    # On crée aussi un sous-dossier pour les checkpoints intermédiaires
+    # Sous-dossier checkpoints
     ckpt_dir = os.path.join(run_dir, "checkpoints")
     os.makedirs(ckpt_dir, exist_ok=True)
 
@@ -71,11 +68,11 @@ def main():
         yaml_data = yaml.safe_load(f)
     
     # INJECTION DU SAVE DIR DANS LA CONFIG
-    # Pour que le trainer sache où enregistrer
+    # Crucial pour que le trainer sache où sauvegarder les checkpoints intermédiaires
     if 'training' not in yaml_data: yaml_data['training'] = {}
     yaml_data['training']['save_dir'] = ckpt_dir 
     
-    # Sauvegarde de la config utilisée dans le dossier de résultat (Bonne pratique !)
+    # Sauvegarde de la config utilisée
     with open(os.path.join(run_dir, "config_used.yaml"), 'w') as f:
         yaml.dump(yaml_data, f)
 
@@ -95,12 +92,11 @@ def main():
 
     # 4. INITIALISATION MODÈLE
     print("🏗️  Initialisation du modèle CGL_PI_DeepONet...")
-    # Le modèle attend le dictionnaire brut ou l'objet ConfigObj (ça marche car ConfigObj a __getitem__)
     model = CGL_PI_DeepONet(cfg).to(device)
 
     # 5. ENTRAÎNEMENT
     try:
-        # On passe la main au Curriculum Trainer
+        # On passe la main au Curriculum Trainer (le chef d'orchestre)
         train_cgle_curriculum(model, cfg)
 
         # 6. SAUVEGARDE FINALE

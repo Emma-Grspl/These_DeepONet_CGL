@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=DeepONet_CGL      # Nom du job
+#SBATCH --job-name=CGL      # Nom du job
 #SBATCH --output=slurm/log/%x_%j.out # Log standard
 #SBATCH --error=slurm/log/%x_%j.err  # Log d'erreur
 #SBATCH -A fdb@v100                  # <--- VÉRIFIE CE CODE PROJET !

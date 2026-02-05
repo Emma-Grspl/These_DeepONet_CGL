@@ -34,39 +34,29 @@ training:
   batch_size_ic: 2048   
   batch_size_pde: 4096   
   
-  # Nombre de tentatives Adam avant L-BFGS
-  max_retry: 4          
+  # Stratégie Robustesse
+  max_macro_loops: 3
+  nb_adam_retries: 3
+  check_interval: 2000
+  stagnation_threshold: 0.01  # 1%
   
-  weights:
-    ic_loss: 2.0    # On garde les poids réduits, c'est mieux
-    pde_loss: 0.5
-    bc_loss: 0.25
+  # Poids Dynamiques
+  pde_weight_start: 0.1   # Poids initial (doux)
+  pde_weight_target: 1.0  # Poids final (objectif)
+  ramp_end_t: 0.5         # Fin de la rampe linéaire, début NTK
+  
+  # Seuils Audit
+  target_error_ic: 0.03     # 3% pour le Warmup
+  target_error_global: 0.05 # 5% pour le Time Marching
 
-  ic_phase:
-    iterations: 20000
-    learning_rate: 0.001
-
-# --- NOUVELLE CONFIGURATION : ZONES TEMPORELLES ---
-# On remplace l'ancien bloc time_marching par celui-ci :
 time_marching:
   zones:
-    # ZONE 1 : Démarrage chirurgical (t=0 à 0.5)
-    # C'est ici que tu avais bloqué. On passe dt à 0.01.
     - t_end: 0.5
-      dt: 0.01        
-      iters: 10000     
-      audit_threshold: 0.05
-
-    # ZONE 2 : Accélération (t=0.5 à 2.0)
-    # Une fois la dynamique lancée, on reprend ton pas de 0.05
+      dt: 0.01   # Petit pas pour démarrer
+      iters: 8000
     - t_end: 2.0
       dt: 0.05
-      iters: 8000
-      audit_threshold: 0.05
-
-    # ZONE 3 : Vitesse de croisière (t=2.0 à 10.0)
-    # Le système est établi, on peut faire des grands sauts
+      iters: 6000
     - t_end: 10.0
       dt: 0.1
-      iters: 7000
-      audit_threshold: 0.06
+      iters: 5000
