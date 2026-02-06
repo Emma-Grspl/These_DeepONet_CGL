@@ -1,4 +1,4 @@
-import torch
+iimport torch
 import torch.optim as optim
 import numpy as np
 import os
@@ -11,24 +11,25 @@ from src.data.generators import get_ic_batch_cgle, get_pde_batch_cgle
 from src.utils.solver_cgl import get_ground_truth_CGL 
 
 # ==============================================================================
-# 1. GÉNÉRATEUR DE BATCH BIAISÉ
+# 1. GÉNÉRATEUR DE BATCH BIAISÉ (80% / 20%)
 # ==============================================================================
 
 def get_biased_batch_generator(cfg, device, target_types, t_limit):
     """
-    Retourne une FONCTION qui génère des batchs biaisés (90% target / 10% global).
-    C'est cette fonction qui sera passée au moteur d'entraînement.
+    Retourne une FONCTION qui génère des batchs biaisés :
+    - 80% target (les types échoués)
+    - 20% global (pour maintenir la mémoire du reste)
     """
     def generator(batch_size_pde, batch_size_ic):
         # --- 1. IC BATCH ---
-        # Proportions
-        n_tgt_ic = int(0.9 * batch_size_ic)
+        # Proportions 80 / 20
+        n_tgt_ic = int(0.8 * batch_size_ic)
         n_gen_ic = batch_size_ic - n_tgt_ic
         
-        # Partie Générale (10%)
+        # Partie Générale (20%)
         b_gen, c_gen, tr_re_gen, tr_im_gen, ux_re_gen, ux_im_gen = get_ic_batch_cgle(n_gen_ic, cfg, device)
         
-        # Partie Ciblée (90%) - Via boucle de rejet
+        # Partie Ciblée (80%) - Via boucle de rejet
         list_b, list_c, list_tr_re, list_tr_im, list_ux_re, list_ux_im = [], [], [], [], [], []
         curr = 0
         safety = 0
@@ -65,7 +66,7 @@ def get_biased_batch_generator(cfg, device, target_types, t_limit):
 
         # --- 2. PDE BATCH (Seulement si t_max > 0) ---
         if t_limit > 1e-5:
-            n_tgt_pde = int(0.9 * batch_size_pde)
+            n_tgt_pde = int(0.8 * batch_size_pde) # 80%
             n_gen_pde = batch_size_pde - n_tgt_pde
             
             # Général
@@ -134,7 +135,7 @@ def run_audit(model, cfg, t_max, threshold=0.03, n_global=60, n_specific=30):
         norm = np.linalg.norm(U_true)
         return np.linalg.norm(U_true - up) / (norm if norm > 1e-9 else 1e-9)
 
-    # Global
+    # --- 1. AUDIT GLOBAL ---
     g_errs = []
     for _ in range(n_global):
         try:
@@ -152,9 +153,14 @@ def run_audit(model, cfg, t_max, threshold=0.03, n_global=60, n_specific=30):
     passed_global = global_score < threshold
     print(f"    🌍 Audit Global  : {global_score:.2%} [{'✅' if passed_global else '❌'}]")
 
-    # Specific
+    # 🛑 ARRÊT IMMÉDIAT SI GLOBAL KO
+    if not passed_global:
+        np.random.set_state(rng_state)
+        return False, [] 
+
+    # --- 2. AUDIT SPÉCIFIQUE (Seulement si Global OK) ---
     failed_types = []
-    print(f"    🔎 Audit Spécifique :")
+    print(f"    🔎 Audit Spécifique (Détail) :")
     for t_id in [0, 1, 2]:
         t_errs = []
         for _ in range(n_specific):
@@ -188,16 +194,11 @@ def get_dynamic_pde_weight(model, t_current, cfg, br_pde, co_pde, pde_params, br
     if t_current <= ramp_end: return w_start + (t_current/ramp_end)*(w_target-w_start)
     return w_target
 
-def core_optimization_loop(model, cfg, t_max, start_lr, batch_gen_func, context_name):
+def core_optimization_loop(model, cfg, t_max, start_lr, batch_gen_func, context_name, use_lbfgs=True):
     """
-    Le Cœur du système : Exécute la boucle Adam (avec retries) + L-BFGS + Audit.
-    Identique pour le Global et le Spécifique.
-    
-    Retourne:
-        - success (bool)
-        - failed_types (list)
-        - next_lr (float) : Le LR où on s'est arrêté (pour reprise)
-        - champion_state (dict)
+    Le Cœur du système : Exécute la boucle Adam (avec retries) + L-BFGS (optionnel) + Audit.
+    Args:
+        use_lbfgs (bool): Si True, lance L-BFGS à la fin. Si False, le saute (pour Specific Training).
     """
     device = next(model.parameters()).device
     adam_retries = cfg['training'].get('nb_adam_retries', 3)
@@ -216,7 +217,7 @@ def core_optimization_loop(model, cfg, t_max, start_lr, batch_gen_func, context_
         model.load_state_dict(champion_state)
         optimizer = optim.Adam(model.parameters(), lr=current_lr)
         
-        n_iter = 5000 + (2000 * attempt) # Base iters + rallonge si retry
+        n_iter = 5000 + (2000 * attempt)
         pbar = tqdm(range(n_iter), desc=f"    [{context_name}] Adam {attempt+1}/{adam_retries}", leave=False)
         
         losses_window = []
@@ -281,54 +282,54 @@ def core_optimization_loop(model, cfg, t_max, start_lr, batch_gen_func, context_
 
         # 🛡️ EARLY EXIT AUDIT (After each Adam loop)
         model.load_state_dict(champion_state)
-        # On fait un petit audit rapide pour décider si on continue
         passed_g, failed_t = run_audit(model, cfg, t_max, threshold=target_err, n_global=40, n_specific=20)
         
         if passed_g and len(failed_t) == 0:
             print(f"    ✅ Audit Intermédiaire Validé ! Sortie anticipée.")
-            # On lance quand même le L-BFGS pour la gloire
             break
         
-        # Si on continue, on divise le LR
         current_lr *= 0.5
     
     # --- FINISHER L-BFGS ---
-    print(f"    🔧 L-BFGS Finisher ({context_name})...")
-    model.load_state_dict(champion_state)
-    lbfgs = optim.LBFGS(model.parameters(), lr=0.5, max_iter=800, line_search_fn="strong_wolfe")
-    
-    # Gros Batch Fixe pour LBFGS
-    bp_fix, cp_fix, pp_fix, bi_fix, ci_fix, tr_re_fix, tr_im_fix, ux_re_fix, ux_im_fix = batch_gen_func(
-        cfg['training']['batch_size_pde']*2, cfg['training']['batch_size_ic']*2
-    )
-
-    def closure():
-        lbfgs.zero_grad()
-        if t_max < 1e-5:
-            ci_fix.requires_grad_(True)
-            pr, pi = model(bi_fix, ci_fix)
-            l_val = torch.mean((pr-tr_re_fix)**2 + (pi-tr_im_fix)**2)
-            gr = torch.autograd.grad(pr.sum(), ci_fix, create_graph=True)[0]
-            gi = torch.autograd.grad(pi.sum(), ci_fix, create_graph=True)[0]
-            loss = l_val + 0.1 * torch.mean((gr[:,0:1]-ux_re_fix)**2 + (gi[:,0:1]-ux_im_fix)**2)
-        else:
-            rr, ri = pde_residual_cgle(model, bp_fix, cp_fix, pp_fix, cfg)
-            pr, pi = model(bi_fix, ci_fix)
-            loss = current_pde_w * torch.mean(rr**2 + ri**2) + weights['ic_loss'] * torch.mean((pr-tr_re_fix)**2 + (pi-tr_im_fix)**2)
-        loss.backward()
-        return loss
-    
-    try: lbfgs.step(closure)
-    except: pass
-    
-    final_loss = closure().item()
-    if final_loss < champion_loss:
-        champion_loss = final_loss
-        champion_state = copy.deepcopy(model.state_dict())
-        print(f"    🚀 L-BFGS a amélioré ! (L={champion_loss:.2e})")
-    else:
+    if use_lbfgs:
+        print(f"    🔧 L-BFGS Finisher ({context_name})...")
         model.load_state_dict(champion_state)
-        print("    ⚠️ Restauration Champion pré-LBFGS.")
+        lbfgs = optim.LBFGS(model.parameters(), lr=0.5, max_iter=800, line_search_fn="strong_wolfe")
+        
+        bp_fix, cp_fix, pp_fix, bi_fix, ci_fix, tr_re_fix, tr_im_fix, ux_re_fix, ux_im_fix = batch_gen_func(
+            cfg['training']['batch_size_pde']*2, cfg['training']['batch_size_ic']*2
+        )
+
+        def closure():
+            lbfgs.zero_grad()
+            if t_max < 1e-5:
+                ci_fix.requires_grad_(True)
+                pr, pi = model(bi_fix, ci_fix)
+                l_val = torch.mean((pr-tr_re_fix)**2 + (pi-tr_im_fix)**2)
+                gr = torch.autograd.grad(pr.sum(), ci_fix, create_graph=True)[0]
+                gi = torch.autograd.grad(pi.sum(), ci_fix, create_graph=True)[0]
+                loss = l_val + 0.1 * torch.mean((gr[:,0:1]-ux_re_fix)**2 + (gi[:,0:1]-ux_im_fix)**2)
+            else:
+                rr, ri = pde_residual_cgle(model, bp_fix, cp_fix, pp_fix, cfg)
+                pr, pi = model(bi_fix, ci_fix)
+                loss = current_pde_w * torch.mean(rr**2 + ri**2) + weights['ic_loss'] * torch.mean((pr-tr_re_fix)**2 + (pi-tr_im_fix)**2)
+            loss.backward()
+            return loss
+        
+        try: lbfgs.step(closure)
+        except: pass
+        
+        final_loss = closure().item()
+        if final_loss < champion_loss:
+            champion_loss = final_loss
+            champion_state = copy.deepcopy(model.state_dict())
+            print(f"    🚀 L-BFGS a amélioré ! (L={champion_loss:.2e})")
+        else:
+            model.load_state_dict(champion_state)
+            print("    ⚠️ Restauration Champion pré-LBFGS.")
+    else:
+        print(f"    ⏩ L-BFGS Skipped for {context_name} (Safety Preservation).")
+        model.load_state_dict(champion_state)
 
     # --- AUDIT FINAL DU CYCLE ---
     passed_g, failed_t = run_audit(model, cfg, t_max, threshold=target_err, n_global=100, n_specific=50)
@@ -344,7 +345,6 @@ def robust_optimize(model, cfg, t_max, n_iters_base, context_str="Global"):
     start_lr = float(cfg['training']['ic_phase']['learning_rate'])
     device = next(model.parameters()).device
     
-    # LR Courant qui va évoluer entre les phases
     current_lr = start_lr
     
     print(f"\n🏰 [Robust Optimize : {context_str}] t={t_max:.2f}")
@@ -352,34 +352,30 @@ def robust_optimize(model, cfg, t_max, n_iters_base, context_str="Global"):
     for macro in range(max_macro):
         print(f"  🔄 Macro Cycle {macro+1}/{max_macro}")
 
-        # 1️⃣ PHASE GLOBALE
-        # Générateur Standard
+        # 1️⃣ PHASE GLOBALE (Standard + L-BFGS)
         gen_std = get_standard_batch_generator(cfg, device, t_max)
         
         ok, failed_types, next_lr, best_state = core_optimization_loop(
-            model, cfg, t_max, current_lr, gen_std, context_name="GLOBAL"
+            model, cfg, t_max, current_lr, gen_std, context_name="GLOBAL", use_lbfgs=True
         )
-        
-        # On met à jour le LR pour la suite (Global -> Specific ou Global -> Next Macro)
         current_lr = next_lr 
         
         if ok and not failed_types:
             print("    🏆 VICTOIRE TOTALE ! Passage à la suite.")
             return True
             
-        # 2️⃣ PHASE SPÉCIFIQUE (Si nécessaire)
+        # 2️⃣ PHASE SPÉCIFIQUE (Si nécessaire) -> Pas de L-BFGS
         if failed_types:
             print(f"    ⚠️ ECHEC SPÉCIFIQUE sur {failed_types}. Lancement Mode CIBLÉ avec LR={current_lr:.1e}")
             
-            # Générateur Biaisé (90% sur les failed_types)
+            # Générateur Biaisé (80% sur les failed_types)
             gen_biased = get_biased_batch_generator(cfg, device, failed_types, t_max)
             
-            # ON RENTRE DANS LA BOUCLE EXACTEMENT IDENTIQUE (Même structure, même retries, LBFGS...)
             ok_spec, failed_spec, next_lr_spec, best_state_spec = core_optimization_loop(
-                model, cfg, t_max, current_lr, gen_biased, context_name="SPECIFIC"
+                model, cfg, t_max, current_lr, gen_biased, context_name="SPECIFIC", use_lbfgs=False
             )
             
-            current_lr = next_lr_spec # On récupère le LR final du spécifique
+            current_lr = next_lr_spec
             
             if ok_spec and not failed_spec:
                  print("    ✅ CORRECTION SPÉCIFIQUE RÉUSSIE !")
