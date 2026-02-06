@@ -178,9 +178,7 @@ def get_dynamic_pde_weight(model, t_current, cfg, br_pde, co_pde, pde_params, br
 def core_optimization_loop(model, cfg, t_max, start_lr, batch_gen_func, context_name, 
                            global_best_state, global_best_score, use_lbfgs=True):
     """
-    Core Loop :
-    - Sortie immédiate (Skip L-BFGS) dès que l'Audit Global est validé.
-    - Si Audit Global OK mais Spécifique KO -> Le return renvoie les types échoués et l'orchestrateur lance la correction.
+    Core Loop avec Sécurité L-BFGS stricte et sortie conditionnelle sur Audit.
     """
     device = next(model.parameters()).device
     adam_retries = cfg['training'].get('nb_adam_retries', 3)
@@ -194,7 +192,7 @@ def core_optimization_loop(model, cfg, t_max, start_lr, batch_gen_func, context_
     champion_audit_score = global_best_score 
 
     current_lr = start_lr
-    early_exit_success = False # Si True -> On saute L-BFGS
+    early_exit_success = False # Si True -> On a réussi l'audit global, on sort pour vérifier le spécifique
     
     print(f"  ⚔️  Start {context_name} Training (LR={current_lr:.1e})...")
     
@@ -260,37 +258,44 @@ def core_optimization_loop(model, cfg, t_max, start_lr, batch_gen_func, context_
             champion_state = local_run_best_state
             print(f"    🚀 Nouveau Champion Local (L={champion_loss:.2e})")
 
-        # 🛡️ EARLY EXIT AUDIT
-        # On vérifie si on est bon pour sortir
+        # 🛡️ EARLY EXIT AUDIT (Intermédiaire)
+        # On charge le meilleur état pour le tester
         model.load_state_dict(champion_state)
+        # On utilise un audit intermédiaire (40 global, 20 specific) pour décider vite
         passed_g, failed_t, current_score = run_audit(model, cfg, t_max, threshold=target_err, n_global=40, n_specific=20, verbose=False)
         
         if current_score < champion_audit_score:
             champion_audit_score = current_score
 
-        # 🔥 MODIFICATION : ON SORT DÈS QUE LE GLOBAL EST BON
+        # LOGIQUE DE BREAK : Si Global OK => On sort pour laisser l'orchestrateur gérer le spécifique
         if passed_g:
             if len(failed_t) == 0:
                 print(f"    ✅ Audit Intermédiaire PARFAIT ! Sortie anticipée.")
             else:
                 print(f"    ⚠️ Audit Global OK ({current_score:.2%}) mais Spécifique KO {failed_t}. Sortie pour Correction.")
             
-            early_exit_success = True # <--- Empêche L-BFGS de se lancer
-            break
+            early_exit_success = True 
+            break # Sortie de la boucle Adam retries
         
         current_lr *= 0.5
     
-    # --- FINISHER L-BFGS ---
-    # Ne se lance QUE SI :
-    # 1. On l'a demandé
-    # 2. ET qu'on n'a PAS réussi l'Early Exit (donc si le Global est encore mauvais)
+    # --- FINISHER L-BFGS (Avec Rollback Strict) ---
+    # On ne lance LBFGS que si :
+    # 1. Option activée
+    # 2. On n'a PAS déjà réussi l'audit parfait (early_exit_success permet de skipper si tout est déjà vert)
+    #    Note : Si early_exit_success est True mais qu'il y a des failed_t, on skip aussi LBFGS car on veut passer en mode "Specifique" via robust_optimize
+    
     if use_lbfgs and not early_exit_success:
         print(f"    🔧 L-BFGS Finisher ({context_name})...")
         
-        # Audit Avant
+        # 1. Sauvegarde de sécurité EXPLICITE (Deep Copy)
+        # On part du champion (le meilleur état Adam)
         model.load_state_dict(champion_state)
+        state_before_lbfgs = copy.deepcopy(model.state_dict())
+
+        # Audit Avant LBFGS (Référence)
         _, _, score_before = run_audit(model, cfg, t_max, threshold=target_err, n_global=40, n_specific=0, verbose=False)
-        print(f"       -> Audit avant L-BFGS : {score_before:.2%}")
+        print(f"        -> Audit avant L-BFGS : {score_before:.2%}")
 
         lbfgs = optim.LBFGS(model.parameters(), lr=0.5, max_iter=800, line_search_fn="strong_wolfe")
         bp, cp, pp, bi, ci, tr, ti, ux, ui = batch_gen_func(cfg['training']['batch_size_pde']*2, cfg['training']['batch_size_ic']*2)
@@ -314,20 +319,24 @@ def core_optimization_loop(model, cfg, t_max, start_lr, batch_gen_func, context_
         try: lbfgs.step(closure)
         except: pass
         
-        # Audit Après
+        # Audit Après LBFGS
         _, _, score_after = run_audit(model, cfg, t_max, threshold=target_err, n_global=40, n_specific=0, verbose=False)
-        print(f"       -> Audit après L-BFGS : {score_after:.2%}")
+        print(f"        -> Audit après L-BFGS : {score_after:.2%}")
         
-        if score_after < score_before:
+        # 2. LOGIQUE DE ROLLBACK STRICTE
+        # Si le score augmente (c'est mauvais), on restaure l'état d'avant LBFGS.
+        if score_after > score_before:
+            print(f"    ⚠️ L-BFGS REJETÉ (Dégradation Audit: {score_before:.2%} -> {score_after:.2%}).")
+            print("       -> ROLLBACK : Restauration des poids pré-LBFGS.")
+            model.load_state_dict(state_before_lbfgs)
+            # Le champion reste celui d'avant (Adam)
+        else:
             print(f"    🚀 L-BFGS Validé ! (Gain Audit: {score_before - score_after:.2%})")
             champion_state = copy.deepcopy(model.state_dict())
             champion_audit_score = score_after
-        else:
-            print(f"    ⚠️ L-BFGS REJETÉ (Régression Audit). Restauration Champion Pré-LBFGS.")
-            model.load_state_dict(champion_state)
             
     elif early_exit_success:
-        print(f"    ⏩ L-BFGS Skipped (Global Audit Passed).")
+        print(f"    ⏩ L-BFGS Skipped (Early Exit Triggered).")
     else:
         print(f"    ⏩ L-BFGS Skipped (Config).")
         model.load_state_dict(champion_state)
@@ -339,6 +348,7 @@ def core_optimization_loop(model, cfg, t_max, start_lr, batch_gen_func, context_
         return passed_g, failed_t, current_lr, champion_state, final_score
     else:
         return passed_g, failed_t, current_lr, global_best_state, global_best_score
+        
 # ==============================================================================
 # 4. ORCHESTRATEUR
 # ==============================================================================
