@@ -20,10 +20,10 @@ physics:
 model:
   branch_input_dim: 9 
   trunk_input_dim: 2
-  latent_dim: 256
+  latent_dim: 512
   
-  branch_layers: [256, 256, 256, 256, 256]
-  trunk_layers: [256, 256, 256, 256]
+  branch_layers: [512, 512, 512, 512, 512, 512]
+  trunk_layers: [512, 512, 512, 512, 512]
   
   activation: "silu"
   
@@ -35,13 +35,13 @@ training:
   batch_size_pde: 16384   
   
   # Stratégie Robustesse
-  max_macro_loops: 4
+  max_macro_loops: 5
   nb_adam_retries: 5
   check_interval: 2000
-  stagnation_threshold: 0.01  # 1%
+  stagnation_threshold: 0.001  # 1%
   
   # Poids Dynamiques
-  pde_weight_start: 0.1   # Poids initial (doux)
+  pde_weight_start: 0.01   # Poids initial (doux)
   pde_weight_target: 1.0  # Poids final (objectif)
   ramp_end_t: 0.5         # Fin de la rampe linéaire, début NTK
   
@@ -52,7 +52,7 @@ training:
   # --- 👇 CE QU'IL MANQUAIT 👇 ---
   weights:
     pde_loss: 0.5
-    ic_loss: 2.0
+    ic_loss: 10.0
     bc_loss: 0.25
 
   ic_phase:
@@ -64,10 +64,10 @@ time_marching:
   zones:
     - t_end: 0.5
       dt: 0.01   # Petit pas pour démarrer
-      iters: 10000
+      iters: 15000
     - t_end: 2.0
       dt: 0.05
-      iters: 9000
+      iters: 12000
     - t_end: 5.0
       dt: 0.1
-      iters: 7000
+      iters: 10000

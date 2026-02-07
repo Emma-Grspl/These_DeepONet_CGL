@@ -178,7 +178,8 @@ def get_dynamic_pde_weight(model, t_current, cfg, br_pde, co_pde, pde_params, br
 def core_optimization_loop(model, cfg, t_max, start_lr, batch_gen_func, context_name, 
                            global_best_state, global_best_score, use_lbfgs=True):
     """
-    Core Loop avec Sécurité L-BFGS stricte et sortie conditionnelle sur Audit.
+    Core Loop avec Sécurité L-BFGS stricte, sortie conditionnelle sur Audit
+    ET Conditions aux Limites Neumann (BC).
     """
     device = next(model.parameters()).device
     adam_retries = cfg['training'].get('nb_adam_retries', 3)
@@ -220,6 +221,7 @@ def core_optimization_loop(model, cfg, t_max, start_lr, batch_gen_func, context_
             # 3. Step
             optimizer.zero_grad(set_to_none=True)
             if t_max < 1e-5:
+                # WARMUP (IC Only)
                 c_i.requires_grad_(True)
                 pr, pi = model(b_i, c_i)
                 l_val = torch.mean((pr-tr_re)**2 + (pi-tr_im)**2)
@@ -228,9 +230,39 @@ def core_optimization_loop(model, cfg, t_max, start_lr, batch_gen_func, context_
                 l_sob = torch.mean((gr[:,0:1]-ux_re)**2 + (gi[:,0:1]-ux_im)**2)
                 loss = l_val + 0.1 * l_sob
             else:
+                # TIME MARCHING (PDE + IC + BC)
                 rr, ri = pde_residual_cgle(model, b_p, c_p, p_p, cfg)
                 pr, pi = model(b_i, c_i)
-                loss = current_pde_w * torch.mean(rr**2 + ri**2) + weights['ic_loss'] * torch.mean((pr-tr_re)**2 + (pi-tr_im)**2)
+                
+                # --- AJOUT BC NEUMANN (ADAM) ---
+                # 1. Sélection sous-ensemble (25%) pour BC
+                idx_bc = torch.randperm(b_p.size(0))[:int(b_p.size(0)*0.25)]
+                b_bc = b_p[idx_bc]
+                c_bc = c_p[idx_bc].clone()
+                x_min, x_max = cfg['physics']['x_domain']
+                
+                # 2. Force x_min et x_max
+                c_left = c_bc.clone(); c_left[:, 0] = x_min
+                c_right = c_bc.clone(); c_right[:, 0] = x_max
+                
+                # 3. Combine et Gradients
+                b_all_bc = torch.cat([b_bc, b_bc], dim=0)
+                c_all_bc = torch.cat([c_left, c_right], dim=0)
+                c_all_bc.requires_grad_(True)
+                
+                ur_bc, ui_bc = model(b_all_bc, c_all_bc)
+                
+                grad_outputs = torch.ones_like(ur_bc)
+                grads_r = torch.autograd.grad(ur_bc, c_all_bc, grad_outputs=grad_outputs, create_graph=True)[0]
+                grads_i = torch.autograd.grad(ui_bc, c_all_bc, grad_outputs=grad_outputs, create_graph=True)[0]
+                
+                # 4. Loss Neumann (Pente nulle)
+                loss_bc = torch.mean(grads_r[:, 0:1]**2 + grads_i[:, 0:1]**2)
+                # -------------------------------
+
+                loss = current_pde_w * torch.mean(rr**2 + ri**2) \
+                     + weights['ic_loss'] * torch.mean((pr-tr_re)**2 + (pi-tr_im)**2) \
+                     + weights.get('bc_loss', 0.25) * loss_bc  # <--- Ajouté
 
             loss.backward()
             optimizer.step()
@@ -312,7 +344,34 @@ def core_optimization_loop(model, cfg, t_max, start_lr, batch_gen_func, context_
             else:
                 rr, ri = pde_residual_cgle(model, bp, cp, pp, cfg)
                 pr, pi = model(bi, ci)
-                loss = current_pde_w * torch.mean(rr**2 + ri**2) + weights['ic_loss'] * torch.mean((pr-tr)**2 + (pi-ti)**2)
+                
+                # --- AJOUT BC NEUMANN (L-BFGS) ---
+                # On doit refaire le calcul BC dans la closure
+                idx_bc = torch.randperm(bp.size(0))[:int(bp.size(0)*0.25)]
+                b_bc = bp[idx_bc]
+                c_bc = cp[idx_bc].clone()
+                x_min, x_max = cfg['physics']['x_domain']
+                
+                c_left = c_bc.clone(); c_left[:, 0] = x_min
+                c_right = c_bc.clone(); c_right[:, 0] = x_max
+                
+                b_all_bc = torch.cat([b_bc, b_bc], dim=0)
+                c_all_bc = torch.cat([c_left, c_right], dim=0)
+                c_all_bc.requires_grad_(True)
+                
+                ur_bc, ui_bc = model(b_all_bc, c_all_bc)
+                
+                grad_outputs = torch.ones_like(ur_bc)
+                grads_r = torch.autograd.grad(ur_bc, c_all_bc, grad_outputs=grad_outputs, create_graph=True)[0]
+                grads_i = torch.autograd.grad(ui_bc, c_all_bc, grad_outputs=grad_outputs, create_graph=True)[0]
+                
+                loss_bc = torch.mean(grads_r[:, 0:1]**2 + grads_i[:, 0:1]**2)
+                # ---------------------------------
+
+                loss = current_pde_w * torch.mean(rr**2 + ri**2) \
+                     + weights['ic_loss'] * torch.mean((pr-tr)**2 + (pi-ti)**2) \
+                     + weights.get('bc_loss', 0.25) * loss_bc # <--- Ajouté
+
             loss.backward()
             return loss
         
@@ -348,7 +407,6 @@ def core_optimization_loop(model, cfg, t_max, start_lr, batch_gen_func, context_
         return passed_g, failed_t, current_lr, champion_state, final_score
     else:
         return passed_g, failed_t, current_lr, global_best_state, global_best_score
-        
 # ==============================================================================
 # 4. ORCHESTRATEUR
 # ==============================================================================
