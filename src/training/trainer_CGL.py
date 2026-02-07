@@ -177,23 +177,19 @@ def get_dynamic_pde_weight(model, t_current, cfg, br_pde, co_pde, pde_params, br
 
 def core_optimization_loop(model, cfg, t_max, start_lr, batch_gen_func, context_name, 
                            global_best_state, global_best_score, use_lbfgs=True):
-    """
-    Core Loop avec Sécurité L-BFGS stricte, sortie conditionnelle sur Audit
-    ET Conditions aux Limites Neumann (BC).
-    """
     device = next(model.parameters()).device
     adam_retries = cfg['training'].get('nb_adam_retries', 3)
     target_err = cfg['training'].get('target_error_ic', 0.03) if t_max < 1e-5 else cfg['training'].get('target_error_global', 0.05)
     weights = cfg['training']['weights'].copy()
     check_interval = cfg['training'].get('check_interval', 2000)
-    stagnation_thresh = cfg['training'].get('stagnation_threshold', 0.01)
+    stagnation_thresh = cfg['training'].get('stagnation_threshold', 1e-4)
     
     champion_state = copy.deepcopy(global_best_state)
     champion_loss = float('inf') 
     champion_audit_score = global_best_score 
 
     current_lr = start_lr
-    early_exit_success = False # Si True -> On a réussi l'audit global, on sort pour vérifier le spécifique
+    early_exit_success = False 
     
     print(f"  ⚔️  Start {context_name} Training (LR={current_lr:.1e})...")
     
@@ -214,14 +210,16 @@ def core_optimization_loop(model, cfg, t_max, start_lr, batch_gen_func, context_
             b_p, c_p, p_p, b_i, c_i, tr_re, tr_im, ux_re, ux_im = batch_gen_func(
                 cfg['training']['batch_size_pde'], cfg['training']['batch_size_ic']
             )
-            # 2. Weight
+            
+            # 2. Weight Update
             if t_max > 0 and i % 500 == 0:
                 current_pde_w = get_dynamic_pde_weight(model, t_max, cfg, b_p, c_p, p_p, b_i, c_i, tr_re, tr_im)
 
             # 3. Step
             optimizer.zero_grad(set_to_none=True)
+            
             if t_max < 1e-5:
-                # WARMUP (IC Only)
+                # WARMUP
                 c_i.requires_grad_(True)
                 pr, pi = model(b_i, c_i)
                 l_val = torch.mean((pr-tr_re)**2 + (pi-tr_im)**2)
@@ -230,39 +228,30 @@ def core_optimization_loop(model, cfg, t_max, start_lr, batch_gen_func, context_
                 l_sob = torch.mean((gr[:,0:1]-ux_re)**2 + (gi[:,0:1]-ux_im)**2)
                 loss = l_val + 0.1 * l_sob
             else:
-                # TIME MARCHING (PDE + IC + BC)
+                # TIME MARCHING + BC NEUMANN
                 rr, ri = pde_residual_cgle(model, b_p, c_p, p_p, cfg)
                 pr, pi = model(b_i, c_i)
                 
-                # --- AJOUT BC NEUMANN (ADAM) ---
-                # 1. Sélection sous-ensemble (25%) pour BC
+                # BC Neumann Logic
                 idx_bc = torch.randperm(b_p.size(0))[:int(b_p.size(0)*0.25)]
                 b_bc = b_p[idx_bc]
                 c_bc = c_p[idx_bc].clone()
                 x_min, x_max = cfg['physics']['x_domain']
-                
-                # 2. Force x_min et x_max
                 c_left = c_bc.clone(); c_left[:, 0] = x_min
                 c_right = c_bc.clone(); c_right[:, 0] = x_max
-                
-                # 3. Combine et Gradients
                 b_all_bc = torch.cat([b_bc, b_bc], dim=0)
                 c_all_bc = torch.cat([c_left, c_right], dim=0)
                 c_all_bc.requires_grad_(True)
                 
                 ur_bc, ui_bc = model(b_all_bc, c_all_bc)
-                
                 grad_outputs = torch.ones_like(ur_bc)
                 grads_r = torch.autograd.grad(ur_bc, c_all_bc, grad_outputs=grad_outputs, create_graph=True)[0]
                 grads_i = torch.autograd.grad(ui_bc, c_all_bc, grad_outputs=grad_outputs, create_graph=True)[0]
-                
-                # 4. Loss Neumann (Pente nulle)
                 loss_bc = torch.mean(grads_r[:, 0:1]**2 + grads_i[:, 0:1]**2)
-                # -------------------------------
 
                 loss = current_pde_w * torch.mean(rr**2 + ri**2) \
                      + weights['ic_loss'] * torch.mean((pr-tr_re)**2 + (pi-tr_im)**2) \
-                     + weights.get('bc_loss', 0.25) * loss_bc  # <--- Ajouté
+                     + weights.get('bc_loss', 0.25) * loss_bc
 
             loss.backward()
             optimizer.step()
@@ -270,13 +259,11 @@ def core_optimization_loop(model, cfg, t_max, start_lr, batch_gen_func, context_
             curr_loss = loss.item()
             losses_window.append(curr_loss)
             
-            if i % 1000 == 0:
-                print(f"      [{context_name} Iter {i}] Loss: {curr_loss:.2e}")
-            
             if curr_loss < local_run_best_loss:
                 local_run_best_loss = curr_loss
                 local_run_best_state = copy.deepcopy(model.state_dict())
             
+            # Anti-Stagnation
             if i > 0 and i % check_interval == 0:
                 curr_avg = np.mean(losses_window[-check_interval:])
                 if len(losses_window) > check_interval:
@@ -290,42 +277,33 @@ def core_optimization_loop(model, cfg, t_max, start_lr, batch_gen_func, context_
             champion_state = local_run_best_state
             print(f"    🚀 Nouveau Champion Local (L={champion_loss:.2e})")
 
-        # 🛡️ EARLY EXIT AUDIT (Intermédiaire)
-        # On charge le meilleur état pour le tester
+        # 🛡️ AUDIT INTERMÉDIAIRE (LIVE)
         model.load_state_dict(champion_state)
-        # On utilise un audit intermédiaire (40 global, 20 specific) pour décider vite
         passed_g, failed_t, current_score = run_audit(model, cfg, t_max, threshold=target_err, n_global=40, n_specific=20, verbose=False)
         
         if current_score < champion_audit_score:
             champion_audit_score = current_score
 
-        # LOGIQUE DE BREAK : Si Global OK => On sort pour laisser l'orchestrateur gérer le spécifique
+        status_icon = "✅" if passed_g else "❌"
+        print(f"    📊 Fin Adam {attempt+1}: Audit Global={current_score:.2%} {status_icon} | Failed Types={failed_t}")
+
+        # BREAK SI OK
         if passed_g:
             if len(failed_t) == 0:
                 print(f"    ✅ Audit Intermédiaire PARFAIT ! Sortie anticipée.")
             else:
-                print(f"    ⚠️ Audit Global OK ({current_score:.2%}) mais Spécifique KO {failed_t}. Sortie pour Correction.")
+                print(f"    ⚠️ Audit Global OK mais Spécifique KO {failed_t}. Sortie pour Correction.")
             
             early_exit_success = True 
-            break # Sortie de la boucle Adam retries
+            break 
         
         current_lr *= 0.5
     
-    # --- FINISHER L-BFGS (Avec Rollback Strict) ---
-    # On ne lance LBFGS que si :
-    # 1. Option activée
-    # 2. On n'a PAS déjà réussi l'audit parfait (early_exit_success permet de skipper si tout est déjà vert)
-    #    Note : Si early_exit_success est True mais qu'il y a des failed_t, on skip aussi LBFGS car on veut passer en mode "Specifique" via robust_optimize
-    
+    # --- FINISHER L-BFGS ---
     if use_lbfgs and not early_exit_success:
         print(f"    🔧 L-BFGS Finisher ({context_name})...")
-        
-        # 1. Sauvegarde de sécurité EXPLICITE (Deep Copy)
-        # On part du champion (le meilleur état Adam)
         model.load_state_dict(champion_state)
         state_before_lbfgs = copy.deepcopy(model.state_dict())
-
-        # Audit Avant LBFGS (Référence)
         _, _, score_before = run_audit(model, cfg, t_max, threshold=target_err, n_global=40, n_specific=0, verbose=False)
         print(f"        -> Audit avant L-BFGS : {score_before:.2%}")
 
@@ -345,50 +323,37 @@ def core_optimization_loop(model, cfg, t_max, start_lr, batch_gen_func, context_
                 rr, ri = pde_residual_cgle(model, bp, cp, pp, cfg)
                 pr, pi = model(bi, ci)
                 
-                # --- AJOUT BC NEUMANN (L-BFGS) ---
-                # On doit refaire le calcul BC dans la closure
+                # BC Neumann (Closure)
                 idx_bc = torch.randperm(bp.size(0))[:int(bp.size(0)*0.25)]
-                b_bc = bp[idx_bc]
-                c_bc = cp[idx_bc].clone()
+                b_bc = bp[idx_bc]; c_bc = cp[idx_bc].clone()
                 x_min, x_max = cfg['physics']['x_domain']
-                
                 c_left = c_bc.clone(); c_left[:, 0] = x_min
                 c_right = c_bc.clone(); c_right[:, 0] = x_max
-                
                 b_all_bc = torch.cat([b_bc, b_bc], dim=0)
                 c_all_bc = torch.cat([c_left, c_right], dim=0)
                 c_all_bc.requires_grad_(True)
                 
                 ur_bc, ui_bc = model(b_all_bc, c_all_bc)
-                
                 grad_outputs = torch.ones_like(ur_bc)
                 grads_r = torch.autograd.grad(ur_bc, c_all_bc, grad_outputs=grad_outputs, create_graph=True)[0]
                 grads_i = torch.autograd.grad(ui_bc, c_all_bc, grad_outputs=grad_outputs, create_graph=True)[0]
-                
                 loss_bc = torch.mean(grads_r[:, 0:1]**2 + grads_i[:, 0:1]**2)
-                # ---------------------------------
 
                 loss = current_pde_w * torch.mean(rr**2 + ri**2) \
                      + weights['ic_loss'] * torch.mean((pr-tr)**2 + (pi-ti)**2) \
-                     + weights.get('bc_loss', 0.25) * loss_bc # <--- Ajouté
-
+                     + weights.get('bc_loss', 0.25) * loss_bc
             loss.backward()
             return loss
         
         try: lbfgs.step(closure)
         except: pass
         
-        # Audit Après LBFGS
         _, _, score_after = run_audit(model, cfg, t_max, threshold=target_err, n_global=40, n_specific=0, verbose=False)
         print(f"        -> Audit après L-BFGS : {score_after:.2%}")
         
-        # 2. LOGIQUE DE ROLLBACK STRICTE
-        # Si le score augmente (c'est mauvais), on restaure l'état d'avant LBFGS.
         if score_after > score_before:
-            print(f"    ⚠️ L-BFGS REJETÉ (Dégradation Audit: {score_before:.2%} -> {score_after:.2%}).")
-            print("       -> ROLLBACK : Restauration des poids pré-LBFGS.")
+            print(f"    ⚠️ L-BFGS REJETÉ (Dégradation Audit). ROLLBACK.")
             model.load_state_dict(state_before_lbfgs)
-            # Le champion reste celui d'avant (Adam)
         else:
             print(f"    🚀 L-BFGS Validé ! (Gain Audit: {score_before - score_after:.2%})")
             champion_state = copy.deepcopy(model.state_dict())
@@ -400,7 +365,6 @@ def core_optimization_loop(model, cfg, t_max, start_lr, batch_gen_func, context_
         print(f"    ⏩ L-BFGS Skipped (Config).")
         model.load_state_dict(champion_state)
 
-    # --- AUDIT FINAL DU CYCLE ---
     passed_g, failed_t, final_score = run_audit(model, cfg, t_max, threshold=target_err, n_global=100, n_specific=50)
     
     if final_score < global_best_score:
@@ -414,50 +378,76 @@ def core_optimization_loop(model, cfg, t_max, start_lr, batch_gen_func, context_
 def robust_optimize(model, cfg, t_max, n_iters_base, context_str="Global"):
     max_macro = cfg['training'].get('max_macro_loops', 3)
     start_lr = float(cfg['training']['ic_phase']['learning_rate'])
+    target_err = cfg['training'].get('target_error_global', 0.05)
     device = next(model.parameters()).device
     
     current_lr = start_lr
     
-    # --- CHAMPION GLOBAL ---
-    # On initialise avec l'état actuel du modèle
+    # --- 1. AUDIT INITIAL (AVANT DE FAIRE QUOI QUE CE SOIT) ---
     global_best_state = copy.deepcopy(model.state_dict())
     
-    # On évalue le score initial
-    _, _, init_score = run_audit(model, cfg, t_max, threshold=1.0, n_global=20, n_specific=0, verbose=False)
+    # On fait un audit COMPLET (Global + Spécifique) tout de suite
+    passed_g, failed_types, init_score = run_audit(model, cfg, t_max, threshold=target_err, n_global=40, n_specific=20, verbose=False)
     global_best_score = init_score
-    print(f"\n🏰 [Robust Optimize : {context_str}] t={t_max:.2f} | Initial Score: {init_score:.2%}")
+    
+    status_icon = "✅" if passed_g else "❌"
+    print(f"\n🏰 [Robust Optimize : {context_str}] t={t_max:.2f} | Initial Score: {init_score:.2%} {status_icon} | Failed Specific: {failed_types}")
+
+    # --- LOGIQUE DE DÉCISION INTELLIGENTE ---
+    run_global_phase = True
+
+    # CAS 1 : Tout est parfait -> On ne fait RIEN, on passe au t suivant
+    if passed_g and len(failed_types) == 0:
+        print(f"  ⏩ SKIP TOTAL : Le modèle est déjà parfait ({init_score:.2%}). Passage au t suivant !")
+        return True
+
+    # CAS 2 : Global OK, mais Spécifique KO -> On saute le Global, on va direct au Spécifique
+    if passed_g and len(failed_types) > 0:
+        print(f"  ↪️  SKIP GLOBAL : Global OK ({init_score:.2%}), focus immédiat sur Spécifique {failed_types}.")
+        run_global_phase = False # On désactive la phase globale pour ce cycle
+        
+    # CAS 3 : Global KO -> On laisse run_global_phase = True
+    # ------------------------------------
 
     for macro in range(max_macro):
-        print(f"  🔄 Macro Cycle {macro+1}/{max_macro} (Best Score so far: {global_best_score:.2%})")
+        print(f"  🔄 Macro Cycle {macro+1}/{max_macro} (Best: {global_best_score:.2%})")
 
-        # 1️⃣ PHASE GLOBALE
-        gen_std = get_standard_batch_generator(cfg, device, t_max)
-        
-        ok, failed_types, next_lr, best_state, best_score = core_optimization_loop(
-            model, cfg, t_max, current_lr, gen_std, "GLOBAL", 
-            global_best_state, global_best_score, use_lbfgs=True
-        )
-        
-        # Mise à jour du Champion Global et du LR
-        current_lr = next_lr 
-        if best_score < global_best_score:
-            global_best_score = best_score
-            global_best_state = best_state
-        
-        if ok and not failed_types:
-            print("    🏆 VICTOIRE TOTALE ! Passage à la suite.")
-            # On s'assure que le modèle contient bien le meilleur état
-            model.load_state_dict(global_best_state)
-            return True
+        # 1️⃣ PHASE GLOBALE (Seulement si nécessaire)
+        if run_global_phase:
+            gen_std = get_standard_batch_generator(cfg, device, t_max)
             
-        # 2️⃣ PHASE SPÉCIFIQUE
+            ok, f_types, next_lr, best_state, best_score = core_optimization_loop(
+                model, cfg, t_max, current_lr, gen_std, "GLOBAL", 
+                global_best_state, global_best_score, use_lbfgs=True
+            )
+            
+            # Mise à jour
+            current_lr = next_lr 
+            if best_score < global_best_score:
+                global_best_score = best_score
+                global_best_state = best_state
+            
+            # Mise à jour des échecs pour la phase spécifique
+            failed_types = f_types
+            
+            # Si tout est réglé après le global, on sort !
+            if ok and not failed_types:
+                print("    🏆 VICTOIRE TOTALE (après Global) ! Passage à la suite.")
+                model.load_state_dict(global_best_state)
+                return True
+        else:
+            # Si on a sauté le global au premier tour, on le réactive pour le tour suivant
+            # (Au cas où l'entrainement spécifique aurait dégradé le global)
+            run_global_phase = True 
+            
+        # 2️⃣ PHASE SPÉCIFIQUE (Si besoin)
         if failed_types:
-            print(f"    ⚠️ ECHEC SPÉCIFIQUE sur {failed_types}. Mode CIBLÉ.")
+            print(f"    ⚠️ CIBLAGE : Correction requise pour {failed_types}.")
             gen_biased = get_biased_batch_generator(cfg, device, failed_types, t_max)
             
             ok_spec, failed_spec, next_lr_spec, best_state_spec, best_score_spec = core_optimization_loop(
                 model, cfg, t_max, current_lr, gen_biased, "SPECIFIC", 
-                global_best_state, global_best_score, use_lbfgs=False
+                global_best_state, global_best_score, use_lbfgs=False # Souvent mieux sans LBFGS sur le spécifique, ou True selon tes goûts
             )
             
             current_lr = next_lr_spec
@@ -466,14 +456,14 @@ def robust_optimize(model, cfg, t_max, n_iters_base, context_str="Global"):
                 global_best_state = best_state_spec
 
             if ok_spec and not failed_spec:
-                 print("    ✅ CORRECTION RÉUSSIE !")
+                 print("    ✅ CORRECTION SPÉCIFIQUE RÉUSSIE !")
                  model.load_state_dict(global_best_state)
                  return True
             else:
                  print(f"    ❌ CORRECTION PARTIELLE (Reste: {failed_spec}).")
+                 failed_types = failed_spec # On met à jour pour la prochaine boucle
         
-    print("🛑 ECHEC FINAL.")
-    # On recharge le meilleur absolu avant de quitter, même si échec
+    print("🛑 ECHEC FINAL (Max Macro loops atteint).")
     model.load_state_dict(global_best_state)
     return False
 
