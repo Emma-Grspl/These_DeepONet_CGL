@@ -471,18 +471,99 @@ def train_cgle_curriculum(model, cfg):
     save_dir = cfg['training'].get('save_dir', "outputs/checkpoints_cgl")
     os.makedirs(save_dir, exist_ok=True)
     
-    print("🧊 WARMUP (IC + Sobolev)...")
-    ok = robust_optimize(model, cfg, 0.0, 5000, context_str="Warmup")
-    if not ok: return
-    
-    zones = cfg['time_marching']['zones']
+    # --- 🔄 LOGIQUE DE REPRISE AUTOMATIQUE ---
     current_t = 0.0
+    
+    # On liste tous les fichiers .pth dans le dossier
+    checkpoints = glob.glob(os.path.join(save_dir, "ckpt_t*.pth"))
+    
+    if checkpoints:
+        # On cherche le t max
+        last_ckpt = None
+        max_t = -1.0
+        
+        for ckpt_path in checkpoints:
+            # Extraction du t depuis le nom de fichier (ex: ckpt_t0.09.pth)
+            try:
+                filename = os.path.basename(ckpt_path)
+                # Regex pour trouver le nombre flottant après ckpt_t
+                match = re.search(r"ckpt_t(\d+\.\d+)\.pth", filename)
+                if match:
+                    t_val = float(match.group(1))
+                    if t_val > max_t:
+                        max_t = t_val
+                        last_ckpt = ckpt_path
+            except:
+                continue
+        
+        # Si on a trouvé un checkpoint valide
+        if last_ckpt is not None and max_t > 0.0:
+            print(f"🔄 REPRISE DÉTECTÉE : Chargement de {last_ckpt}")
+            checkpoint = torch.load(last_ckpt)
+            
+            # Gestion robuste : soit le checkpoint est un dict, soit c'est juste le state_dict
+            if isinstance(checkpoint, dict) and 'model' in checkpoint:
+                model.load_state_dict(checkpoint['model'])
+                current_t = checkpoint.get('t', max_t) # On prend le t du dict si dispo, sinon le nom de fichier
+            else:
+                model.load_state_dict(checkpoint)
+                current_t = max_t
+                
+            print(f"✅ Modèle chargé. Reprise à t = {current_t:.4f}")
+    
+    # --- FIN DE LA LOGIQUE DE REPRISE ---
+
+    # 1. WARMUP (Seulement si on démarre de zéro)
+    if current_t < 1e-5:
+        print("🧊 WARMUP (IC + Sobolev)...")
+        ok = robust_optimize(model, cfg, 0.0, 5000, context_str="Warmup")
+        if not ok: return
+    else:
+        print(f"⏩ SKIP WARMUP (Déjà traité, t={current_t:.2f})")
+
+    # 2. TIME MARCHING
+    zones = cfg['time_marching']['zones']
+    
     for zone in zones:
         z_end, z_dt, z_iters = zone['t_end'], zone['dt'], zone['iters']
-        print(f"\n🚀 ZONE : t_end={z_end}, dt={z_dt}")
+        
+        # Si on a déjà dépassé cette zone avec notre reprise, on passe à la suivante
+        if current_t >= z_end - 1e-9:
+            continue
+            
+        print(f"\n🚀 ZONE : t_end={z_end}, dt={z_dt} (Start t={current_t:.2f})")
+        
+        # On boucle tant qu'on n'a pas fini la zone
         while current_t < z_end - 1e-9:
-            next_t = min(current_t + z_dt, z_end)
+            
+            # Calcul du prochain pas
+            next_t = current_t + z_dt
+            # On s'assure de ne pas dépasser la fin de zone (pour éviter les micro-pas)
+            if next_t > z_end: 
+                next_t = z_end
+            
+            # Lancement de l'optimisation
+            # Note : robust_optimize va checker si l'audit est bon avant de lancer l'entraînement
             ok = robust_optimize(model, cfg, next_t, z_iters, context_str="Global")
-            if not ok: return
+            
+            if not ok: 
+                print("🛑 Échec critique ou arrêt demandé.")
+                return
+
+            # Validation du pas de temps
             current_t = next_t
-            torch.save({'model': model.state_dict(), 't': current_t}, os.path.join(save_dir, f"ckpt_t{current_t:.2f}.pth"))
+            
+            # Sauvegarde propre
+            save_name = f"ckpt_t{current_t:.2f}.pth"
+            save_path = os.path.join(save_dir, save_name)
+            
+            # On sauvegarde le dict complet pour pouvoir reprendre facilement
+            torch.save({
+                'model': model.state_dict(), 
+                't': current_t,
+                'config': cfg # Optionnel mais pratique
+            }, save_path)
+            
+            print(f"   💾 Checkpoint sauvegardé : {save_name}")
+
+    print("🏁 Entraînement terminé avec succès !")
