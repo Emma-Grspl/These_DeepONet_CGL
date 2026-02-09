@@ -85,17 +85,18 @@ def get_standard_batch_generator(cfg, device, t_limit):
 # ==============================================================================
 # 2. AUDIT
 # ==============================================================================
-
 def run_audit(model, cfg, t_max, threshold=0.03, n_global=60, n_specific=30, verbose=True):
     device = next(model.parameters()).device
     model.eval()
     
+    # Lecture des types autorisés depuis le YAML
+    phys = cfg['physics'] if isinstance(cfg, dict) else cfg.physics
+    allowed_types = phys.get('initial_conditions', [1, 2])
     type_names = {0: "Gaussian", 1: "Sech", 2: "Tanh"}
+    
     rng_state = np.random.get_state()
     np.random.seed(42) 
 
-    if isinstance(cfg, dict): phys = cfg['physics']
-    else: phys = cfg.physics
     eq_p, bounds, x_domain = phys['equation_params'], phys['bounds'], phys['x_domain']
 
     def evaluate_point(p_dict, t_eval):
@@ -126,7 +127,8 @@ def run_audit(model, cfg, t_max, threshold=0.03, n_global=60, n_specific=30, ver
                  'V':     np.random.uniform(eq_p['V'][0],     eq_p['V'][1]),
                  'A':     np.random.uniform(bounds['A'][0], bounds['A'][1]),
                  'w0':    10**np.random.uniform(np.log10(bounds['w0'][0]), np.log10(bounds['w0'][1])),
-                 'x0': 0.0, 'k': 1.0, 'type': np.random.choice([0, 1, 2])}
+                 'x0': 0.0, 'k': 1.0, 
+                 'type': np.random.choice(allowed_types)} # <--- Choix dynamique
             g_errs.append(evaluate_point(p, t_max if t_max > 1e-5 else 0.0))
         except: continue
     
@@ -138,13 +140,12 @@ def run_audit(model, cfg, t_max, threshold=0.03, n_global=60, n_specific=30, ver
 
     if not passed_global:
         np.random.set_state(rng_state)
-        # On renvoie le score global pour comparaison
         return False, [], global_score
 
     # --- 2. AUDIT SPÉCIFIQUE ---
     failed_types = []
-    if verbose: print(f"    🔎 Audit Spécifique (Détail) :")
-    for t_id in [0, 1, 2]:
+    if verbose: print(f"    🔎 Audit Spécifique :")
+    for t_id in allowed_types: # <--- Boucle dynamique
         t_errs = []
         for _ in range(n_specific):
             try:

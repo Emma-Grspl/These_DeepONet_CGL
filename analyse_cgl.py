@@ -223,67 +223,123 @@ def run_analysis(model, cfg, device):
 # =============================================================================
 
 def run_massive_stats(model, cfg, device, n_samples=1000):
-    print(f"\n📊 Statistiques Massives ({n_samples} samples/type)...")
+    print(f"\n📊 LANCEMENT DES STATISTIQUES FINALES (N={n_samples})...")
     
+    # 1. Plages de paramètres
+    # NOTE : On fixe x0=0 car le modèle a été entraîné uniquement sur des pulses centrés.
     ranges = {
-        'alpha': [0.0, 1.0], 'beta': [-1.5, 1.5], 'mu': [-0.5, 1.0], 'V': [-2.0, 2.0],
-        'A': [0.5, 2.0], 'w0': [0.5, 5.0], 'x0': [-5.0, 5.0], 'k': [-2.0, 2.0]
+        'alpha': [0.0, 1.0], 
+        'beta': [-1.5, 1.5], 
+        'mu': [-0.5, 1.0], 
+        'V': [-2.0, 2.0],
+        'A': [0.5, 2.0], 
+        'w0': [0.5, 5.0], 
+        'x0': [0.0, 0.0],  # <--- CRITIQUE : On reste dans la distribution apprise
+        'k': [-2.0, 2.0]
     }
+    
     types = [0, 1, 2]
     type_names = ['Gaussian', 'Sech', 'Tanh']
     
-    # Stockage : errors[type][comp] -> list
-    stats = {t: {'Real': [], 'Imag': [], 'Mod': []} for t in types}
+    # Stockage des résultats par composante
+    stats = {t: {'Mod': [], 'Real': [], 'Imag': []} for t in types}
+    t_eval = 0.09 # Temps final à évaluer
     
-    t_eval = 0.09
-    
+    # 2. Boucle de Calcul
     for typ in types:
-        print(f"   👉 Sampling {type_names[typ]}...")
-        for _ in tqdm(range(n_samples)):
+        print(f"   👉 Traitement : {type_names[typ]}")
+        
+        # Barre de progression
+        for _ in tqdm(range(n_samples), desc=f"Simulations {type_names[typ]}"):
+            # Tirage aléatoire
             p = {k: np.random.uniform(v[0], v[1]) for k, v in ranges.items()}
             p['type'] = float(typ)
             
             try:
+                # Prédiction
                 _, _, u_true, u_pred = predict_case(model, p, cfg, t_eval, device)
                 
-                # Dernier temps
+                # Vérification
+                if len(u_true) == 0: continue
+
+                # Extraction dernier temps
                 ut, up = u_true[-1], u_pred[-1]
                 
-                err_re = np.linalg.norm(ut.real - up.real) / (np.linalg.norm(ut.real) + 1e-9)
-                err_im = np.linalg.norm(ut.imag - up.imag) / (np.linalg.norm(ut.imag) + 1e-9)
-                err_mod = np.linalg.norm(np.abs(ut) - np.abs(up)) / (np.linalg.norm(np.abs(ut)) + 1e-9)
+                # Normes pour l'erreur relative
+                norm_mod = np.linalg.norm(np.abs(ut)) + 1e-9
+                norm_re  = np.linalg.norm(ut.real) + 1e-9
+                norm_im  = np.linalg.norm(ut.imag) + 1e-9
                 
-                stats[typ]['Real'].append(err_re)
-                stats[typ]['Imag'].append(err_im)
-                stats[typ]['Mod'].append(err_mod)
-            except: continue
+                # Calcul des erreurs
+                err_mod = np.linalg.norm(np.abs(ut) - np.abs(up)) / norm_mod
+                err_re  = np.linalg.norm(ut.real - up.real) / norm_re
+                err_im  = np.linalg.norm(ut.imag - up.imag) / norm_im
+                
+                # Ajout seulement si numérique valide
+                if not np.isnan(err_mod) and not np.isinf(err_mod):
+                    stats[typ]['Mod'].append(err_mod)
+                    stats[typ]['Real'].append(err_re)
+                    stats[typ]['Imag'].append(err_im)
+                    
+            except Exception:
+                # On ignore les erreurs de solveur pour ne pas bloquer le script
+                continue
 
-    # PLOT GLOBAL
+    # 3. Génération du Graphique (Barres Groupées)
+    print("\n📈 Génération du graphique final...")
     components = ['Real', 'Imag', 'Mod']
-    x = np.arange(len(types))
-    width = 0.25
     
-    plt.figure(figsize=(12, 6))
+    # Configuration des barres
+    x_pos = np.arange(len(types))
+    width = 0.25  # Largeur des barres
+    colors = ['#1f77b4', '#ff7f0e', '#2ca02c'] # Bleu, Orange, Vert
+    
+    plt.figure(figsize=(12, 7))
+    
     for i, comp in enumerate(components):
-        means = [np.mean(stats[t][comp]) for t in types]
-        stds = [np.std(stats[t][comp]) for t in types]
+        means = []
+        stds = []
         
-        pos = x + (i-1)*width
-        bars = plt.bar(pos, means, width, yerr=stds, capsize=5, label=comp, alpha=0.8)
+        # Calcul des moyennes/std pour chaque type
+        for t in types:
+            data = stats[t][comp]
+            if data:
+                means.append(np.mean(data))
+                stds.append(np.std(data))
+            else:
+                means.append(0)
+                stds.append(0)
         
+        # Position décalée pour grouper les barres
+        pos = x_pos + (i - 1) * width
+        
+        # Dessin des barres
+        bars = plt.bar(pos, means, width, yerr=stds, capsize=4, 
+                       label=comp, color=colors[i], alpha=0.85, edgecolor='black')
+        
+        # Ajout des étiquettes de valeur au-dessus des barres
         for bar in bars:
-            plt.text(bar.get_x() + bar.get_width()/2, bar.get_height(), 
-                     f"{bar.get_height():.1%}", ha='center', va='bottom', fontsize=8)
-            
-    plt.xticks(x, type_names)
-    plt.ylabel("Erreur Relative L2 (t=0.09)")
-    plt.title(f"Statistiques Globales par Composante (N={n_samples})")
-    plt.legend()
-    plt.grid(axis='y', alpha=0.3)
-    plt.savefig("outputs/Analysis_t0.09/Global_Statistics.png", dpi=300)
-    plt.close()
-    print("✅ Stats terminées.")
+            height = bar.get_height()
+            if height > 0:
+                plt.text(bar.get_x() + bar.get_width()/2, height + 0.001, 
+                         f"{height:.1%}", ha='center', va='bottom', 
+                         fontsize=9, fontweight='bold')
 
+    # Mise en forme du graphique
+    plt.xlabel("Type de Condition Initiale", fontweight='bold')
+    plt.ylabel(f"Erreur Relative L2 (t={t_eval})", fontweight='bold')
+    plt.title(f"Performance Moyenne du Modèle (sur {n_samples} simulations aléatoires)", fontsize=14)
+    plt.xticks(x_pos, type_names, fontsize=11)
+    plt.legend(title="Composante")
+    plt.grid(axis='y', linestyle='--', alpha=0.4)
+    plt.ylim(bottom=0) # Commence à 0
+    
+    # Sauvegarde
+    output_path = "outputs/Analysis_t0.09/Statistiques_Globales.png"
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    print(f"✅ Analyse terminée ! Graphique sauvegardé ici : {output_path}")
 if __name__ == "__main__":
     CKPT_PATH = "ckpt_t0.09.pth"
     if not os.path.exists(CKPT_PATH):
@@ -296,5 +352,5 @@ if __name__ == "__main__":
     cfg = load_config()
     model = load_model(CKPT_PATH, cfg, device)
     
-    run_analysis(model, cfg, device)
-    run_massive_stats(model, cfg, device, n_samples=100) # Augmente à 1000 pour la vraie science
+    #run_analysis(model, cfg, device)
+    run_massive_stats(model, cfg, device, n_samples=500) # Augmente à 1000 pour la vraie science
