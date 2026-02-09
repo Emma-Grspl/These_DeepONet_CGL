@@ -1,9 +1,9 @@
-import numpy as np   # <--- C'est cette ligne qui manque !
+import numpy as np
 import torch
+
 def get_ic_batch_cgle(batch_size, cfg, device):
     """
-    Génère un batch pour la Condition Initiale (t=0) AVEC les dérivées spatiales (Sobolev).
-    Retourne: branch, coords, u_val_re, u_val_im, u_x_re, u_x_im
+    Génère un batch CI (t=0) : UNIQUEMENT SECH (1) et TANH (2).
     """
     if isinstance(cfg, dict):
         eq_p = cfg['physics']['equation_params']
@@ -14,7 +14,7 @@ def get_ic_batch_cgle(batch_size, cfg, device):
         bounds = cfg.physics['bounds']
         x_domain = cfg.physics['x_domain']
 
-    # 1. Paramètres Physiques (Branch Input)
+    # 1. Paramètres Physiques
     alpha = np.random.uniform(eq_p['alpha'][0], eq_p['alpha'][1], batch_size)
     beta  = np.random.uniform(eq_p['beta'][0],  eq_p['beta'][1], batch_size)
     mu    = np.random.uniform(eq_p['mu'][0],    eq_p['mu'][1], batch_size)
@@ -26,53 +26,41 @@ def get_ic_batch_cgle(batch_size, cfg, device):
     x0 = np.random.uniform(bounds['x0'][0], bounds['x0'][1], batch_size)
     k  = np.random.uniform(bounds['k'][0], bounds['k'][1], batch_size)
     
-    # Choix du type de CI (0: Gaussian, 1: Sech, 2: Tanh)
-    type_id = np.random.randint(0, 3, batch_size)
+    # --- MODIFICATION ICI ---
+    # On tire entre [1, 3[ => soit 1, soit 2.
+    type_id = np.random.randint(1, 3, batch_size) 
+    # ------------------------
     
-    # 3. Coordonnées Spatiales (Trunk Input)
+    # 3. Coordonnées Spatiales
     x = np.random.uniform(x_domain[0], x_domain[1], batch_size)
-    t = np.zeros(batch_size) # t=0
+    t = np.zeros(batch_size)
 
-    # 4. Calcul Analytique des Valeurs (u) et Dérivées (u_x)
-    # u(x) = M(x) * exp(i*k*x)
-    # u'(x) = M'(x)*exp(i*k*x) + i*k*M(x)*exp(i*k*x) = exp(i*k*x) * [M'(x) + i*k*M(x)]
-    
+    # 4. Calcul Analytique
     X = x - x0
     exp_ikx = np.exp(1j * k * x)
     
     u_val = np.zeros(batch_size, dtype=np.complex128)
     u_x   = np.zeros(batch_size, dtype=np.complex128)
     
-    # --- Gaussian: M(x) = A * exp(-X^2 / w0^2) ---
-    mask_0 = (type_id == 0)
-    if np.any(mask_0):
-        # M = A * exp(-X^2/w0^2)
-        M = A[mask_0] * np.exp(-(X[mask_0]**2) / (w0[mask_0]**2))
-        # M' = M * (-2*X/w0^2)
-        M_prime = M * (-2 * X[mask_0] / (w0[mask_0]**2))
-        
-        u_val[mask_0] = M * exp_ikx[mask_0]
-        u_x[mask_0]   = exp_ikx[mask_0] * (M_prime + 1j * k[mask_0] * M)
+    # --- Gaussian (Type 0) : SUPPRIMÉ ---
+    # Le code est toujours là pour mémoire mais ne sera jamais exécuté
+    # car type_id ne vaut jamais 0.
 
-    # --- Sech: M(x) = A * sech(X/w0) ---
+    # --- Sech (Type 1) ---
     mask_1 = (type_id == 1)
     if np.any(mask_1):
         arg = X[mask_1] / w0[mask_1]
-        # M = A / cosh(arg)
         M = A[mask_1] / np.cosh(arg)
-        # M' = -A/w0 * sech(arg) * tanh(arg) = -M/w0 * tanh(arg)
         M_prime = - (M / w0[mask_1]) * np.tanh(arg)
         
         u_val[mask_1] = M * exp_ikx[mask_1]
         u_x[mask_1]   = exp_ikx[mask_1] * (M_prime + 1j * k[mask_1] * M)
 
-    # --- Tanh (Hole/Shock): M(x) = A * tanh(X/w0) ---
+    # --- Tanh (Type 2) ---
     mask_2 = (type_id == 2)
     if np.any(mask_2):
         arg = X[mask_2] / w0[mask_2]
-        # M = A * tanh(arg)
         M = A[mask_2] * np.tanh(arg)
-        # M' = A/w0 * sech^2(arg)
         sech_sq = 1.0 / (np.cosh(arg)**2)
         M_prime = (A[mask_2] / w0[mask_2]) * sech_sq
         
@@ -95,9 +83,7 @@ def get_ic_batch_cgle(batch_size, cfg, device):
 
 def get_pde_batch_cgle(n_samples, cfg, device, t_limit=None):
     """
-    Générateur pour la PDE Collocation.
-    Retourne aussi les paramètres de l'équation sous forme de dictionnaire
-    pour faciliter le calcul du résidu dans la loss function.
+    Générateur PDE : UNIQUEMENT SECH (1) et TANH (2).
     """
     b = cfg.physics['bounds']
     eq_params = cfg.physics['equation_params']
@@ -115,27 +101,22 @@ def get_pde_batch_cgle(n_samples, cfg, device, t_limit=None):
     w0 = 10 ** (torch.rand(n_samples, 1, device=device) * np.log10(w0_max/w0_min) + np.log10(w0_min))
     x0 = torch.rand(n_samples, 1, device=device) * (b['x0'][1] - b['x0'][0]) + b['x0'][0]
     k_wav = torch.rand(n_samples, 1, device=device) * (b['k'][1] - b['k'][0]) + b['k'][0]
-    types = torch.randint(0, 3, (n_samples, 1), device=device).float()
     
-    # 3. Branch Input complet
+    # --- MODIFICATION ICI ---
+    # torch.randint(low, high) exclut high. Donc [1, 3) => 1 ou 2.
+    types = torch.randint(1, 3, (n_samples, 1), device=device).float()
+    # ------------------------
+    
+    # 3. Branch Input
     branch = torch.cat([alpha, beta, mu, V, A, w0, x0, k_wav, types], dim=1)
 
-    # 4. Coordonnées (Trunk Input)
+    # 4. Trunk Input
     x = torch.rand(n_samples, 1, device=device) * (x_max - x_min) + x_min
-    
-    if t_limit is None:
-        t_limit = cfg.physics['t_max']
+    if t_limit is None: t_limit = cfg.physics['t_max']
     t = torch.rand(n_samples, 1, device=device) * t_limit
-    
     coords = torch.cat([x, t], dim=1).requires_grad_(True)
 
-    # 5. Dictionnaire de paramètres pour la Physics Loss
-    # Cela permet à pde_cgl.py d'accéder directement à 'alpha' sans re-slicing complexe
-    params_dict = {
-        "alpha": alpha,
-        "beta": beta,
-        "mu": mu,
-        "V": V
-    }
+    # 5. Params Dict pour Physics Loss
+    params_dict = {"alpha": alpha, "beta": beta, "mu": mu, "V": V}
 
     return branch, coords, params_dict

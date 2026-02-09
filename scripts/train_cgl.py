@@ -96,7 +96,7 @@ def main():
     # ... initialisation du modèle ...
 
     # 👇 METS LE CHEMIN EXACT QUE TU AS TROUVÉ AVEC 'find' 👇
-    OLD_CHECKPOINT = "/lustre/fswork/projects/rech/fdb/usv13rn/These_DeepOnet_CGL/results/CGL_run_20260207-175414/checkpoints/ckpt_t0.09.pth"
+    OLD_CHECKPOINT = None
     
     # 5. ENTRAÎNEMENT
     try:

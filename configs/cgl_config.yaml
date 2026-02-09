@@ -32,11 +32,11 @@ model:
 
 training:
   batch_size_ic: 8192   
-  batch_size_pde: 16384   
+  batch_size_pde: 24000   
   
   # Stratégie Robustesse
-  max_macro_loops: 5
-  nb_adam_retries: 5
+  max_macro_loops: 8
+  nb_adam_retries: 4
   check_interval: 2000
   stagnation_threshold: 0.001  # 1%
   
@@ -53,7 +53,7 @@ training:
   weights:
     pde_loss: 0.5
     ic_loss: 10.0
-    bc_loss: 0.25
+    bc_loss: 1.0
 
   ic_phase:
     learning_rate: 5e-4
