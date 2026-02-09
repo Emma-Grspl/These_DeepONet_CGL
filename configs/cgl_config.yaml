@@ -47,7 +47,7 @@ training:
   
   # Seuils Audit
   target_error_ic: 0.03     # 3% pour le Warmup
-  target_error_global: 0.05 # 5% pour le Time Marching
+  target_error_global: 0.03 # 5% pour le Time Marching
 
   # --- 👇 CE QU'IL MANQUAIT 👇 ---
   weights:
