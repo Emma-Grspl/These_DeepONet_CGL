@@ -4,6 +4,8 @@ import numpy as np
 import os
 import copy
 from tqdm import tqdm
+import glob
+import re
 
 # Imports CGL
 from src.physics.pde_cgl import pde_residual_cgle
@@ -468,14 +470,18 @@ def robust_optimize(model, cfg, t_max, n_iters_base, context_str="Global"):
     return False
 
 def train_cgle_curriculum(model, cfg):
-    save_dir = cfg['training'].get('save_dir', "outputs/checkpoints_cgl")
+    # 👇 CORRECTION DU CHEMIN ICI (outputs/checkpoints) 👇
+    save_dir = cfg['training'].get('save_dir', "outputs/checkpoints") 
     os.makedirs(save_dir, exist_ok=True)
     
+    print(f"📂 Recherche de reprise dans : {save_dir}")
+
     # --- 🔄 LOGIQUE DE REPRISE AUTOMATIQUE ---
     current_t = 0.0
     
-    # On liste tous les fichiers .pth dans le dossier
-    checkpoints = glob.glob(os.path.join(save_dir, "ckpt_t*.pth"))
+    # On cherche les fichiers ckpt_t*.pth
+    search_pattern = os.path.join(save_dir, "ckpt_t*.pth")
+    checkpoints = glob.glob(search_pattern)
     
     if checkpoints:
         # On cherche le t max
@@ -483,10 +489,8 @@ def train_cgle_curriculum(model, cfg):
         max_t = -1.0
         
         for ckpt_path in checkpoints:
-            # Extraction du t depuis le nom de fichier (ex: ckpt_t0.09.pth)
             try:
                 filename = os.path.basename(ckpt_path)
-                # Regex pour trouver le nombre flottant après ckpt_t
                 match = re.search(r"ckpt_t(\d+\.\d+)\.pth", filename)
                 if match:
                     t_val = float(match.group(1))
@@ -496,20 +500,19 @@ def train_cgle_curriculum(model, cfg):
             except:
                 continue
         
-        # Si on a trouvé un checkpoint valide
         if last_ckpt is not None and max_t > 0.0:
             print(f"🔄 REPRISE DÉTECTÉE : Chargement de {last_ckpt}")
             checkpoint = torch.load(last_ckpt)
             
-            # Gestion robuste : soit le checkpoint est un dict, soit c'est juste le state_dict
             if isinstance(checkpoint, dict) and 'model' in checkpoint:
                 model.load_state_dict(checkpoint['model'])
-                current_t = checkpoint.get('t', max_t) # On prend le t du dict si dispo, sinon le nom de fichier
             else:
                 model.load_state_dict(checkpoint)
-                current_t = max_t
                 
-            print(f"✅ Modèle chargé. Reprise à t = {current_t:.4f}")
+            current_t = max_t
+            print(f"✅ Modèle chargé. Reprise immédiate à t = {current_t:.4f}")
+    else:
+        print(f"❌ Aucun checkpoint trouvé dans {save_dir}. Démarrage à t=0.0")
     
     # --- FIN DE LA LOGIQUE DE REPRISE ---
 
