@@ -469,54 +469,74 @@ def robust_optimize(model, cfg, t_max, n_iters_base, context_str="Global"):
     model.load_state_dict(global_best_state)
     return False
 
-def train_cgle_curriculum(model, cfg):
-    # 👇 CORRECTION DU CHEMIN ICI (outputs/checkpoints) 👇
-    save_dir = cfg['training'].get('save_dir', "outputs/checkpoints") 
+import glob
+import re
+import os
+import torch
+
+def train_cgle_curriculum(model, cfg, explicit_resume_path=None):
+    """
+    Args:
+        explicit_resume_path (str): Chemin complet vers un checkpoint précis (ex: .../ckpt_t0.09.pth)
+                                    Si fourni, force la reprise depuis ce fichier.
+    """
+    save_dir = cfg['training'].get('save_dir', "outputs/checkpoints")
     os.makedirs(save_dir, exist_ok=True)
     
-    print(f"📂 Recherche de reprise dans : {save_dir}")
-
-    # --- 🔄 LOGIQUE DE REPRISE AUTOMATIQUE ---
     current_t = 0.0
-    
-    # On cherche les fichiers ckpt_t*.pth
-    search_pattern = os.path.join(save_dir, "ckpt_t*.pth")
-    checkpoints = glob.glob(search_pattern)
-    
-    if checkpoints:
-        # On cherche le t max
-        last_ckpt = None
-        max_t = -1.0
-        
-        for ckpt_path in checkpoints:
-            try:
-                filename = os.path.basename(ckpt_path)
-                match = re.search(r"ckpt_t(\d+\.\d+)\.pth", filename)
-                if match:
-                    t_val = float(match.group(1))
-                    if t_val > max_t:
-                        max_t = t_val
-                        last_ckpt = ckpt_path
-            except:
-                continue
-        
-        if last_ckpt is not None and max_t > 0.0:
-            print(f"🔄 REPRISE DÉTECTÉE : Chargement de {last_ckpt}")
-            checkpoint = torch.load(last_ckpt)
-            
-            if isinstance(checkpoint, dict) and 'model' in checkpoint:
-                model.load_state_dict(checkpoint['model'])
-            else:
-                model.load_state_dict(checkpoint)
-                
-            current_t = max_t
-            print(f"✅ Modèle chargé. Reprise immédiate à t = {current_t:.4f}")
-    else:
-        print(f"❌ Aucun checkpoint trouvé dans {save_dir}. Démarrage à t=0.0")
-    
-    # --- FIN DE LA LOGIQUE DE REPRISE ---
+    loaded = False
 
-    # 1. WARMUP (Seulement si on démarre de zéro)
+    # --- 1. REPRISE FORCÉE (Si chemin fourni) ---
+    if explicit_resume_path and os.path.exists(explicit_resume_path):
+        print(f"🔄 REPRISE FORCÉE : Chargement de {explicit_resume_path}")
+        checkpoint = torch.load(explicit_resume_path, map_location=next(model.parameters()).device)
+        
+        if isinstance(checkpoint, dict) and 'model' in checkpoint:
+            model.load_state_dict(checkpoint['model'])
+            current_t = checkpoint.get('t', 0.0)
+        else:
+            model.load_state_dict(checkpoint)
+            # Si le t n'est pas dans le fichier, on essaie de le deviner du nom
+            try:
+                match = re.search(r"t(\d+\.\d+)", os.path.basename(explicit_resume_path))
+                if match: current_t = float(match.group(1))
+            except: pass
+            
+        print(f"✅ Modèle chargé depuis source externe. Reprise à t = {current_t:.4f}")
+        loaded = True
+
+    # --- 2. REPRISE AUTOMATIQUE (Dans le dossier courant) ---
+    if not loaded:
+        print(f"📂 Recherche de reprise locale dans : {save_dir}")
+        search_pattern = os.path.join(save_dir, "ckpt_t*.pth")
+        checkpoints = glob.glob(search_pattern)
+        
+        if checkpoints:
+            last_ckpt = None
+            max_t = -1.0
+            for ckpt_path in checkpoints:
+                try:
+                    match = re.search(r"ckpt_t(\d+\.\d+)\.pth", os.path.basename(ckpt_path))
+                    if match:
+                        t_val = float(match.group(1))
+                        if t_val > max_t:
+                            max_t = t_val
+                            last_ckpt = ckpt_path
+                except: continue
+            
+            if last_ckpt:
+                print(f"🔄 AUTO-RESUME : Chargement de {last_ckpt}")
+                checkpoint = torch.load(last_ckpt)
+                if isinstance(checkpoint, dict) and 'model' in checkpoint:
+                    model.load_state_dict(checkpoint['model'])
+                else:
+                    model.load_state_dict(checkpoint)
+                current_t = max_t
+                print(f"✅ Reprise locale à t = {current_t:.4f}")
+
+    # --- SUITE (WARMUP & ZONES) ---
+    
+    # 1. WARMUP
     if current_t < 1e-5:
         print("🧊 WARMUP (IC + Sobolev)...")
         ok = robust_optimize(model, cfg, 0.0, 5000, context_str="Warmup")
@@ -530,43 +550,26 @@ def train_cgle_curriculum(model, cfg):
     for zone in zones:
         z_end, z_dt, z_iters = zone['t_end'], zone['dt'], zone['iters']
         
-        # Si on a déjà dépassé cette zone avec notre reprise, on passe à la suivante
         if current_t >= z_end - 1e-9:
             continue
             
         print(f"\n🚀 ZONE : t_end={z_end}, dt={z_dt} (Start t={current_t:.2f})")
         
-        # On boucle tant qu'on n'a pas fini la zone
         while current_t < z_end - 1e-9:
-            
-            # Calcul du prochain pas
             next_t = current_t + z_dt
-            # On s'assure de ne pas dépasser la fin de zone (pour éviter les micro-pas)
-            if next_t > z_end: 
-                next_t = z_end
+            if next_t > z_end: next_t = z_end
             
-            # Lancement de l'optimisation
-            # Note : robust_optimize va checker si l'audit est bon avant de lancer l'entraînement
             ok = robust_optimize(model, cfg, next_t, z_iters, context_str="Global")
-            
             if not ok: 
-                print("🛑 Échec critique ou arrêt demandé.")
+                print("🛑 Arrêt demandé ou échec critique.")
                 return
 
-            # Validation du pas de temps
             current_t = next_t
             
-            # Sauvegarde propre
+            # Sauvegarde dans le NOUVEAU dossier
             save_name = f"ckpt_t{current_t:.2f}.pth"
             save_path = os.path.join(save_dir, save_name)
-            
-            # On sauvegarde le dict complet pour pouvoir reprendre facilement
-            torch.save({
-                'model': model.state_dict(), 
-                't': current_t,
-                'config': cfg # Optionnel mais pratique
-            }, save_path)
-            
+            torch.save({'model': model.state_dict(), 't': current_t}, save_path)
             print(f"   💾 Checkpoint sauvegardé : {save_name}")
 
     print("🏁 Entraînement terminé avec succès !")

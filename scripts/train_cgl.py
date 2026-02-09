@@ -93,11 +93,15 @@ def main():
     # 4. INITIALISATION MODÈLE
     print("🏗️  Initialisation du modèle CGL_PI_DeepONet...")
     model = CGL_PI_DeepONet(cfg).to(device)
+    # ... initialisation du modèle ...
 
+    # 👇 METS LE CHEMIN EXACT QUE TU AS TROUVÉ AVEC 'find' 👇
+    OLD_CHECKPOINT = "/lustre/fswork/projects/rech/fdb/usv13rn/These_DeepOnet_CGL/results/CGL_run_20260207-175414/checkpoints/ckpt_t0.09.pth"
+    
     # 5. ENTRAÎNEMENT
     try:
         # On passe la main au Curriculum Trainer (le chef d'orchestre)
-        train_cgle_curriculum(model, cfg)
+        train_cgle_curriculum(model, cfg, explicit_resume_path=OLD_CHECKPOINT)
 
         # 6. SAUVEGARDE FINALE
         final_path = os.path.join(run_dir, "model_final_cgl.pth")
