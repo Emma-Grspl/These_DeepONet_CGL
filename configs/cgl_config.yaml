@@ -32,7 +32,7 @@ model:
 
 training:
   batch_size_ic: 8192   
-  batch_size_pde: 24000   
+  batch_size_pde: 8192   
   
   # Stratégie Robustesse
   max_macro_loops: 8
@@ -57,17 +57,17 @@ training:
 
   ic_phase:
     learning_rate: 5e-4
-    iterations: 20000
+    iterations: 10000
   # -----------------------------
 
 time_marching:
   zones:
     - t_end: 0.5
       dt: 0.01   # Petit pas pour démarrer
-      iters: 15000
+      iters: 8000
     - t_end: 2.0
       dt: 0.05
-      iters: 12000
+      iters: 8000
     - t_end: 5.0
       dt: 0.1
-      iters: 10000
+      iters: 9000
