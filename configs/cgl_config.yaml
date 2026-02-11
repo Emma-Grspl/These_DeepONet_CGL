@@ -39,21 +39,20 @@ training:
   nb_adam_retries: 4
   check_interval: 2000
   stagnation_threshold: 0.001  # 1%
-  
-  # Poids Dynamiques
-  pde_weight_start: 0.01   # Poids initial (doux)
-  pde_weight_target: 1.0  # Poids final (objectif)
-  ramp_end_t: 0.5         # Fin de la rampe linéaire, début NTK
-  
+
+  pde_weight_start: 0.1   # On commence un peu plus haut pour aider la Tanh
+  pde_weight_target: 1.0
+  ramp_end_t: 0.1         # Zone de transition
+
+  weights:
+    pde_loss: 0.5
+    ic_loss_start: 10.0    # <--- Démarrage fort
+    ic_loss_target: 2.0    # <--- Atterrissage doux pour laisser vivre la Tanh
+    bc_loss: 1.0
+    
   # Seuils Audit
   target_error_ic: 0.03     # 3% pour le Warmup
   target_error_global: 0.03 # 5% pour le Time Marching
-
-  # --- 👇 CE QU'IL MANQUAIT 👇 ---
-  weights:
-    pde_loss: 0.5
-    ic_loss: 10.0
-    bc_loss: 1.0
 
   ic_phase:
     learning_rate: 5e-4
@@ -61,8 +60,9 @@ training:
   # -----------------------------
 
 time_marching:
+  learning_rate: 1e-4
   zones:
-    - t_end: 0.5
+    - t_end: 0.1
       dt: 0.01   # Petit pas pour démarrer
       iters: 8000
     - t_end: 2.0

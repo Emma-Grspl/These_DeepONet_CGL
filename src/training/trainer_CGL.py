@@ -171,12 +171,28 @@ def run_audit(model, cfg, t_max, threshold=0.03, n_global=60, n_specific=30, ver
 # 3. MOTEUR D'ENTRAÎNEMENT UNIFIÉ (CORE ENGINE)
 # ==============================================================================
 
-def get_dynamic_pde_weight(model, t_current, cfg, br_pde, co_pde, pde_params, br_ic, co_ic, tr_ic_re, tr_ic_im):
-    ramp_end = cfg['training'].get('ramp_end_t', 0.5)
-    w_start = cfg['training'].get('pde_weight_start', 0.1)
-    w_target = cfg['training'].get('pde_weight_target', 1.0)
-    if t_current <= ramp_end: return w_start + (t_current/ramp_end)*(w_target-w_start)
-    return w_target
+def get_dynamic_weights(t_current, cfg):
+    t_ramp_end = cfg['training'].get('ramp_end_t', 0.1) # Défaut 0.1 pour rampe rapide
+    
+    # --- Rampe PDE (Montante) ---
+    w_pde_start = cfg['training'].get('pde_weight_start', 0.01)
+    w_pde_target = cfg['training'].get('pde_weight_target', 1.0)
+    
+    # --- Rampe IC (Descendante) - Double Rampe ---
+    w_ic_start = cfg['training']['weights'].get('ic_loss_start', 10.0)
+    w_ic_target = cfg['training']['weights'].get('ic_loss_target', 1.0) # Ou 2.0 selon config
+
+    if t_current <= t_ramp_end:
+        # Calcul du ratio de progression (0 à 1)
+        ratio = t_current / t_ramp_end
+        
+        pde_w = w_pde_start + ratio * (w_pde_target - w_pde_start)
+        ic_w = w_ic_start - ratio * (w_ic_start - w_ic_target) # Elle descend
+    else:
+        pde_w = w_pde_target
+        ic_w = w_ic_target
+        
+    return pde_w, ic_w
 
 def core_optimization_loop(model, cfg, t_max, start_lr, batch_gen_func, context_name, 
                            global_best_state, global_best_score, use_lbfgs=True):
@@ -214,9 +230,10 @@ def core_optimization_loop(model, cfg, t_max, start_lr, batch_gen_func, context_
                 cfg['training']['batch_size_pde'], cfg['training']['batch_size_ic']
             )
             
-            # 2. Weight Update
+            # 2. Weight Update (Dynamique Double Rampe)
             if t_max > 0 and i % 500 == 0:
-                current_pde_w = get_dynamic_pde_weight(model, t_max, cfg, b_p, c_p, p_p, b_i, c_i, tr_re, tr_im)
+                current_pde_w, current_ic_w = get_dynamic_weights(t_max, cfg)
+                weights['ic_loss'] = current_ic_w # Mise à jour dynamique de l'IC
 
             # 3. Step
             optimizer.zero_grad(set_to_none=True)
@@ -378,11 +395,19 @@ def core_optimization_loop(model, cfg, t_max, start_lr, batch_gen_func, context_
 # 4. ORCHESTRATEUR
 # ==============================================================================
 
-def robust_optimize(model, cfg, t_max, n_iters_base, context_str="Global"):
+def robust_optimize(model, cfg, t_max, n_iters_base, context_str="Global", start_lr_override=None):
     max_macro = cfg['training'].get('max_macro_loops', 3)
-    start_lr = float(cfg['training']['ic_phase']['learning_rate'])
     target_err = cfg['training'].get('target_error_global', 0.05)
     device = next(model.parameters()).device
+    
+    # Choix du LR de base : Override (Transition) > IC Phase (Warmup) > Time Marching (Normal)
+    if start_lr_override:
+        start_lr = start_lr_override
+    elif t_max < 1e-5:
+        start_lr = float(cfg['training']['ic_phase']['learning_rate'])
+    else:
+        # On va chercher le LR spécifique Time Marching, par défaut 1e-4 si pas présent
+        start_lr = float(cfg['time_marching'].get('learning_rate', 1e-4))
     
     current_lr = start_lr
     
@@ -556,11 +581,28 @@ def train_cgle_curriculum(model, cfg, explicit_resume_path=None):
             
         print(f"\n🚀 ZONE : t_end={z_end}, dt={z_dt} (Start t={current_t:.2f})")
         
+        # Flag pour détecter le tout premier pas de cette zone
+        is_new_zone = True 
+        
         while current_t < z_end - 1e-9:
             next_t = current_t + z_dt
             if next_t > z_end: next_t = z_end
             
-            ok = robust_optimize(model, cfg, next_t, z_iters, context_str="Global")
+            # --- LOGIQUE DE LR ADAPTATIF ET SOFT START ---
+            # 1. On récupère le LR de croisière (ex: 1e-4)
+            base_lr = float(cfg['time_marching'].get('learning_rate', 1e-4))
+            
+            if is_new_zone:
+                # 2. Transition de zone : Soft Start (Divisé par 2)
+                step_lr = base_lr * 0.5
+                print(f"  🛡️ Soft Start (Transition Zone) : LR={step_lr:.1e}")
+                is_new_zone = False # Désactivé pour les prochains pas
+            else:
+                step_lr = base_lr
+            
+            # 3. Appel avec le LR calculé
+            ok = robust_optimize(model, cfg, next_t, z_iters, 
+                                 context_str="Global", start_lr_override=step_lr)
             if not ok: 
                 print("🛑 Arrêt demandé ou échec critique.")
                 return
@@ -571,6 +613,6 @@ def train_cgle_curriculum(model, cfg, explicit_resume_path=None):
             save_name = f"ckpt_t{current_t:.2f}.pth"
             save_path = os.path.join(save_dir, save_name)
             torch.save({'model': model.state_dict(), 't': current_t}, save_path)
-            print(f"   💾 Checkpoint sauvegardé : {save_name}")
+            print(f"    💾 Checkpoint sauvegardé : {save_name}")
 
     print("🏁 Entraînement terminé avec succès !")
