@@ -72,14 +72,48 @@ def get_biased_batch_generator(cfg, device, target_types, t_limit):
     return generator
 
 def get_standard_batch_generator(cfg, device, t_limit):
-    """Générateur standard."""
+    """
+    Générateur 'Harmonisé' : 
+    - Pour la PDE : 100% Uniforme (Respecte la physique globale)
+    - Pour l'IC : 50% Uniforme (Apprend le vide) + 50% Focus (Apprend le pic)
+    """
     def generator(batch_size_pde, batch_size_ic):
-        b_ic, c_ic, tr_re, tr_im, ux_re, ux_im = get_ic_batch_cgle(batch_size_ic, cfg, device)
+        # --- 1. GÉNÉRATION IC HARMONISÉE (Mix 50/50) ---
+        
+        # A. Moitié standard (Exploration globale [-20, 20])
+        n_std = batch_size_ic // 2
+        b1, c1, t1_re, t1_im, u1_re, u1_im = get_ic_batch_cgle(n_std, cfg, device)
+        
+        # B. Moitié "Focus" (Concentration sur [-6, 6])
+        # On crée une config temporaire pour forcer le générateur à tirer au centre
+        n_focus = batch_size_ic - n_std
+        cfg_focus = copy.deepcopy(cfg)
+        cfg_focus['physics']['x_domain'] = [-6.0, 6.0] # Zone d'activité de Sech/Tanh
+        
+        b2, c2, t2_re, t2_im, u2_re, u2_im = get_ic_batch_cgle(n_focus, cfg_focus, device)
+        
+        # C. Fusion et Mélange
+        # On concatène
+        b_ic = torch.cat([b1, b2])
+        c_ic = torch.cat([c1, c2])
+        tr_re = torch.cat([t1_re, t2_re]); tr_im = torch.cat([t1_im, t2_im])
+        ux_re = torch.cat([u1_re, u2_re]); ux_im = torch.cat([u1_im, u2_im])
+        
+        # On mélange aléatoirement (Shuffle) pour que le batch ne soit pas trié
+        perm = torch.randperm(batch_size_ic)
+        b_ic, c_ic = b_ic[perm], c_ic[perm]
+        tr_re, tr_im = tr_re[perm], tr_im[perm]
+        ux_re, ux_im = ux_re[perm], ux_im[perm]
+
+        # --- 2. GÉNÉRATION PDE (Standard - On ne touche à rien !) ---
         if t_limit > 1e-5:
+            # On utilise 'cfg' (le vrai), donc domaine complet [-20, 20]
             b_p, c_p, p_p = get_pde_batch_cgle(batch_size_pde, cfg, device, t_limit=t_limit)
         else:
             b_p, c_p, p_p = None, None, None
+            
         return b_p, c_p, p_p, b_ic, c_ic, tr_re, tr_im, ux_re, ux_im
+
     return generator
 
 # ==============================================================================
