@@ -1,4 +1,4 @@
-experiment_name: "CGL_Generalist_Solver"
+experiment_name: "CGL_Generalist_Solver_Lite"
 device: "cuda"
 
 physics:
@@ -10,7 +10,6 @@ physics:
     w0: [0.5, 6.0]
     x0: [0.0, 0.0]
     k: [-2.0, 2.0]
-
   equation_params:
     alpha: [0.0, 1.0]
     beta: [-1.5, 1.5]
@@ -20,54 +19,57 @@ physics:
 model:
   branch_input_dim: 9 
   trunk_input_dim: 2
-  latent_dim: 512
+  latent_dim: 256              # <--- RÉDUIT (Était 512)
   
-  branch_layers: [512, 512, 512, 512, 512, 512]
-  trunk_layers: [512, 512, 512, 512, 512]
+  branch_layers: [256, 256, 256, 256, 256] # <--- 5 couches au lieu de 6
+  trunk_layers: [256, 256, 256, 256]       # <--- 4 couches suffisent
   
   activation: "silu"
   
   fourier_dim: 64
-  fourier_scales: [1.0, 2.0, 5.0, 10.0, 20.0, 40.0]
+  fourier_scales: [1.0, 2.0, 5.0, 10.0, 20.0] # <--- SUPPRESSION du 40.0 (Trop bruitant)
 
 training:
   batch_size_ic: 8192   
   batch_size_pde: 8192   
   
   # Stratégie Robustesse
-  max_macro_loops: 8
-  nb_adam_retries: 4
+  max_macro_loops: 6          # <--- RÉDUIT (Si ça marche pas en 6 coups, ça marchera pas en 8)
+  nb_adam_retries: 2          # <--- CRITIQUE : Évite l'effondrement du LR (Divise max par 4)
   check_interval: 2000
-  stagnation_threshold: 0.001  # 1%
+  stagnation_threshold: 0.001
 
-  pde_weight_start: 0.1   # On commence un peu plus haut pour aider la Tanh
+  # Équilibrage initial
+  pde_weight_start: 0.5       # <--- AUGMENTÉ (Était 0.1). On force la physique dès le début.
   pde_weight_target: 1.0
-  ramp_end_t: 0.1         # Zone de transition
+  ramp_end_t: 0.1
 
   weights:
-    pde_loss: 0.5
-    ic_loss_start: 10.0    # <--- Démarrage fort
-    ic_loss_target: 2.0    # <--- Atterrissage doux pour laisser vivre la Tanh
+    pde_loss: 0.5             # Sera écrasé par la rampe
+    ic_loss_start: 10.0
+    ic_loss_target: 2.0
     bc_loss: 1.0
     
   # Seuils Audit
-  target_error_ic: 0.03     # 3% pour le Warmup
-  target_error_global: 0.03 # 5% pour le Time Marching
+  target_error_ic: 0.03       # 3%
+  target_error_global: 0.04   # <--- LÉGER RELÂCHEMENT (4% au lieu de 3% pour fluidifier le début)
 
   ic_phase:
     learning_rate: 5e-4
     iterations: 10000
-  # -----------------------------
+
+# -----------------------------
 
 time_marching:
-  learning_rate: 1e-4
+  learning_rate: 3e-4         # <--- AUGMENTÉ (Était 1e-4). 
+                              # Avec le Soft Start (divisé par 2), ça commencera à 1.5e-4. C'est parfait.
   zones:
     - t_end: 0.1
-      dt: 0.01   # Petit pas pour démarrer
-      iters: 8000
+      dt: 0.01
+      iters: 10000            # <--- AUGMENTÉ : Modèle plus petit = on peut itérer plus vite.
     - t_end: 2.0
       dt: 0.05
       iters: 8000
     - t_end: 5.0
       dt: 0.1
-      iters: 9000
+      iters: 8000
