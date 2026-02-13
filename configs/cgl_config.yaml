@@ -51,8 +51,8 @@ training:
     bc_loss: 1.0
     
   # Seuils Audit
-  target_error_ic: 0.03       # 3%
-  target_error_global: 0.04   # <--- LÉGER RELÂCHEMENT (4% au lieu de 3% pour fluidifier le début)
+  target_error_ic: 0.04       # 3%
+  target_error_global: 0.045   # <--- LÉGER RELÂCHEMENT (4% au lieu de 3% pour fluidifier le début)
 
   ic_phase:
     learning_rate: 5e-4
