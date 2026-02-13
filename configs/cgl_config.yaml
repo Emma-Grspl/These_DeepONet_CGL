@@ -40,13 +40,13 @@ training:
   stagnation_threshold: 0.001
 
   # Équilibrage initial
-  pde_weight_start: 0.5       # <--- AUGMENTÉ (Était 0.1). On force la physique dès le début.
+  pde_weight_start: 0.2       
   pde_weight_target: 1.0
   ramp_end_t: 0.1
 
   weights:
     pde_loss: 0.5             # Sera écrasé par la rampe
-    ic_loss_start: 10.0
+    ic_loss_start: 5.0
     ic_loss_target: 2.0
     bc_loss: 1.0
     
