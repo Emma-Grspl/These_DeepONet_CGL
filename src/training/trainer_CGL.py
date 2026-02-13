@@ -162,24 +162,24 @@ def run_audit(model, cfg, t_max, threshold=0.03, n_global=60, n_specific=30, ver
                  'A':     np.random.uniform(bounds['A'][0], bounds['A'][1]),
                  'w0':    10**np.random.uniform(np.log10(bounds['w0'][0]), np.log10(bounds['w0'][1])),
                  'x0': 0.0, 'k': 1.0, 
-                 'type': np.random.choice(allowed_types)} # <--- Choix dynamique
+                 'type': np.random.choice(allowed_types)}
             g_errs.append(evaluate_point(p, t_max if t_max > 1e-5 else 0.0))
         except: continue
     
     global_score = np.mean(g_errs) if g_errs else 1.0
     passed_global = global_score < threshold
     
+    # Affichage systématique du Global
     if verbose:
-        print(f"    🌍 Audit Global  : {global_score:.2%} [{'✅' if passed_global else '❌'}]")
-
-    if not passed_global:
-        np.random.set_state(rng_state)
-        return False, [], global_score
+        status_icon = "✅" if passed_global else "❌"
+        print(f"    🌍 Audit Global  : {global_score:.2%} [{status_icon}]")
 
     # --- 2. AUDIT SPÉCIFIQUE ---
+    # On l'exécute MAINTENANT quoi qu'il arrive au Global pour avoir l'info
     failed_types = []
     if verbose: print(f"    🔎 Audit Spécifique :")
-    for t_id in allowed_types: # <--- Boucle dynamique
+    
+    for t_id in allowed_types:
         t_errs = []
         for _ in range(n_specific):
             try:
@@ -195,8 +195,12 @@ def run_audit(model, cfg, t_max, threshold=0.03, n_global=60, n_specific=30, ver
         
         score = np.mean(t_errs) if t_errs else 1.0
         status = "✅" if score < threshold else "❌"
-        if verbose: print(f"      - {type_names[t_id]:<10} : {score:.2%} {status}")
-        if score > threshold: failed_types.append(t_id)
+        
+        if verbose: 
+            print(f"      - {type_names[t_id]:<10} : {score:.2%} {status}")
+            
+        if score > threshold: 
+            failed_types.append(t_id)
 
     np.random.set_state(rng_state)
     return passed_global, failed_types, global_score
@@ -231,8 +235,14 @@ def get_dynamic_weights(t_current, cfg):
 def core_optimization_loop(model, cfg, t_max, start_lr, batch_gen_func, context_name, 
                            global_best_state, global_best_score, use_lbfgs=True):
     device = next(model.parameters()).device
-    adam_retries = cfg['training'].get('nb_adam_retries', 3)
-    target_err = cfg['training'].get('target_error_ic', 0.03) if t_max < 1e-5 else cfg['training'].get('target_error_global', 0.05)
+    adam_retries = cfg['training'].get('nb_adam_retries', 2)
+    
+    # Seuils
+    if t_max < 1e-5:
+        target_err = cfg['training'].get('target_error_ic', 0.05)
+    else:
+        target_err = cfg['training'].get('target_error_global', 0.05)
+        
     weights = cfg['training']['weights'].copy()
     check_interval = cfg['training'].get('check_interval', 2000)
     stagnation_thresh = cfg['training'].get('stagnation_threshold', 1e-4)
@@ -243,6 +253,9 @@ def core_optimization_loop(model, cfg, t_max, start_lr, batch_gen_func, context_
 
     current_lr = start_lr
     early_exit_success = False 
+    
+    # NOUVEAU : On mémorise si Adam a détecté une erreur spécifique
+    adam_detected_failures = [] 
     
     print(f"  ⚔️  Start {context_name} Training (LR={current_lr:.1e})...")
     
@@ -264,39 +277,33 @@ def core_optimization_loop(model, cfg, t_max, start_lr, batch_gen_func, context_
                 cfg['training']['batch_size_pde'], cfg['training']['batch_size_ic']
             )
             
-            # 2. Weight Update (Dynamique Double Rampe)
+            # 2. Weight Update
             if t_max > 0 and i % 500 == 0:
                 current_pde_w, current_ic_w = get_dynamic_weights(t_max, cfg)
-                weights['ic_loss'] = current_ic_w # Mise à jour dynamique de l'IC
+                weights['ic_loss'] = current_ic_w 
 
             # 3. Step
             optimizer.zero_grad(set_to_none=True)
             
-            if t_max < 1e-5:
-                # WARMUP
+            if t_max < 1e-5: # WARMUP
                 c_i.requires_grad_(True)
                 pr, pi = model(b_i, c_i)
                 l_val = torch.mean((pr-tr_re)**2 + (pi-tr_im)**2)
                 gr = torch.autograd.grad(pr.sum(), c_i, create_graph=True)[0]
                 gi = torch.autograd.grad(pi.sum(), c_i, create_graph=True)[0]
-                l_sob = torch.mean((gr[:,0:1]-ux_re)**2 + (gi[:,0:1]-ux_im)**2)
-                loss = l_val + 0.1 * l_sob
-            else:
-                # TIME MARCHING + BC NEUMANN
+                loss = l_val + 0.1 * torch.mean((gr[:,0:1]-ux_re)**2 + (gi[:,0:1]-ux_im)**2)
+            else: # TIME MARCHING
                 rr, ri = pde_residual_cgle(model, b_p, c_p, p_p, cfg)
                 pr, pi = model(b_i, c_i)
                 
-                # BC Neumann Logic
+                # BC Neumann
                 idx_bc = torch.randperm(b_p.size(0))[:int(b_p.size(0)*0.25)]
-                b_bc = b_p[idx_bc]
-                c_bc = c_p[idx_bc].clone()
+                b_bc = b_p[idx_bc]; c_bc = c_p[idx_bc].clone()
                 x_min, x_max = cfg['physics']['x_domain']
                 c_left = c_bc.clone(); c_left[:, 0] = x_min
                 c_right = c_bc.clone(); c_right[:, 0] = x_max
-                b_all_bc = torch.cat([b_bc, b_bc], dim=0)
-                c_all_bc = torch.cat([c_left, c_right], dim=0)
+                b_all_bc = torch.cat([b_bc, b_bc], dim=0); c_all_bc = torch.cat([c_left, c_right], dim=0)
                 c_all_bc.requires_grad_(True)
-                
                 ur_bc, ui_bc = model(b_all_bc, c_all_bc)
                 grad_outputs = torch.ones_like(ur_bc)
                 grads_r = torch.autograd.grad(ur_bc, c_all_bc, grad_outputs=grad_outputs, create_graph=True)[0]
@@ -317,7 +324,6 @@ def core_optimization_loop(model, cfg, t_max, start_lr, batch_gen_func, context_
                 local_run_best_loss = curr_loss
                 local_run_best_state = copy.deepcopy(model.state_dict())
             
-            # Anti-Stagnation
             if i > 0 and i % check_interval == 0:
                 curr_avg = np.mean(losses_window[-check_interval:])
                 if len(losses_window) > check_interval:
@@ -331,30 +337,33 @@ def core_optimization_loop(model, cfg, t_max, start_lr, batch_gen_func, context_
             champion_state = local_run_best_state
             print(f"    🚀 Nouveau Champion Local (L={champion_loss:.2e})")
 
-        # 🛡️ AUDIT INTERMÉDIAIRE (LIVE)
+        # 🛡️ AUDIT INTERMÉDIAIRE (Dans la boucle Adam)
         model.load_state_dict(champion_state)
+        # verbose=False ici pour ne pas spammer, on affiche juste le résumé
         passed_g, failed_t, current_score = run_audit(model, cfg, t_max, threshold=target_err, n_global=40, n_specific=20, verbose=False)
         
-        if current_score < champion_audit_score:
-            champion_audit_score = current_score
-
         status_icon = "✅" if passed_g else "❌"
-        print(f"    📊 Fin Adam {attempt+1}: Audit Global={current_score:.2%} {status_icon} | Failed Types={failed_t}")
+        print(f"    📊 Fin Adam {attempt+1}: Audit Global={current_score:.2%} {status_icon} | Failed={failed_t}")
 
-        # BREAK SI OK
+        # LOGIQUE DE SORTIE
         if passed_g:
             if len(failed_t) == 0:
                 print(f"    ✅ Audit Intermédiaire PARFAIT ! Sortie anticipée.")
+                early_exit_success = True 
+                break 
             else:
                 print(f"    ⚠️ Audit Global OK mais Spécifique KO {failed_t}. Sortie pour Correction.")
-            
-            early_exit_success = True 
-            break 
+                # ON SAUVEGARDE L'ECHEC SPÉCIFIQUE
+                adam_detected_failures = failed_t 
+                early_exit_success = True 
+                break 
         
         current_lr *= 0.5
     
     # --- FINISHER L-BFGS ---
-    if use_lbfgs and not early_exit_success:
+    # On ne lance L-BFGS que si on n'a PAS détecté de problème spécifique
+    # Si Adam a vu un problème spécifique, L-BFGS ne va pas aider, il faut re-entraîner le spécifique.
+    if use_lbfgs and not early_exit_success and len(adam_detected_failures) == 0:
         print(f"    🔧 L-BFGS Finisher ({context_name})...")
         model.load_state_dict(champion_state)
         state_before_lbfgs = copy.deepcopy(model.state_dict())
@@ -377,16 +386,13 @@ def core_optimization_loop(model, cfg, t_max, start_lr, batch_gen_func, context_
                 rr, ri = pde_residual_cgle(model, bp, cp, pp, cfg)
                 pr, pi = model(bi, ci)
                 
-                # BC Neumann (Closure)
                 idx_bc = torch.randperm(bp.size(0))[:int(bp.size(0)*0.25)]
                 b_bc = bp[idx_bc]; c_bc = cp[idx_bc].clone()
                 x_min, x_max = cfg['physics']['x_domain']
                 c_left = c_bc.clone(); c_left[:, 0] = x_min
                 c_right = c_bc.clone(); c_right[:, 0] = x_max
-                b_all_bc = torch.cat([b_bc, b_bc], dim=0)
-                c_all_bc = torch.cat([c_left, c_right], dim=0)
+                b_all_bc = torch.cat([b_bc, b_bc], dim=0); c_all_bc = torch.cat([c_left, c_right], dim=0)
                 c_all_bc.requires_grad_(True)
-                
                 ur_bc, ui_bc = model(b_all_bc, c_all_bc)
                 grad_outputs = torch.ones_like(ur_bc)
                 grads_r = torch.autograd.grad(ur_bc, c_all_bc, grad_outputs=grad_outputs, create_graph=True)[0]
@@ -419,7 +425,20 @@ def core_optimization_loop(model, cfg, t_max, start_lr, batch_gen_func, context_
         print(f"    ⏩ L-BFGS Skipped (Config).")
         model.load_state_dict(champion_state)
 
-    passed_g, failed_t, final_score = run_audit(model, cfg, t_max, threshold=target_err, n_global=100, n_specific=50)
+    # --- AUDIT FINAL & DÉCISIF ---
+    print(f"    🏁 Audit Final de validation ({context_name}) :")
+    # verbose=True pour FORCER l'affichage complet ici
+    passed_g, failed_t, final_score = run_audit(model, cfg, t_max, threshold=target_err, n_global=100, n_specific=50, verbose=True)
+    
+    # 🚨 CORRECTION CRITIQUE : RÉ-INJECTION DE LA MÉMOIRE D'ADAM
+    # Si Adam a détecté un problème spécifique, on le remet dans la liste
+    # même si l'audit final l'a raté.
+    if len(adam_detected_failures) > 0:
+        # On ajoute les échecs d'Adam s'ils ne sont pas déjà là
+        for f in adam_detected_failures:
+            if f not in failed_t:
+                failed_t.append(f)
+        print(f"    🚨 MÉMOIRE : Ré-injection des échecs détectés par Adam {adam_detected_failures}")
     
     if final_score < global_best_score:
         return passed_g, failed_t, current_lr, champion_state, final_score
