@@ -733,9 +733,12 @@ def train_cgle_curriculum(model, cfg, explicit_resume_path=None):
     # 1. WARMUP
     # Si loaded=True et current_t=0.00, c'est que le Warmup est FAIT (on l'a chargé).
     # On ne doit le relancer QUE si on n'a rien chargé (loaded=False).
+    # 1. WARMUP
     if current_t < 1e-5 and not loaded:
         print("🧊 WARMUP (IC + Sobolev)...")
-        ok = robust_optimize(model, cfg, 0.0, 5000, context_str="Warmup")
+        # On va chercher la valeur 15000 dans le YAML
+        warmup_iters = cfg['training']['ic_phase'].get('iterations', 15000)
+        ok = robust_optimize(model, cfg, 0.0, warmup_iters, context_str="Warmup")
         
         # Sauvegarde explicite du t=0.00 dans le NOUVEAU dossier
         save_name = "ckpt_t0.00.pth"
