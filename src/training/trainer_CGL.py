@@ -498,15 +498,16 @@ def core_optimization_loop(model, cfg, t_max, start_lr, batch_gen_func, context_
 # ==============================================================================
 # 4. ORCHESTRATEUR
 # ==============================================================================
-
 def robust_optimize(model, cfg, t_max, n_iters_base, context_str="Global", start_lr_override=None):
+    # Lecture Config
     max_macro = cfg['training'].get('max_macro_loops', 6)
     target_err = cfg['training'].get('target_error_global', 0.045)
     device = next(model.parameters()).device
     
-    # On récupère la liste des IC autorisées (ex: [1, 2])
+    # Liste des conditions initiales (ex: [1, 2] pour Sech et Tanh)
     allowed_types = cfg['physics'].get('initial_conditions', [1, 2])
     
+    # Choix du Learning Rate initial
     if start_lr_override: 
         current_lr = start_lr_override
     elif t_max < 1e-5: 
@@ -514,57 +515,65 @@ def robust_optimize(model, cfg, t_max, n_iters_base, context_str="Global", start
     else: 
         current_lr = float(cfg['time_marching'].get('learning_rate', 1e-4))
     
+    # Initialisation
     global_best_state = copy.deepcopy(model.state_dict())
-    global_best_score = 1e9 # Score arbitraire très haut pour commencer
+    
+    # Premier Audit pour avoir un score de référence
+    passed_g, failed_types, init_score = run_audit(model, cfg, t_max, threshold=target_err, n_global=40, n_specific=30, verbose=False)
+    global_best_score = init_score
+
+    print(f"\n🏰 [Robust Optimize : {context_str}] t={t_max:.2f} | Initial Score: {init_score:.2%} | Failed: {failed_types}")
+
+    # Si c'est déjà gagné, on part
+    if not failed_types:
+        print(f"  ⏩ SKIP TOTAL : Le modèle est déjà parfait (Toutes IC validées).")
+        return True
 
     # Boucle Macro
     for macro in range(max_macro):
-        # --- 1. AUDIT DÉCISIONNEL ---
-        # On ignore le "passed_g" global, on ne regarde que la liste des échecs
-        _, failed_types, current_score = run_audit(model, cfg, t_max, threshold=target_err, 
-                                                   n_global=40, n_specific=30, verbose=True)
+        print(f"  🔄 Macro Cycle {macro+1}/{max_macro} (Best: {global_best_score:.2%})")
+
+        # --- 1. DÉCISION STRATÉGIQUE ---
+        # On décide du mode d'entraînement selon ce qui a échoué
         
-        # Mise à jour du champion
-        if current_score < global_best_score:
-            global_best_score = current_score
-            global_best_state = copy.deepcopy(model.state_dict())
-
-        # CAS A : Tout est validé
-        if not failed_types:
-            print(f"    🏆 VICTOIRE : Toutes les IC sont validées à t={t_max:.2f}")
-            model.load_state_dict(global_best_state)
-            return True
-
-        print(f"  🔄 Macro Cycle {macro+1}/{max_macro} | Score: {current_score:.2%} | Failed: {failed_types}")
-
-        # --- 2. CHOIX DE LA STRATÉGIE ---
-        
-        # CAS B : Aucune IC n'est validée (Tout le monde a échoué)
+        # CAS A : Tout le monde a échoué (ou presque) -> GLOBAL
         if len(failed_types) == len(allowed_types):
-            print(f"    🌍 ÉCHEC GÉNÉRAL : Entraînement GLOBAL (Standard Batch).")
+            print(f"    🌍 ÉCHEC GÉNÉRAL ({len(failed_types)}/{len(allowed_types)}) : Entraînement GLOBAL (Standard Batch).")
             gen = get_standard_batch_generator(cfg, device, t_max)
             context = "GLOBAL"
-            lbfgs_active = True
+            lbfgs_active = True # L-BFGS utile pour dégrossir le global
         
-        # CAS C : Une partie est validée, l'autre non (Le cas de ta Sech !)
+        # CAS B : Échec partiel (Ciblage) -> SPÉCIFIQUE
         else:
-            print(f"    🎯 ÉCHEC PARTIEL : Entraînement SPÉCIFIQUE sur {failed_types} (Biased Batch).")
+            print(f"    🎯 ÉCHEC PARTIEL : Entraînement CIBLÉ sur {failed_types} (Biased Batch).")
             gen = get_biased_batch_generator(cfg, device, failed_types, t_max)
-            context = "SPECIFIC"
-            lbfgs_active = False # On évite L-BFGS sur du spécifique pour ne pas trop "overfitter"
+            context = f"SPECIFIC_{failed_types}"
+            lbfgs_active = False # Pas de L-BFGS sur des batchs biaisés (risque d'oubli)
 
-        # --- 3. EXÉCUTION ---
-        ok, f_types, next_lr, best_state, best_score = core_optimization_loop(
+        # --- 2. EXÉCUTION ---
+        # On appelle la boucle Core qu'on a déjà corrigée
+        ok, new_failed, next_lr, best_state, best_score = core_optimization_loop(
             model, cfg, t_max, current_lr, gen, context, 
             global_best_state, global_best_score, n_iters_input=n_iters_base, use_lbfgs=lbfgs_active
         )
         
         current_lr = next_lr
         
+        # Mise à jour du Champion si on a progressé
         if best_score < global_best_score:
             global_best_score = best_score
             global_best_state = best_state
             model.load_state_dict(global_best_state)
+
+        # --- 3. VERDICT DU CYCLE ---
+        # On refait un petit audit rapide pour savoir qui échoue encore
+        # (NB: core_optimization_loop renvoie déjà new_failed, on l'utilise directement)
+        failed_types = new_failed
+        
+        if not failed_types:
+            print(f"    🏆 VICTOIRE : Toutes les IC sont validées à t={t_max:.2f}")
+            model.load_state_dict(global_best_state)
+            return True
 
     print(f"🛑 ECHEC FINAL à t={t_max:.2f} après {max_macro} cycles.")
     model.load_state_dict(global_best_state)
