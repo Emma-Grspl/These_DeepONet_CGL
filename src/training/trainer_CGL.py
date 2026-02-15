@@ -234,8 +234,6 @@ def get_dynamic_weights(t_current, cfg):
 
 def core_optimization_loop(model, cfg, t_max, start_lr, batch_gen_func, context_name, 
                            global_best_state, global_best_score, n_iters_input, use_lbfgs=True):
-    # ^^^ AJOUT DE L'ARGUMENT n_iters_input DANS LA SIGNATURE ^^^
-
     device = next(model.parameters()).device
     adam_retries = cfg['training'].get('nb_adam_retries', 2)
     
@@ -269,7 +267,7 @@ def core_optimization_loop(model, cfg, t_max, start_lr, batch_gen_func, context_
         model.load_state_dict(current_champion_state)
         optimizer = optim.Adam(model.parameters(), lr=current_lr)
         
-        # ICI : On utilise l'argument n_iters_input passé par robust_optimize
+        # UTILISATION DE L'ARGUMENT n_iters_input
         n_iter = n_iters_input + (2000 * attempt)
         
         # --- 👇 AJOUT SCHEDULER 👇 ---
@@ -295,22 +293,25 @@ def core_optimization_loop(model, cfg, t_max, start_lr, batch_gen_func, context_
                 current_pde_w, current_ic_w = get_dynamic_weights(t_max, cfg)
                 weights['ic_loss'] = current_ic_w 
 
-            # --- 🕵️ DIAGNOSTIC DE VÉRITÉ (Juste au tout début) ---
+            # --- 🕵️ DIAGNOSTIC DE VÉRITÉ (SÉCURISÉ) ---
             if i == 0 and attempt == 0:
                 with torch.no_grad():
-                    # On calcule combien la PDE "hurle"
-                    rr_d, ri_d = pde_residual_cgle(model, b_p, c_p, p_p, cfg)
-                    loss_pde_raw = torch.mean(rr_d**2 + ri_d**2).item()
-                    
-                    # On calcule combien l'IC est "calme"
+                    # Calcul IC (Toujours dispo)
                     pr_d, pi_d = model(b_i, c_i)
                     loss_ic_raw = torch.mean((pr_d-tr_re)**2 + (pi_d-tr_im)**2).item()
                     
                     print(f"\n🚨 DIAGNOSTIC CRASH TEST (t={t_max}):")
                     print(f"   📉 Loss IC (Attache) : {loss_ic_raw:.6f}")
-                    print(f"   💥 Loss PDE (Physique): {loss_pde_raw:.6f}")
-                    ratio = loss_pde_raw / (loss_ic_raw + 1e-9)
-                    print(f"   ⚖️  La Physique est {ratio:.1f}x plus violente que l'IC.")
+                    
+                    # CORRECTION DU CRASH : On vérifie si b_p existe
+                    if b_p is not None:
+                        rr_d, ri_d = pde_residual_cgle(model, b_p, c_p, p_p, cfg)
+                        loss_pde_raw = torch.mean(rr_d**2 + ri_d**2).item()
+                        print(f"   💥 Loss PDE (Physique): {loss_pde_raw:.6f}")
+                        ratio = loss_pde_raw / (loss_ic_raw + 1e-9)
+                        print(f"   ⚖️  La Physique est {ratio:.1f}x plus violente que l'IC.")
+                    else:
+                        print(f"   ☕ Mode WARMUP : Pas de PDE calculée.")
             # -----------------------------------------------------
 
             # 3. Optimization Step
@@ -390,8 +391,8 @@ def core_optimization_loop(model, cfg, t_max, start_lr, batch_gen_func, context_
         status_icon = "✅" if passed_g else "❌"
         print(f"    📊 Fin Adam {attempt+1}: Audit Global={score_after_adam:.2%} {status_icon} (Avant: {score_before_adam:.2%}) | Failed={failed_t}")
 
-        # 🛑 LOGIQUE DE ROLLBACK (NOUVEAU) 🛑
-        if score_after_adam > score_before_adam + 0.02: 
+        # 🛑 LOGIQUE DE ROLLBACK (ASSOUPLIE +5%) 🛑
+        if score_after_adam > score_before_adam + 0.05: 
             print(f"    ⚠️ ADAM REJETÉ : Explosion de l'erreur. ROLLBACK.")
             current_champion_state = state_before_adam
             current_champion_score = score_before_adam
