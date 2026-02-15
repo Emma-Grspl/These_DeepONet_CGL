@@ -233,7 +233,9 @@ def get_dynamic_weights(t_current, cfg):
     return pde_w, ic_w
 
 def core_optimization_loop(model, cfg, t_max, start_lr, batch_gen_func, context_name, 
-                           global_best_state, global_best_score, use_lbfgs=True):
+                           global_best_state, global_best_score, n_iters_input, use_lbfgs=True):
+    # ^^^ AJOUT DE L'ARGUMENT n_iters_input DANS LA SIGNATURE ^^^
+
     device = next(model.parameters()).device
     adam_retries = cfg['training'].get('nb_adam_retries', 2)
     
@@ -257,7 +259,7 @@ def core_optimization_loop(model, cfg, t_max, start_lr, batch_gen_func, context_
     # NOUVEAU : On mémorise si Adam a détecté une erreur spécifique
     adam_detected_failures = [] 
     
-    print(f"  ⚔️  Start {context_name} Training (LR={current_lr:.1e})...")
+    print(f"  ⚔️  Start {context_name} Training (LR={current_lr:.1e}, Iters={n_iters_input})...")
     
     for attempt in range(adam_retries):
         # 🛡️ SNAPSHOT : On mémorise l'état AVANT cet essai Adam
@@ -267,7 +269,14 @@ def core_optimization_loop(model, cfg, t_max, start_lr, batch_gen_func, context_
         model.load_state_dict(current_champion_state)
         optimizer = optim.Adam(model.parameters(), lr=current_lr)
         
-        n_iter = 5000 + (2000 * attempt)
+        # ICI : On utilise l'argument n_iters_input passé par robust_optimize
+        n_iter = n_iters_input + (2000 * attempt)
+        
+        # --- 👇 AJOUT SCHEDULER 👇 ---
+        # Le LR va décroître doucement jusqu'à 0 à la fin des n_iter
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_iter, eta_min=0.0)
+        # -----------------------------
+        
         pbar = tqdm(range(n_iter), desc=f"    [{context_name}] Adam {attempt+1}/{adam_retries}", leave=False)
         
         losses_window = []
@@ -286,6 +295,24 @@ def core_optimization_loop(model, cfg, t_max, start_lr, batch_gen_func, context_
                 current_pde_w, current_ic_w = get_dynamic_weights(t_max, cfg)
                 weights['ic_loss'] = current_ic_w 
 
+            # --- 🕵️ DIAGNOSTIC DE VÉRITÉ (Juste au tout début) ---
+            if i == 0 and attempt == 0:
+                with torch.no_grad():
+                    # On calcule combien la PDE "hurle"
+                    rr_d, ri_d = pde_residual_cgle(model, b_p, c_p, p_p, cfg)
+                    loss_pde_raw = torch.mean(rr_d**2 + ri_d**2).item()
+                    
+                    # On calcule combien l'IC est "calme"
+                    pr_d, pi_d = model(b_i, c_i)
+                    loss_ic_raw = torch.mean((pr_d-tr_re)**2 + (pi_d-tr_im)**2).item()
+                    
+                    print(f"\n🚨 DIAGNOSTIC CRASH TEST (t={t_max}):")
+                    print(f"   📉 Loss IC (Attache) : {loss_ic_raw:.6f}")
+                    print(f"   💥 Loss PDE (Physique): {loss_pde_raw:.6f}")
+                    ratio = loss_pde_raw / (loss_ic_raw + 1e-9)
+                    print(f"   ⚖️  La Physique est {ratio:.1f}x plus violente que l'IC.")
+            # -----------------------------------------------------
+
             # 3. Optimization Step
             optimizer.zero_grad(set_to_none=True)
             
@@ -296,8 +323,8 @@ def core_optimization_loop(model, cfg, t_max, start_lr, batch_gen_func, context_
                 l_val = torch.mean((pr-tr_re)**2 + (pi-tr_im)**2)
                 gr = torch.autograd.grad(pr.sum(), c_i, create_graph=True)[0]
                 gi = torch.autograd.grad(pi.sum(), c_i, create_graph=True)[0]
-                # Sobolev (dérivée spatiale)
-                loss = l_val + 0.1 * torch.mean((gr[:,0:1]-ux_re)**2 + (gi[:,0:1]-ux_im)**2)
+                # Sobolev (dérivée spatiale) -> Poids 1.0 comme discuté
+                loss = l_val + 1.0 * torch.mean((gr[:,0:1]-ux_re)**2 + (gi[:,0:1]-ux_im)**2)
             
             else: 
                 # --- TIME MARCHING (PDE + IC + BC) ---
@@ -325,11 +352,15 @@ def core_optimization_loop(model, cfg, t_max, start_lr, batch_gen_func, context_
 
             loss.backward()
             
-            # --- 🛡️ SÉCURITÉ : GRADIENT CLIPPING (NOUVEAU) ---
+            # --- 🛡️ SÉCURITÉ : GRADIENT CLIPPING ---
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             # ---------------------------------------
             
             optimizer.step()
+            
+            # --- 👇 STEP SCHEDULER 👇 ---
+            scheduler.step()
+            # --------------------------
             
             # Tracking
             curr_loss = loss.item()
@@ -360,7 +391,6 @@ def core_optimization_loop(model, cfg, t_max, start_lr, batch_gen_func, context_
         print(f"    📊 Fin Adam {attempt+1}: Audit Global={score_after_adam:.2%} {status_icon} (Avant: {score_before_adam:.2%}) | Failed={failed_t}")
 
         # 🛑 LOGIQUE DE ROLLBACK (NOUVEAU) 🛑
-        # Si l'erreur a explosé (ex: +2% d'erreur absolue), on jette ce run.
         if score_after_adam > score_before_adam + 0.02: 
             print(f"    ⚠️ ADAM REJETÉ : Explosion de l'erreur. ROLLBACK.")
             current_champion_state = state_before_adam
@@ -386,7 +416,6 @@ def core_optimization_loop(model, cfg, t_max, start_lr, batch_gen_func, context_
         current_lr *= 0.5
     
     # --- FINISHER L-BFGS ---
-    # On ne lance L-BFGS que si on n'a PAS détecté de problème spécifique
     if use_lbfgs and not early_exit_success and len(adam_detected_failures) == 0:
         print(f"    🔧 L-BFGS Finisher ({context_name})...")
         model.load_state_dict(current_champion_state)
@@ -405,7 +434,7 @@ def core_optimization_loop(model, cfg, t_max, start_lr, batch_gen_func, context_
                 l_v = torch.mean((pr-tr)**2 + (pi-ti)**2)
                 gr = torch.autograd.grad(pr.sum(), ci, create_graph=True)[0]
                 gi = torch.autograd.grad(pi.sum(), ci, create_graph=True)[0]
-                loss = l_v + 0.1 * torch.mean((gr[:,0:1]-ux)**2 + (gi[:,0:1]-ui)**2)
+                loss = l_v + 1.0 * torch.mean((gr[:,0:1]-ux)**2 + (gi[:,0:1]-ui)**2)
             else:
                 rr, ri = pde_residual_cgle(model, bp, cp, pp, cfg)
                 pr, pi = model(bi, ci)
@@ -497,7 +526,6 @@ def robust_optimize(model, cfg, t_max, n_iters_base, context_str="Global", start
         print(f"  🔄 Macro Cycle {macro+1}/{max_macro} (Best: {global_best_score:.2%})")
 
         # 1️⃣ PHASE GLOBALE (Obligatoire si Global KO)
-        # On ne saute le Global QUE si le Global est déjà Vert (passed_g=True) ET qu'il reste du spécifique
         run_global_phase = True
         if passed_g and len(failed_types) > 0:
             print(f"  ↪️  SKIP GLOBAL : Global OK ({global_best_score:.2%}), focus immédiat sur Spécifique {failed_types}.")
@@ -505,17 +533,18 @@ def robust_optimize(model, cfg, t_max, n_iters_base, context_str="Global", start
 
         if run_global_phase:
             gen_std = get_standard_batch_generator(cfg, device, t_max)
+            # 👇 MODIFICATION ICI : On passe n_iters_base dans n_iters_input 👇
             ok, f_types, next_lr, best_state, best_score = core_optimization_loop(
                 model, cfg, t_max, current_lr, gen_std, "GLOBAL", 
-                global_best_state, global_best_score, use_lbfgs=True
+                global_best_state, global_best_score, n_iters_input=n_iters_base, use_lbfgs=True
             )
+            # -----------------------------------------------------------------
             current_lr = next_lr 
             
             # Mise à jour Champion
             if best_score < global_best_score:
                 global_best_score = best_score
                 global_best_state = best_state
-                # Mise à jour du statut global
                 passed_g = (global_best_score < target_err)
             
             failed_types = f_types
@@ -527,15 +556,16 @@ def robust_optimize(model, cfg, t_max, n_iters_base, context_str="Global", start
                 return True
 
         # 2️⃣ PHASE SPÉCIFIQUE (Uniquement si Global est VERT)
-        # C'est LA correction que tu attendais :
         if passed_g and failed_types:
             print(f"    ⚠️ CIBLAGE : Correction requise pour {failed_types}.")
             gen_biased = get_biased_batch_generator(cfg, device, failed_types, t_max)
             
+            # 👇 MODIFICATION ICI : On passe n_iters_base dans n_iters_input 👇
             ok_spec, failed_spec, next_lr_spec, best_state_spec, best_score_spec = core_optimization_loop(
                 model, cfg, t_max, current_lr, gen_biased, "SPECIFIC", 
-                global_best_state, global_best_score, use_lbfgs=False 
+                global_best_state, global_best_score, n_iters_input=n_iters_base, use_lbfgs=False 
             )
+            # -----------------------------------------------------------------
             current_lr = next_lr_spec
             
             if best_score_spec < global_best_score:
@@ -556,7 +586,6 @@ def robust_optimize(model, cfg, t_max, n_iters_base, context_str="Global", start
     print("🛑 ECHEC FINAL (Max Macro loops atteint).")
     model.load_state_dict(global_best_state)
     return False
-
 
 import datetime
 
