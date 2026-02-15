@@ -42,10 +42,10 @@ training:
   # Équilibrage initial
   pde_weight_start: 0.2       
   pde_weight_target: 1.0
-  ramp_end_t: 0.1
+  ramp_end_t: 0.15
 
   weights:
-    pde_loss: 0.5             # Sera écrasé par la rampe
+    pde_loss: 0.1             # Sera écrasé par la rampe
     ic_loss_start: 5.0
     ic_loss_target: 2.0
     bc_loss: 1.0
@@ -61,10 +61,10 @@ training:
 # -----------------------------
 
 time_marching:
-  learning_rate: 3e-4         # <--- AUGMENTÉ (Était 1e-4). 
+  learning_rate: 1e-4         # <--- AUGMENTÉ (Était 1e-4). 
                               # Avec le Soft Start (divisé par 2), ça commencera à 1.5e-4. C'est parfait.
   zones:
-    - t_end: 0.1
+    - t_end: 0.15
       dt: 0.01
       iters: 10000            # <--- AUGMENTÉ : Modèle plus petit = on peut itérer plus vite.
     - t_end: 2.0
