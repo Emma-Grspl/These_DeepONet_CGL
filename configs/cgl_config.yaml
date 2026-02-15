@@ -83,6 +83,6 @@ time_marching:
     - t_end: 2.0
       dt: 0.05
       iters: 8000
-    - t_end: 5.0
+    - t_end: 4.0
       dt: 0.1
       iters: 8000

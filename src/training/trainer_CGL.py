@@ -293,25 +293,31 @@ def core_optimization_loop(model, cfg, t_max, start_lr, batch_gen_func, context_
                 current_pde_w, current_ic_w = get_dynamic_weights(t_max, cfg)
                 weights['ic_loss'] = current_ic_w 
 
-            # --- 🕵️ DIAGNOSTIC DE VÉRITÉ (SÉCURISÉ) ---
+            # --- 🕵️ DIAGNOSTIC DE VÉRITÉ (CORRIGÉ) ---
             if i == 0 and attempt == 0:
+                # 1. Calcul IC (Pas besoin de gradient, juste forward)
                 with torch.no_grad():
-                    # Calcul IC (Toujours dispo)
                     pr_d, pi_d = model(b_i, c_i)
                     loss_ic_raw = torch.mean((pr_d-tr_re)**2 + (pi_d-tr_im)**2).item()
-                    
                     print(f"\n🚨 DIAGNOSTIC CRASH TEST (t={t_max}):")
                     print(f"   📉 Loss IC (Attache) : {loss_ic_raw:.6f}")
+
+                # 2. Calcul PDE (A BESOIN DU GRADIENT !)
+                if b_p is not None:
+                    # IMPORTANT : On active le gradient sur les coordonnées pour calculer du/dx
+                    c_p.requires_grad_(True)
                     
-                    # CORRECTION DU CRASH : On vérifie si b_p existe
-                    if b_p is not None:
+                    # On calcule le résidu (SANS torch.no_grad)
+                    try:
                         rr_d, ri_d = pde_residual_cgle(model, b_p, c_p, p_p, cfg)
                         loss_pde_raw = torch.mean(rr_d**2 + ri_d**2).item()
                         print(f"   💥 Loss PDE (Physique): {loss_pde_raw:.6f}")
                         ratio = loss_pde_raw / (loss_ic_raw + 1e-9)
                         print(f"   ⚖️  La Physique est {ratio:.1f}x plus violente que l'IC.")
-                    else:
-                        print(f"   ☕ Mode WARMUP : Pas de PDE calculée.")
+                    except Exception as e:
+                        print(f"   ⚠️ Diagnostic PDE ignoré (Erreur technique): {e}")
+                else:
+                    print(f"   ☕ Mode WARMUP : Pas de PDE calculée.")
             # -----------------------------------------------------
 
             # 3. Optimization Step
