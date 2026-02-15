@@ -557,6 +557,10 @@ def robust_optimize(model, cfg, t_max, n_iters_base, context_str="Global", start
     model.load_state_dict(global_best_state)
     return False
 
+
+import datetime
+
+
 import glob
 import re
 import os
@@ -564,17 +568,21 @@ import torch
 
 def train_cgle_curriculum(model, cfg, explicit_resume_path=None):
     """
-    Args:
-        explicit_resume_path (str): Chemin complet vers un checkpoint précis (ex: .../ckpt_t0.09.pth)
-                                    Si fourni, force la reprise depuis ce fichier.
+    Entraînement avec "Smart Resume" :
+    1. Regarde si un chemin précis est donné.
+    2. Regarde dans le dossier actuel (si on a relancé le même run).
+    3. (NOUVEAU) Regarde dans les ANCIENS runs pour trouver le dernier checkpoint valide.
     """
+    # C'est ici que le dossier du run ACTUEL est créé (ex: .../Run_20260215/checkpoints)
     save_dir = cfg['training'].get('save_dir', "outputs/checkpoints")
     os.makedirs(save_dir, exist_ok=True)
     
     current_t = 0.0
     loaded = False
 
-    # --- 1. REPRISE FORCÉE (Si chemin fourni) ---
+    # ==========================================================================
+    # 1. REPRISE FORCÉE (Si chemin explicite fourni)
+    # ==========================================================================
     if explicit_resume_path and os.path.exists(explicit_resume_path):
         print(f"🔄 REPRISE FORCÉE : Chargement de {explicit_resume_path}")
         checkpoint = torch.load(explicit_resume_path, map_location=next(model.parameters()).device)
@@ -584,7 +592,6 @@ def train_cgle_curriculum(model, cfg, explicit_resume_path=None):
             current_t = checkpoint.get('t', 0.0)
         else:
             model.load_state_dict(checkpoint)
-            # Si le t n'est pas dans le fichier, on essaie de le deviner du nom
             try:
                 match = re.search(r"t(\d+\.\d+)", os.path.basename(explicit_resume_path))
                 if match: current_t = float(match.group(1))
@@ -593,7 +600,9 @@ def train_cgle_curriculum(model, cfg, explicit_resume_path=None):
         print(f"✅ Modèle chargé depuis source externe. Reprise à t = {current_t:.4f}")
         loaded = True
 
-    # --- 2. REPRISE AUTOMATIQUE (Dans le dossier courant) ---
+    # ==========================================================================
+    # 2. REPRISE LOCALE (Si on relance dans le MÊME dossier)
+    # ==========================================================================
     if not loaded:
         print(f"📂 Recherche de reprise locale dans : {save_dir}")
         search_pattern = os.path.join(save_dir, "ckpt_t*.pth")
@@ -613,7 +622,7 @@ def train_cgle_curriculum(model, cfg, explicit_resume_path=None):
                 except: continue
             
             if last_ckpt:
-                print(f"🔄 AUTO-RESUME : Chargement de {last_ckpt}")
+                print(f"🔄 AUTO-RESUME (Local) : Chargement de {last_ckpt}")
                 checkpoint = torch.load(last_ckpt)
                 if isinstance(checkpoint, dict) and 'model' in checkpoint:
                     model.load_state_dict(checkpoint['model'])
@@ -621,20 +630,93 @@ def train_cgle_curriculum(model, cfg, explicit_resume_path=None):
                     model.load_state_dict(checkpoint)
                 current_t = max_t
                 print(f"✅ Reprise locale à t = {current_t:.4f}")
+                loaded = True
 
-    # --- SUITE (WARMUP & ZONES) ---
+    # ==========================================================================
+    # 3. REPRISE HISTORIQUE (C'EST CE QUI TE MANQUAIT !)
+    # ==========================================================================
+    if not loaded:
+        print("🕵️  Dossier local vide. Scan des RUNS PRÉCÉDENTS dans 'results'...")
+        
+        # On remonte d'un niveau : de ".../Run_2026.../checkpoints" à ".../Run_2026..."
+        current_run_folder = os.path.dirname(save_dir) 
+        # On remonte encore : vers ".../results"
+        results_root = os.path.dirname(current_run_folder) 
+        
+        # On liste tous les dossiers CGL_Binary_Run_*
+        all_runs = glob.glob(os.path.join(results_root, "CGL_Binary_Run_*"))
+        
+        # On trie par ordre alphabétique INVERSE (le plus récent en premier grâce à la date)
+        all_runs = sorted(all_runs, reverse=True)
+        
+        for run_path in all_runs:
+            # IMPORTANT : On saute le dossier actuel (qui est vide puisqu'on vient de le créer)
+            if os.path.abspath(run_path) == os.path.abspath(current_run_folder):
+                continue
+            
+            # On regarde s'il y a des checkpoints dans ce run voisin
+            neighbor_ckpt_dir = os.path.join(run_path, "checkpoints")
+            if not os.path.isdir(neighbor_ckpt_dir):
+                continue
+                
+            old_ckpts = glob.glob(os.path.join(neighbor_ckpt_dir, "ckpt_t*.pth"))
+            if not old_ckpts:
+                continue
+            
+            # On a trouvé un dossier valide (ex: ton run du 13/02) ! 
+            # On cherche le dernier checkpoint dedans
+            max_t = -1.0
+            best_ckpt = None
+            for ckpt_path in old_ckpts:
+                try:
+                    match = re.search(r"ckpt_t(\d+\.\d+)\.pth", os.path.basename(ckpt_path))
+                    if match:
+                        t_val = float(match.group(1))
+                        if t_val > max_t:
+                            max_t = t_val
+                            best_ckpt = ckpt_path
+                except: continue
+            
+            if best_ckpt:
+                print(f"🔍 Trouvé historique : {os.path.basename(run_path)}")
+                print(f"🔄 SMART RESUME : Chargement de {os.path.basename(best_ckpt)}")
+                
+                checkpoint = torch.load(best_ckpt, map_location=next(model.parameters()).device)
+                if isinstance(checkpoint, dict) and 'model' in checkpoint:
+                    model.load_state_dict(checkpoint['model'])
+                else:
+                    model.load_state_dict(checkpoint)
+                
+                current_t = max_t
+                loaded = True
+                print(f"✅ Reprise historique validée à t = {current_t:.4f}")
+                break # On arrête de chercher, on a pris le plus récent
+
+    if not loaded:
+        print("❌ Aucun historique trouvé. Démarrage à zéro.")
+
+
+    # ==========================================================================
+    # SUITE (WARMUP & ZONES)
+    # ==========================================================================
     
     # 1. WARMUP
-    if current_t < 1e-5:
+    # Si loaded=True et current_t=0.00, c'est que le Warmup est FAIT (on l'a chargé).
+    # On ne doit le relancer QUE si on n'a rien chargé (loaded=False).
+    if current_t < 1e-5 and not loaded:
         print("🧊 WARMUP (IC + Sobolev)...")
         ok = robust_optimize(model, cfg, 0.0, 5000, context_str="Warmup")
+        
+        # Sauvegarde explicite du t=0.00 dans le NOUVEAU dossier
         save_name = "ckpt_t0.00.pth"
         save_path = os.path.join(save_dir, save_name)
         torch.save({'model': model.state_dict(), 't': 0.0}, save_path)
         print(f"    💾 Checkpoint Warmup sauvegardé : {save_name}")
+        
         if not ok: return
     else:
-        print(f"⏩ SKIP WARMUP (Déjà traité, t={current_t:.2f})")
+        # Soit on a chargé un t > 0, soit on a chargé t=0 (donc Warmup déjà fait)
+        print(f"⏩ SKIP WARMUP (Prêt pour Time Marching, t={current_t:.2f})")
 
     # 2. TIME MARCHING
     zones = cfg['time_marching']['zones']
@@ -647,26 +729,23 @@ def train_cgle_curriculum(model, cfg, explicit_resume_path=None):
             
         print(f"\n🚀 ZONE : t_end={z_end}, dt={z_dt} (Start t={current_t:.2f})")
         
-        # Flag pour détecter le tout premier pas de cette zone
         is_new_zone = True 
         
         while current_t < z_end - 1e-9:
             next_t = current_t + z_dt
             if next_t > z_end: next_t = z_end
             
-            # --- LOGIQUE DE LR ADAPTATIF ET SOFT START ---
-            # 1. On récupère le LR de croisière (ex: 1e-4)
+            # LR Adaptatif + Soft Start
             base_lr = float(cfg['time_marching'].get('learning_rate', 1e-4))
             
             if is_new_zone:
-                # 2. Transition de zone : Soft Start (Divisé par 2)
+                # Si on change de zone, on réduit le LR pour la transition
                 step_lr = base_lr * 0.5
                 print(f"  🛡️ Soft Start (Transition Zone) : LR={step_lr:.1e}")
-                is_new_zone = False # Désactivé pour les prochains pas
+                is_new_zone = False 
             else:
                 step_lr = base_lr
             
-            # 3. Appel avec le LR calculé
             ok = robust_optimize(model, cfg, next_t, z_iters, 
                                  context_str="Global", start_lr_override=step_lr)
             if not ok: 
@@ -675,7 +754,6 @@ def train_cgle_curriculum(model, cfg, explicit_resume_path=None):
 
             current_t = next_t
             
-            # Sauvegarde dans le NOUVEAU dossier
             save_name = f"ckpt_t{current_t:.2f}.pth"
             save_path = os.path.join(save_dir, save_name)
             torch.save({'model': model.state_dict(), 't': current_t}, save_path)
