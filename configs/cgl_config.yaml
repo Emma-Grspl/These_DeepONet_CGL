@@ -77,12 +77,15 @@ time_marching:
   learning_rate: 1e-4         
                               # Avec le Soft Start (divisé par 2), ça commencera à 1.5e-4. C'est parfait.
   zones:
+    - t_end: 0.05    # Une toute petite zone de démarrage
+      dt: 0.002      # Pas très fins (20 pas pour faire 0.05)
+      iters: 5000    # Moins d'itérations par pas, car le pas est petit
     - t_end: 0.15
-      dt: 0.01
-      iters: 10000            # <--- AUGMENTÉ : Modèle plus petit = on peut itérer plus vite.
+      dt: 0.01       # On reprend le rythme normal ensuite
+      iters: 9000          # <--- AUGMENTÉ : Modèle plus petit = on peut itérer plus vite.
     - t_end: 2.0
       dt: 0.05
-      iters: 8000
+      iters: 9000
     - t_end: 4.0
       dt: 0.1
-      iters: 8000
+      iters: 10000
