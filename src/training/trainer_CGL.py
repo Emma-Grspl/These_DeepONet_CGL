@@ -134,12 +134,23 @@ def run_audit(model, cfg, t_max, threshold=0.03, n_global=60, n_specific=30, ver
     eq_p, bounds, x_domain = phys['equation_params'], phys['bounds'], phys['x_domain']
 
     def evaluate_point(p_dict, t_eval):
-        if t_eval < 1e-5:
-            X, T, U_cplx = get_ground_truth_CGL(p_dict, x_domain[0], x_domain[1], 0.01, Nx=128, Nt=None)
-            U_true, X_flat, T_flat = U_cplx[:, 0], X[:, 0], np.zeros_like(X[:, 0])
+        # --- FIX : Sécurité pour les temps très courts ---
+        # Si t est minuscule, on compare à l'IC analytique (t=0)
+        # car le solveur numérique est instable/imprécis sur ces échelles.
+        t_for_solver = 0.01 if t_eval < 0.01 else t_eval
+        
+        X, T, U_cplx = get_ground_truth_CGL(p_dict, x_domain[0], x_domain[1], t_for_solver, Nx=128, Nt=None)
+        
+        if t_eval < 0.01:
+            # On récupère la condition initiale (t=0) dans la première colonne
+            U_true = U_cplx[:, 0]
+            X_flat = X[:, 0]
+            T_flat = np.zeros_like(X_flat) + t_eval # On demande au modèle de prédire à t_eval
         else:
-            X, T, U_cplx = get_ground_truth_CGL(p_dict, x_domain[0], x_domain[1], t_eval, Nx=128, Nt=None)
-            U_true, X_flat, T_flat = U_cplx.flatten(), X.flatten(), T.flatten()
+            # Mode normal pour le Time Marching avancé
+            U_true = U_cplx.flatten()
+            X_flat = X.flatten()
+            T_flat = T.flatten()
             
         xt_t = torch.tensor(np.stack([X_flat, T_flat], axis=1), dtype=torch.float32).to(device)
         p_vec = np.array([p_dict[k] for k in ['alpha','beta','mu','V','A','w0','x0','k','type']])
@@ -148,6 +159,7 @@ def run_audit(model, cfg, t_max, threshold=0.03, n_global=60, n_specific=30, ver
         with torch.no_grad():
             ur, ui = model(p_t, xt_t)
             up = (ur + 1j*ui).cpu().numpy().flatten()
+            
         norm = np.linalg.norm(U_true)
         return np.linalg.norm(U_true - up) / (norm if norm > 1e-9 else 1e-9)
 

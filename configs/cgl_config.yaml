@@ -53,7 +53,7 @@ training:
   stagnation_threshold: 0.001
 
   # Équilibrage initial
-  pde_weight_start: 0.01       
+  pde_weight_start: 0.005       
   pde_weight_target: 1.0
   ramp_end_t: 0.15
 
