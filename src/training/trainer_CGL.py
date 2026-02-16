@@ -6,12 +6,21 @@ import copy
 from tqdm import tqdm
 import glob
 import re
+import csv
 
 # Imports CGL
 from src.physics.pde_cgl import pde_residual_cgle
 from src.data.generators import get_ic_batch_cgle, get_pde_batch_cgle
 from src.utils.solver_cgl import get_ground_truth_CGL 
 
+def init_csv_logs(save_dir):
+    log_path = os.path.join(save_dir, "training_diagnostics.csv")
+    if not os.path.exists(log_path):
+        with open(log_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(["t_max", "step", "loss_global", "loss_ic", "loss_pde", "r_grad", "cos_phi", "tr_ratio", "weight_pde"])
+    return log_path
+    
 # ==============================================================================
 # 1. GÉNÉRATEURS DE BATCH
 # ==============================================================================
@@ -244,55 +253,55 @@ def get_dynamic_weights(t_current, cfg):
         
     return pde_w, ic_w
 
+import torch
+import torch.optim as optim
+import numpy as np
+import copy
+import os
+import csv
+from tqdm import tqdm
+
 def core_optimization_loop(model, cfg, t_max, start_lr, batch_gen_func, context_name, 
                            global_best_state, global_best_score, n_iters_input, use_lbfgs=True):
     device = next(model.parameters()).device
     adam_retries = cfg['training'].get('nb_adam_retries', 2)
     
-    # Choix du seuil d'erreur selon la phase
-    if t_max < 1e-5:
-        target_err = cfg['training'].get('target_error_ic', 0.05)
-    else:
-        target_err = cfg['training'].get('target_error_global', 0.05)
+    # Choix du seuil selon la phase
+    target_err = cfg['training'].get('target_error_ic' if t_max < 1e-5 else 'target_error_global', 0.05)
         
     weights = cfg['training']['weights'].copy()
     check_interval = cfg['training'].get('check_interval', 2000)
     stagnation_thresh = cfg['training'].get('stagnation_threshold', 1e-4)
+    save_dir = cfg['training'].get('save_dir', "outputs")
     
-    # On garde une copie du "meilleur monde connu" AVANT de commencer quoi que ce soit
+    # Initialisation du log CSV
+    log_path = init_csv_logs(save_dir)
+    
     current_champion_state = copy.deepcopy(global_best_state)
     current_champion_score = global_best_score
-
     current_lr = start_lr
     early_exit_success = False 
-    
-    # NOUVEAU : On mémorise si Adam a détecté une erreur spécifique
     adam_detected_failures = [] 
     
     print(f"  ⚔️  Start {context_name} Training (LR={current_lr:.1e}, Iters={n_iters_input})...")
     
     for attempt in range(adam_retries):
-        # 🛡️ SNAPSHOT : On mémorise l'état AVANT cet essai Adam
         state_before_adam = copy.deepcopy(current_champion_state)
         score_before_adam = current_champion_score
 
         model.load_state_dict(current_champion_state)
         optimizer = optim.Adam(model.parameters(), lr=current_lr)
         
-        # UTILISATION DE L'ARGUMENT n_iters_input
         n_iter = n_iters_input + (2000 * attempt)
-        
-        # --- 👇 AJOUT SCHEDULER 👇 ---
-        # Le LR va décroître doucement jusqu'à 0 à la fin des n_iter
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_iter, eta_min=0.0)
-        # -----------------------------
         
         pbar = tqdm(range(n_iter), desc=f"    [{context_name}] Adam {attempt+1}/{adam_retries}", leave=False)
-        
         losses_window = []
         local_run_best_loss = float('inf')
         local_run_best_state = None
-        current_pde_w = 0.5
+        
+        # Initialisation dynamique des poids
+        current_pde_w, current_ic_w = get_dynamic_weights(t_max, cfg)
 
         for i in pbar:
             # 1. Fetch Data
@@ -300,57 +309,59 @@ def core_optimization_loop(model, cfg, t_max, start_lr, batch_gen_func, context_
                 cfg['training']['batch_size_pde'], cfg['training']['batch_size_ic']
             )
             
-            # 2. Update Dynamic Weights (Double Rampe)
+            # 2. Update Weights (Rampe par défaut toutes les 500 iters)
             if t_max > 0 and i % 500 == 0:
-                current_pde_w, current_ic_w = get_dynamic_weights(t_max, cfg)
+                _, current_ic_w = get_dynamic_weights(t_max, cfg)
                 weights['ic_loss'] = current_ic_w 
-
-            # --- 🕵️ DIAGNOSTIC DE VÉRITÉ (CORRIGÉ) ---
-            if i == 0 and attempt == 0:
-                # 1. Calcul IC (Pas besoin de gradient, juste forward)
-                with torch.no_grad():
-                    pr_d, pi_d = model(b_i, c_i)
-                    loss_ic_raw = torch.mean((pr_d-tr_re)**2 + (pi_d-tr_im)**2).item()
-                    print(f"\n🚨 DIAGNOSTIC CRASH TEST (t={t_max}):")
-                    print(f"   📉 Loss IC (Attache) : {loss_ic_raw:.6f}")
-
-                # 2. Calcul PDE (A BESOIN DU GRADIENT !)
-                if b_p is not None:
-                    # IMPORTANT : On active le gradient sur les coordonnées pour calculer du/dx
-                    c_p.requires_grad_(True)
-                    
-                    # On calcule le résidu (SANS torch.no_grad)
-                    try:
-                        rr_d, ri_d = pde_residual_cgle(model, b_p, c_p, p_p, cfg)
-                        loss_pde_raw = torch.mean(rr_d**2 + ri_d**2).item()
-                        print(f"   💥 Loss PDE (Physique): {loss_pde_raw:.6f}")
-                        ratio = loss_pde_raw / (loss_ic_raw + 1e-9)
-                        print(f"   ⚖️  La Physique est {ratio:.1f}x plus violente que l'IC.")
-                    except Exception as e:
-                        print(f"   ⚠️ Diagnostic PDE ignoré (Erreur technique): {e}")
-                else:
-                    print(f"   ☕ Mode WARMUP : Pas de PDE calculée.")
-            # -----------------------------------------------------
 
             # 3. Optimization Step
             optimizer.zero_grad(set_to_none=True)
             
             if t_max < 1e-5: 
-                # --- WARMUP (IC Only) ---
+                # --- MODE WARMUP (IC + Sobolev) ---
                 c_i.requires_grad_(True)
                 pr, pi = model(b_i, c_i)
-                l_val = torch.mean((pr-tr_re)**2 + (pi-tr_im)**2)
+                l_ic_raw = torch.mean((pr-tr_re)**2 + (pi-tr_im)**2)
                 gr = torch.autograd.grad(pr.sum(), c_i, create_graph=True)[0]
                 gi = torch.autograd.grad(pi.sum(), c_i, create_graph=True)[0]
-                # Sobolev (dérivée spatiale) -> Poids 1.0 comme discuté
-                loss = l_val + 1.0 * torch.mean((gr[:,0:1]-ux_re)**2 + (gi[:,0:1]-ux_im)**2)
+                loss = l_ic_raw + 1.0 * torch.mean((gr[:,0:1]-ux_re)**2 + (gi[:,0:1]-ux_im)**2)
             
             else: 
-                # --- TIME MARCHING (PDE + IC + BC) ---
+                # --- MODE TIME MARCHING (PDE + IC + BC) ---
                 rr, ri = pde_residual_cgle(model, b_p, c_p, p_p, cfg)
                 pr, pi = model(b_i, c_i)
                 
-                # BC Neumann (Conditions aux limites)
+                l_pde_raw = torch.mean(rr**2 + ri**2)
+                l_ic_raw = torch.mean((pr-tr_re)**2 + (pi-tr_im)**2)
+
+                # --- 🧠 DIAGNOSTICS NTK-LIGHT (Toutes les 100 itérations) ---
+                if i % 100 == 0:
+                    params = [p for p in model.parameters() if p.requires_grad]
+                    g_ic = torch.autograd.grad(l_ic_raw, params, retain_graph=True, allow_unused=True)
+                    g_pde = torch.autograd.grad(l_pde_raw, params, retain_graph=True, allow_unused=True)
+                    
+                    v_ic = torch.cat([g.flatten() for g in g_ic if g is not None])
+                    v_pde = torch.cat([g.flatten() for g in g_pde if g is not None])
+                    
+                    n_ic, n_pde = torch.norm(v_ic) + 1e-9, torch.norm(v_pde) + 1e-9
+                    r_grad = (n_pde / n_ic).item()
+                    cos_phi = torch.nn.functional.cosine_similarity(v_ic, v_pde, dim=0).item()
+                    tr_ratio = (n_ic.item()**2) / (n_pde.item()**2 + 1e-9)
+                    
+                    # Pondération Adaptative (Wang et al.)
+                    ideal_w = 1.0 / (r_grad + 1e-9)
+                    current_pde_w = 0.9 * current_pde_w + 0.1 * ideal_w
+                    
+                    # Logging CSV
+                    with open(log_path, 'a', newline='') as f:
+                        writer = csv.writer(f)
+                        writer.writerow([f"{t_max:.4f}", i, "N/A", f"{l_ic_raw.item():.2e}", 
+                                         f"{l_pde_raw.item():.2e}", f"{r_grad:.2f}", 
+                                         f"{cos_phi:.3f}", f"{tr_ratio:.2e}", f"{current_pde_w:.2e}"])
+
+                    tqdm.write(f"\n📊 [t={t_max:.4f} | {i:04d}] R_grad: {r_grad:.1f} | Cos(φ): {cos_phi:.3f} | Tr_Ratio: {tr_ratio:.1e}")
+
+                # BC Neumann
                 idx_bc = torch.randperm(b_p.size(0))[:int(b_p.size(0)*0.25)]
                 b_bc = b_p[idx_bc]; c_bc = c_p[idx_bc].clone()
                 x_min, x_max = cfg['physics']['x_domain']
@@ -364,24 +375,14 @@ def core_optimization_loop(model, cfg, t_max, start_lr, batch_gen_func, context_
                 grads_i = torch.autograd.grad(ui_bc, c_all_bc, grad_outputs=grad_outputs, create_graph=True)[0]
                 loss_bc = torch.mean(grads_r[:, 0:1]**2 + grads_i[:, 0:1]**2)
 
-                # Total Loss
-                loss = current_pde_w * torch.mean(rr**2 + ri**2) \
-                     + weights['ic_loss'] * torch.mean((pr-tr_re)**2 + (pi-tr_im)**2) \
-                     + weights.get('bc_loss', 0.25) * loss_bc
+                loss = current_pde_w * l_pde_raw + weights['ic_loss'] * l_ic_raw + weights.get('bc_loss', 0.25) * loss_bc
 
+            # Backprop & Clipping
             loss.backward()
-            
-            # --- 🛡️ SÉCURITÉ : GRADIENT CLIPPING ---
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            # ---------------------------------------
-            
             optimizer.step()
-            
-            # --- 👇 STEP SCHEDULER 👇 ---
             scheduler.step()
-            # --------------------------
             
-            # Tracking
             curr_loss = loss.item()
             losses_window.append(curr_loss)
             
@@ -389,7 +390,7 @@ def core_optimization_loop(model, cfg, t_max, start_lr, batch_gen_func, context_
                 local_run_best_loss = curr_loss
                 local_run_best_state = copy.deepcopy(model.state_dict())
             
-            # Anti-Stagnation Check
+            # Anti-Stagnation
             if i > 0 and i % check_interval == 0:
                 curr_avg = np.mean(losses_window[-check_interval:])
                 if len(losses_window) > check_interval:
@@ -398,39 +399,19 @@ def core_optimization_loop(model, cfg, t_max, start_lr, batch_gen_func, context_
                         print(f"      💤 Stagnation. Stop Adam {attempt+1}.")
                         break
         
-        # --- FIN ADAM : VÉRIFICATION DU RÉSULTAT ---
-        # On charge le meilleur état trouvé pendant CE run Adam
-        if local_run_best_state:
-            model.load_state_dict(local_run_best_state)
+        # Fin de l'essai Adam : Audit
+        if local_run_best_state: model.load_state_dict(local_run_best_state)
         
-        # On Audite
-        passed_g, failed_t, score_after_adam = run_audit(model, cfg, t_max, threshold=target_err, n_global=40, n_specific=20, verbose=False)
+        passed_g, failed_t, score_after_adam = run_audit(model, cfg, t_max, threshold=target_err, verbose=False)
         
-        status_icon = "✅" if passed_g else "❌"
-        print(f"    📊 Fin Adam {attempt+1}: Audit Global={score_after_adam:.2%} {status_icon} (Avant: {score_before_adam:.2%}) | Failed={failed_t}")
-
-        # 🛑 LOGIQUE DE ROLLBACK (ASSOUPLIE +5%) 🛑
         if score_after_adam > score_before_adam + 0.05: 
-            print(f"    ⚠️ ADAM REJETÉ : Explosion de l'erreur. ROLLBACK.")
-            current_champion_state = state_before_adam
-            current_champion_score = score_before_adam
-            # On ne met pas à jour adam_detected_failures car ce run est invalidé
+            print(f"    ⚠️ ADAM REJETÉ : Explosion ({score_after_adam:.2%}). ROLLBACK.")
+            current_champion_state, current_champion_score = state_before_adam, score_before_adam
         else:
-            # Adam Validé
-            current_champion_state = copy.deepcopy(model.state_dict())
-            current_champion_score = score_after_adam
-            
-            # Logique de Sortie Anticipée
+            current_champion_state, current_champion_score = copy.deepcopy(model.state_dict()), score_after_adam
             if passed_g:
-                if len(failed_t) == 0:
-                    print(f"    ✅ Audit Intermédiaire PARFAIT ! Sortie anticipée.")
-                    early_exit_success = True 
-                    break 
-                else:
-                    print(f"    ⚠️ Audit Global OK mais Spécifique KO {failed_t}. Sortie pour Correction.")
-                    adam_detected_failures = failed_t 
-                    early_exit_success = True 
-                    break 
+                early_exit_success, adam_detected_failures = True, failed_t
+                break 
         
         current_lr *= 0.5
     
@@ -439,9 +420,8 @@ def core_optimization_loop(model, cfg, t_max, start_lr, batch_gen_func, context_
         print(f"    🔧 L-BFGS Finisher ({context_name})...")
         model.load_state_dict(current_champion_state)
         state_before_lbfgs = copy.deepcopy(model.state_dict())
-        _, _, score_before = run_audit(model, cfg, t_max, threshold=target_err, n_global=40, n_specific=0, verbose=False)
-        print(f"        -> Audit avant L-BFGS : {score_before:.2%}")
-
+        _, _, score_before = run_audit(model, cfg, t_max, threshold=target_err, verbose=False)
+        
         lbfgs = optim.LBFGS(model.parameters(), lr=0.5, max_iter=800, line_search_fn="strong_wolfe")
         bp, cp, pp, bi, ci, tr, ti, ux, ui = batch_gen_func(cfg['training']['batch_size_pde']*2, cfg['training']['batch_size_ic']*2)
 
@@ -453,66 +433,35 @@ def core_optimization_loop(model, cfg, t_max, start_lr, batch_gen_func, context_
                 l_v = torch.mean((pr-tr)**2 + (pi-ti)**2)
                 gr = torch.autograd.grad(pr.sum(), ci, create_graph=True)[0]
                 gi = torch.autograd.grad(pi.sum(), ci, create_graph=True)[0]
-                loss = l_v + 1.0 * torch.mean((gr[:,0:1]-ux)**2 + (gi[:,0:1]-ui)**2)
+                loss_bfgs = l_v + 1.0 * torch.mean((gr[:,0:1]-ux)**2 + (gi[:,0:1]-ui)**2)
             else:
                 rr, ri = pde_residual_cgle(model, bp, cp, pp, cfg)
                 pr, pi = model(bi, ci)
-                
-                # BC Neumann (Closure)
-                idx_bc = torch.randperm(bp.size(0))[:int(bp.size(0)*0.25)]
-                b_bc = bp[idx_bc]; c_bc = cp[idx_bc].clone()
-                x_min, x_max = cfg['physics']['x_domain']
-                c_left = c_bc.clone(); c_left[:, 0] = x_min
-                c_right = c_bc.clone(); c_right[:, 0] = x_max
-                b_all_bc = torch.cat([b_bc, b_bc], dim=0); c_all_bc = torch.cat([c_left, c_right], dim=0)
-                c_all_bc.requires_grad_(True)
-                ur_bc, ui_bc = model(b_all_bc, c_all_bc)
-                grad_outputs = torch.ones_like(ur_bc)
-                grads_r = torch.autograd.grad(ur_bc, c_all_bc, grad_outputs=grad_outputs, create_graph=True)[0]
-                grads_i = torch.autograd.grad(ui_bc, c_all_bc, grad_outputs=grad_outputs, create_graph=True)[0]
-                loss_bc = torch.mean(grads_r[:, 0:1]**2 + grads_i[:, 0:1]**2)
-
-                loss = current_pde_w * torch.mean(rr**2 + ri**2) \
-                     + weights['ic_loss'] * torch.mean((pr-tr)**2 + (pi-ti)**2) \
-                     + weights.get('bc_loss', 0.25) * loss_bc
-            loss.backward()
-            return loss
+                loss_bfgs = current_pde_w * torch.mean(rr**2 + ri**2) + weights['ic_loss'] * torch.mean((pr-tr)**2 + (pi-ti)**2)
+            loss_bfgs.backward()
+            return loss_bfgs
         
         try: lbfgs.step(closure)
         except: pass
         
-        _, _, score_after = run_audit(model, cfg, t_max, threshold=target_err, n_global=40, n_specific=0, verbose=False)
-        print(f"        -> Audit après L-BFGS : {score_after:.2%}")
-        
+        _, _, score_after = run_audit(model, cfg, t_max, threshold=target_err, verbose=False)
         if score_after > score_before:
-            print(f"    ⚠️ L-BFGS REJETÉ (Dégradation Audit). ROLLBACK.")
+            print(f"    ⚠️ L-BFGS REJETÉ. ROLLBACK.")
             model.load_state_dict(state_before_lbfgs)
         else:
-            print(f"    🚀 L-BFGS Validé ! (Gain Audit: {score_before - score_after:.2%})")
-            current_champion_state = copy.deepcopy(model.state_dict())
-            current_champion_score = score_after
+            print(f"    🚀 L-BFGS Validé ! (Gain: {score_before - score_after:.2%})")
+            current_champion_state, current_champion_score = copy.deepcopy(model.state_dict()), score_after
             
-    elif early_exit_success:
-        print(f"    ⏩ L-BFGS Skipped (Early Exit Triggered).")
-    else:
-        print(f"    ⏩ L-BFGS Skipped (Config).")
-        model.load_state_dict(current_champion_state)
-
-    # --- AUDIT FINAL & DÉCISIF ---
     print(f"    🏁 Audit Final de validation ({context_name}) :")
     passed_g, failed_t, final_score = run_audit(model, cfg, t_max, threshold=target_err, n_global=100, n_specific=50, verbose=True)
     
-    # 🚨 LOGIQUE DE MÉMOIRE : On réinjecte les échecs vus par Adam
-    if len(adam_detected_failures) > 0:
+    # Mémoire des échecs
+    if adam_detected_failures:
         for f in adam_detected_failures:
-            if f not in failed_t:
-                failed_t.append(f)
-        print(f"    🚨 MÉMOIRE : Ré-injection des échecs détectés par Adam {adam_detected_failures}")
+            if f not in failed_t: failed_t.append(f)
     
-    if final_score < global_best_score:
-        return passed_g, failed_t, current_lr, current_champion_state, final_score
-    else:
-        return passed_g, failed_t, current_lr, global_best_state, global_best_score
+    return passed_g, failed_t, current_lr, (current_champion_state if final_score < global_best_score else global_best_state), min(final_score, global_best_score)
+    
 # ==============================================================================
 # 4. ORCHESTRATEUR
 # ==============================================================================
@@ -769,7 +718,7 @@ def train_cgle_curriculum(model, cfg, explicit_resume_path=None):
         if current_t >= z_end - 1e-9:
             continue
             
-        print(f"\n🚀 ZONE : t_end={z_end}, dt={z_dt} (Start t={current_t:.2f})")
+        print(f"\n🚀 ZONE : t_end={z_end}, dt={z_dt} (Start t={current_t:.4f})")
         
         is_new_zone = True 
         
@@ -796,7 +745,7 @@ def train_cgle_curriculum(model, cfg, explicit_resume_path=None):
 
             current_t = next_t
             
-            save_name = f"ckpt_t{current_t:.2f}.pth"
+            save_name = f"ckpt_t{current_t:.4f}.pth"
             save_path = os.path.join(save_dir, save_name)
             torch.save({'model': model.state_dict(), 't': current_t}, save_path)
             print(f"    💾 Checkpoint sauvegardé : {save_name}")

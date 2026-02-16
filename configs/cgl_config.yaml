@@ -40,33 +40,33 @@ model:
   activation: "silu"
   
   fourier_dim: 64
-  fourier_scales: [1.0, 2.0, 5.0, 10.0, 20.0] # <--- SUPPRESSION du 40.0 (Trop bruitant)
+  fourier_scales: [1.0, 2.0, 5.0, 10.0, 20.0] 
 
 training:
   batch_size_ic: 8192   
   batch_size_pde: 8192   
   
   # Stratégie Robustesse
-  max_macro_loops: 6          # <--- RÉDUIT (Si ça marche pas en 6 coups, ça marchera pas en 8)
-  nb_adam_retries: 2          # <--- CRITIQUE : Évite l'effondrement du LR (Divise max par 4)
+  max_macro_loops: 6          
+  nb_adam_retries: 2         
   check_interval: 2000
   stagnation_threshold: 0.001
-
-  # Équilibrage initial
-  pde_weight_start: 0.005       
-  pde_weight_target: 1.0
-  ramp_end_t: 0.15
-
+  
+  pde_weight_start: 0.00001     # <--- Agit comme un "fusible" pour les 100 premières iters
+  pde_weight_target: 0.1       # <--- On bride la cible max pour ne pas écraser l'IC
+  ramp_end_t: 0.5              # On s'en fiche un peu maintenant, l'adaptatif domine
+  
   weights:
-    pde_loss: 0.1             # Sera écrasé par la rampe
-    ic_loss_start: 5.0
-    ic_loss_target: 2.0
+    pde_loss: 0.0001           # Valeur initiale
+    ic_loss_start: 2.0         # Pas besoin de monter à 5.0, 2.0 suffit
+    ic_loss_target: 1.0        # On veut que l'IC soit la référence (poids 1.0)
     bc_loss: 1.0
     
   # Seuils Audit
   target_error_ic: 0.035       # 3%
   target_error_global: 0.045   
-
+  save_dir: "results/CGL_Lite_Adaptive_v1"
+  
   ic_phase:
     learning_rate: 3e-4
     iterations: 15000
@@ -79,7 +79,7 @@ time_marching:
   zones:
     - t_end: 0.05    # Une toute petite zone de démarrage
       dt: 0.002      # Pas très fins (20 pas pour faire 0.05)
-      iters: 5000    # Moins d'itérations par pas, car le pas est petit
+      iters: 7000    # Moins d'itérations par pas, car le pas est petit
     - t_end: 0.15
       dt: 0.01       # On reprend le rythme normal ensuite
       iters: 9000          # <--- AUGMENTÉ : Modèle plus petit = on peut itérer plus vite.
