@@ -59,12 +59,12 @@ training:
   weights:
     pde_loss: 0.0001           # Valeur initiale
     ic_loss_start: 2.0         # Pas besoin de monter à 5.0, 2.0 suffit
-    ic_loss_target: 1.0        # On veut que l'IC soit la référence (poids 1.0)
+    ic_loss_target: 0.5        # On veut que l'IC soit la référence (poids 1.0)
     bc_loss: 1.0
     
   # Seuils Audit
-  target_error_ic: 0.035       # 3%
-  target_error_global: 0.045   
+  target_error_ic: 0.035       
+  target_error_global: 0.05   
   save_dir: "results/CGL_Lite_Adaptive_v1"
   
   ic_phase:

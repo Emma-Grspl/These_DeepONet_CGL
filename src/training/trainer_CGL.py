@@ -350,6 +350,7 @@ def core_optimization_loop(model, cfg, t_max, start_lr, batch_gen_func, context_
                     
                     # Pondération Adaptative (Wang et al.)
                     ideal_w = 1.0 / (r_grad + 1e-9)
+                    ideal_w = max(ideal_w, 1e-3) # On interdit au poids de descendre sous 0.001
                     current_pde_w = 0.9 * current_pde_w + 0.1 * ideal_w
                     
                     # Logging CSV
