@@ -263,10 +263,15 @@ def run_audit(model, cfg, t_max, threshold=0.03, n_global=60, n_specific=30, ver
 
 def train_worker(model, cfg, t_max, start_lr, n_iters, batch_gen_func, context_name, 
                  global_best_state, global_best_score, use_lbfgs=True, stop_on_explosion=False):
+    """
+    L'OUVRIER : Exécute N itérations. 
+    Intègre KingOfTheHill, NTK Lissé, et RAR.
+    """
     weights = cfg['training']['weights'].copy()
     save_dir = cfg['training'].get('save_dir', "outputs")
     log_path = init_csv_logs(save_dir)
 
+    # Init King of the Hill (RAM)
     king = KingOfTheHill(model)
     king.best_score = global_best_score
     king.best_state = copy.deepcopy(global_best_state)
@@ -274,6 +279,10 @@ def train_worker(model, cfg, t_max, start_lr, n_iters, batch_gen_func, context_n
     current_lr = start_lr
     current_pde_w, current_ic_w = get_dynamic_weights(t_max, cfg)
     
+    # État RAR
+    rar_active = False
+    rar_data = None
+
     model.load_state_dict(king.best_state)
     optimizer = optim.Adam(model.parameters(), lr=current_lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_iters, eta_min=0.0)
@@ -281,66 +290,62 @@ def train_worker(model, cfg, t_max, start_lr, n_iters, batch_gen_func, context_n
     pbar = tqdm(range(n_iters), desc=f"  👷 [{context_name}]", leave=False)
     
     for i in pbar:
+        # 1. Fetch Batch
         b_p, c_p, p_p, b_i, c_i, tr_re, tr_im, ux_re, ux_im = batch_gen_func(
             cfg['training']['batch_size_pde'], cfg['training']['batch_size_ic']
         )
+        
+        # Injection RAR
+        if rar_active and rar_data is not None and b_p is not None:
+            rb, rc, rp = rar_data
+            b_p = torch.cat([b_p, rb], dim=0)
+            c_p = torch.cat([c_p, rc], dim=0)
+            for k in p_p: p_p[k] = torch.cat([p_p[k], rp[k]], dim=0)
 
         optimizer.zero_grad(set_to_none=True)
         
-        if t_max < 1e-5: 
+        # 2. Calcul Loss
+        if t_max < 1e-5: # Mode Warmup
              c_i.requires_grad_(True)
              pr, pi = model(b_i, c_i)
-             l_ic_raw = torch.mean((pr-tr_re)**2 + (pi-tr_im)**2)
+             l_ic = torch.mean((pr-tr_re)**2 + (pi-tr_im)**2)
              gr = torch.autograd.grad(pr.sum(), c_i, create_graph=True)[0]
              gi = torch.autograd.grad(pi.sum(), c_i, create_graph=True)[0]
-             l_pde_raw = torch.tensor(0.0).to(b_i.device)
-             loss = l_ic_raw + 1.0 * torch.mean((gr[:,0:1]-ux_re)**2 + (gi[:,0:1]-ux_im)**2)
+             loss = l_ic + 1.0 * torch.mean((gr[:,0:1]-ux_re)**2 + (gi[:,0:1]-ux_im)**2)
         else:
+             # Mode Time Marching
              rr, ri = pde_residual_cgle(model, b_p, c_p, p_p, cfg)
              pr, pi = model(b_i, c_i)
-             l_pde_raw = torch.mean(rr**2 + ri**2)
-             l_ic_raw = torch.mean((pr-tr_re)**2 + (pi-tr_im)**2)
+             l_pde = torch.mean(rr**2 + ri**2)
+             l_ic = torch.mean((pr-tr_re)**2 + (pi-tr_im)**2)
 
-             if i % 500 == 0: 
+             # 3. NTK & RAR (tous les 500 pas)
+             if i % 500 == 0:
                   params = [p for p in model.parameters() if p.requires_grad]
-                  g_ic = torch.autograd.grad(l_ic_raw, params, retain_graph=True, allow_unused=True)
-                  g_pde = torch.autograd.grad(l_pde_raw, params, retain_graph=True, allow_unused=True)
+                  g_ic = torch.autograd.grad(l_ic, params, retain_graph=True, allow_unused=True)
+                  g_pde = torch.autograd.grad(l_pde, params, retain_graph=True, allow_unused=True)
                   v_ic = torch.cat([g.flatten() for g in g_ic if g is not None])
                   v_pde = torch.cat([g.flatten() for g in g_pde if g is not None])
                   
-                  n_ic, n_pde = torch.norm(v_ic) + 1e-9, torch.norm(v_pde) + 1e-9
-                  r_grad = (n_pde / n_ic).item()
-                  target_w = 1.0 / (r_grad + 1e-9)
-                  
+                  n_ic, n_pde = torch.norm(v_ic)+1e-9, torch.norm(v_pde)+1e-9
                   cos_phi = torch.nn.functional.cosine_similarity(v_ic, v_pde, dim=0).item()
                   angle = np.arccos(np.clip(cos_phi, -1.0, 1.0)) * 180 / np.pi
                   
-                  dampener = 1.0
-                  if angle > 135: dampener = 0.1
-                  elif angle > 90: dampener = 0.5
-                  
-                  target_w = max(target_w * dampener, 1e-4)
-                  current_pde_w = 0.9 * current_pde_w + 0.1 * target_w
+                  # Adaptation Poids
+                  target_w = (n_ic / n_pde).item()
+                  damp = 0.1 if angle > 135 else (0.5 if angle > 90 else 1.0)
+                  current_pde_w = 0.9 * current_pde_w + 0.1 * max(target_w * damp, 1e-4)
 
-                  with open(log_path, 'a', newline='') as f:
-                        csv.writer(f).writerow([f"{t_max:.4f}", i, f"{l_ic_raw.item():.2e}", f"{l_pde_raw.item():.2e}", 
-                                         f"{r_grad:.2f}", f"{cos_phi:.3f}", "0.0", f"{current_pde_w:.2e}"])
-                  tqdm.write(f"\n📊 [t={t_max:.4f} | {i:04d}] Angle: {angle:.1f}° | W_pde: {current_pde_w:.1e}")
+                  # Activation RAR (à mi-chemin)
+                  if i >= n_iters // 2 and not rar_active and not stop_on_explosion:
+                      rar_active = True
+                      rar_data = get_rar_batch(model, cfg, b_i.device, t_max)
+                      tqdm.write(f"      🎯 RAR: Injection de points critiques.")
 
-             idx_bc = torch.randperm(b_p.size(0))[:int(b_p.size(0)*0.25)]
-             b_bc = b_p[idx_bc]; c_bc = c_p[idx_bc].clone()
-             x_min, x_max = cfg['physics']['x_domain']
-             c_left = c_bc.clone(); c_left[:, 0] = x_min; c_right = c_bc.clone(); c_right[:, 0] = x_max
-             b_all_bc = torch.cat([b_bc, b_bc], dim=0); c_all_bc = torch.cat([c_left, c_right], dim=0)
-             c_all_bc.requires_grad_(True)
-             ur_bc, ui_bc = model(b_all_bc, c_all_bc)
-             grads_r = torch.autograd.grad(ur_bc.sum(), c_all_bc, create_graph=True)[0]
-             grads_i = torch.autograd.grad(ui_bc.sum(), c_all_bc, create_graph=True)[0]
-             loss_bc = torch.mean(grads_r[:, 0:1]**2 + grads_i[:, 0:1]**2)
+             loss = current_pde_w * l_pde + current_ic_w * l_ic
 
-             loss = current_pde_w * l_pde_raw + current_ic_w * l_ic_raw + weights.get('bc_loss', 1.0) * loss_bc
-
-        if stop_on_explosion and loss.item() > 100.0:
+        # --- SÉCURITÉ : Uniquement sur NaN/Inf désormais ---
+        if stop_on_explosion and (torch.isnan(loss) or torch.isinf(loss)):
             return False, king.best_state, 1e9
 
         loss.backward()
@@ -348,99 +353,91 @@ def train_worker(model, cfg, t_max, start_lr, n_iters, batch_gen_func, context_n
         optimizer.step()
         scheduler.step()
         
+        # Sauvegarde RAM périodique
         if i % 1000 == 0 and not stop_on_explosion:
-             _, _, quick_score = run_audit(model, cfg, t_max, threshold=1.0, verbose=False)
-             king.update(model, quick_score)
+             _, _, qs = run_audit(model, cfg, t_max, threshold=1.0, verbose=False)
+             king.update(model, qs)
 
+    # --- FINISHER L-BFGS ---
     if use_lbfgs and not stop_on_explosion and t_max > 1e-5:
-        tqdm.write("    🔧 L-BFGS Finisher...")
-        lbfgs = optim.LBFGS(model.parameters(), lr=0.5, max_iter=50, line_search_fn="strong_wolfe")
+        lbfgs = optim.LBFGS(model.parameters(), lr=0.5, max_iter=40, line_search_fn="strong_wolfe")
         def closure():
             lbfgs.zero_grad()
             rr, ri = pde_residual_cgle(model, b_p, c_p, p_p, cfg)
             pr, pi = model(b_i, c_i)
-            loss_bfgs = current_pde_w * torch.mean(rr**2 + ri**2) + current_ic_w * torch.mean((pr-tr_re)**2 + (pi-tr_im)**2)
-            loss_bfgs.backward()
-            return loss_bfgs
+            l = current_pde_w * torch.mean(rr**2 + ri**2) + current_ic_w * torch.mean((pr-tr_re)**2 + (pi-tr_im)**2)
+            l.backward(); return l
         try: lbfgs.step(closure)
         except: pass
-        _, _, lbfgs_score = run_audit(model, cfg, t_max, threshold=1.0, verbose=False)
-        king.update(model, lbfgs_score)
+        _, _, fs = run_audit(model, cfg, t_max, threshold=1.0, verbose=False)
+        king.update(model, fs)
 
-    final_score = king.restore(model)
-    print(f"    📊 Audit de Fin de Cycle [{context_name}] (Best Retained) :")
-    passed, _, _ = run_audit(model, cfg, t_max, threshold=cfg['training'].get('target_error_global', 0.05), verbose=True)
+    # Restauration du meilleur état
+    score = king.restore(model)
+    print(f"    📊 Audit Fin [{context_name}] (Best Retained) :")
+    run_audit(model, cfg, t_max, threshold=cfg['training'].get('target_error_global', 0.05), verbose=True)
+    
+    return (score < cfg['training'].get('target_error_global', 0.05)), king.best_state, score
 
-    return passed, king.best_state, final_score
-
-# ==============================================================================
-# 4. LE CONTRÔLEUR
-# ==============================================================================
 
 def run_controller(model, cfg, t_target, dt, global_iters_yaml):
+    """
+    CONTRÔLEUR : Utilise l'Audit pour décider de la validité du pas.
+    """
     device = next(model.parameters()).device
-    base_lr = float(cfg['time_marching'].get('learning_rate', 1e-4))
+    lr = float(cfg['time_marching'].get('learning_rate', 1e-4))
     target_err = cfg['training'].get('target_error_global', 0.05)
     
-    print(f"    🛡️ [Controller] Diagnostic (4000 it) pour valider dt={dt:.4f}...")
-    diag_state = copy.deepcopy(model.state_dict())
+    # 1. DIAGNOSTIC (On est tolérant : on ne refuse que si NaN ou Audit > 2*Seuil)
+    print(f"    🛡️ [Controller] Diagnostic (4000 it) dt={dt:.4f}...")
+    diag_model_state = copy.deepcopy(model.state_dict())
     
-    diag_success, _, diag_score = train_worker(
-        model, cfg, t_target, start_lr=base_lr, n_iters=4000, 
-        batch_gen_func=get_standard_batch_generator(cfg, device, t_target),
-        context_name="DIAG",
-        global_best_state=diag_state, global_best_score=1e9,
-        use_lbfgs=False, stop_on_explosion=True
+    _, b_st, s_diag = train_worker(
+        model, cfg, t_target, lr, 4000, 
+        get_standard_batch_generator(cfg, device, t_target), 
+        "DIAG", diag_model_state, 1e9, False, True
     )
-    
-    if diag_score > 10.0:
-        print(f"    💥 Diagnostic Échoué (Score: {diag_score:.2f}). DT/LR trop élevés.")
-        model.load_state_dict(diag_state)
-        return False, diag_state
 
-    print(f"    ✅ Diag OK. Lancement Global ({global_iters_yaml} it).")
-    glob_success, best_state, best_score = train_worker(
-        model, cfg, t_target, start_lr=base_lr, n_iters=global_iters_yaml,
-        batch_gen_func=get_standard_batch_generator(cfg, device, t_target),
-        context_name="GLOBAL",
-        global_best_state=model.state_dict(), global_best_score=1.0,
-        use_lbfgs=True
+    # Logique de rejet stricte NLSE
+    if s_diag == 1e9:
+        print(f"    💥 Diagnostic rejeté : Instabilité numérique (NaN).")
+        model.load_state_dict(diag_model_state)
+        return False, diag_model_state
+
+    if s_diag > (2.0 * target_err):
+        print(f"    ⚠️ Diagnostic faiblard ({s_diag:.2%} > {2*target_err:.2%}). Réduction dt.")
+        model.load_state_dict(diag_model_state)
+        return False, diag_model_state
+
+    # 2. ENTRAÎNEMENT GLOBAL (Le "vrai" travail)
+    print(f"    ✅ Diagnostic Validé. Lancement Global ({global_iters_yaml} it)...")
+    _, b_st, b_sc = train_worker(
+        model, cfg, t_target, lr, global_iters_yaml, 
+        get_standard_batch_generator(cfg, device, t_target), 
+        "GLOBAL", model.state_dict(), 1.0
     )
-    model.load_state_dict(best_state)
+    model.load_state_dict(b_st)
 
+    # 3. AUDIT DE DÉCISION
     print(f"    🧐 Audit de Contrôle (Entraînement Spécifique requis ?) :")
-    pass_global, failed_types, score_final = run_audit(model, cfg, t_target, threshold=target_err, verbose=True)
+    pass_g, failed, sc = run_audit(model, cfg, t_target, threshold=target_err, verbose=True)
     
-    if pass_global or not failed_types:
-        return True, best_state
+    if pass_g and not failed:
+        return True, b_st
 
-    print(f"    🎯 Échec Global ({score_final:.2%}). Entraînement Spécifique sur {failed_types}.")
-    current_best_state = best_state 
-    
-    for t_id in failed_types:
-        spec_success, spec_state, spec_score = train_worker(
-            model, cfg, t_target, start_lr=base_lr, n_iters=global_iters_yaml,
-            batch_gen_func=get_biased_batch_generator(cfg, device, [t_id], t_target),
-            context_name=f"SPEC_{t_id}",
-            global_best_state=current_best_state, global_best_score=best_score,
-            use_lbfgs=True
+    # 4. ENTRAÎNEMENT SPÉCIFIQUE (Si besoin)
+    print(f"    🎯 Échec Global ({sc:.2%}). Specialists sur {failed}...")
+    for t_id in failed:
+        _, b_st, b_sc = train_worker(
+            model, cfg, t_target, lr, global_iters_yaml, 
+            get_biased_batch_generator(cfg, device, [t_id], t_target), 
+            f"SPEC_{t_id}", b_st, sc
         )
-        if spec_success:
-            current_best_state = spec_state
-            model.load_state_dict(spec_state)
-        else:
-            print(f"    ❌ Échec Spécifique Type {t_id} ({spec_score:.2%}).")
-
-    print(f"    📊 Audit Final Ultime :")
-    pass_final, _, score_final_ult = run_audit(model, cfg, t_target, threshold=target_err, verbose=True)
+        model.load_state_dict(b_st)
     
-    if pass_final:
-        print(f"    🏆 Sauvetage Réussi (Score: {score_final_ult:.2%}) !")
-        return True, current_best_state
-    else:
-        print(f"    🛑 Échec Final (Score: {score_final_ult:.2%}).")
-        return False, current_best_state
-
+    # Verdict final après spécialistes
+    final_pass, _, final_score = run_audit(model, cfg, t_target, threshold=target_err, verbose=False)
+    return final_pass, model.state_dict()
 # ==============================================================================
 # 5. LE NAVIGATEUR (AVEC AUTO-RESUME)
 # ==============================================================================
