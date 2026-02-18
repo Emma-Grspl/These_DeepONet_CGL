@@ -1,4 +1,4 @@
-iimport sys
+import sys
 import os
 import argparse
 import yaml
@@ -11,7 +11,8 @@ sys.path.append(project_root)
 
 # --- IMPORTS ---
 from src.models.cgl_deeponet import CGL_PI_DeepONet
-from src.training.trainer_CGL import train_cgle_curriculum 
+# MODIFICATION ICI : On importe le Navigateur (la nouvelle logique)
+from src.training.trainer_CGL import train_navigator 
 
 # --- HELPER CONFIG ---
 class ConfigObj:
@@ -24,21 +25,24 @@ class ConfigObj:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, default="configs/diffractive_secure.yaml")
+    # On garde ton défaut (vérifie juste que le fichier existe bien)
+    parser.add_argument("--config", type=str, default="configs/cgl_config.yaml") 
     args = parser.parse_args()
 
     # 1. SETUP RUN
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    run_name = f"CGL_Binary_Run_{timestamp}"
+    run_name = f"CGL_Navigator_Run_{timestamp}" # Petit rename pour distinguer
     run_dir = os.path.join(project_root, "results", run_name)
     ckpt_dir = os.path.join(run_dir, "checkpoints")
     os.makedirs(ckpt_dir, exist_ok=True)
 
-    print(f"🚀 NOUVEAU START BINAIRE : {run_dir}")
+    print(f"🚀 NOUVEAU START (NAVIGATOR) : {run_dir}")
 
     # 2. CONFIG
     with open(args.config, 'r') as f:
         yaml_data = yaml.safe_load(f)
+    
+    # On force la sauvegarde dans le dossier du run actuel
     yaml_data['training']['save_dir'] = ckpt_dir 
     cfg = ConfigObj(yaml_data)
 
@@ -51,15 +55,16 @@ def main():
 
     # 5. ENTRAÎNEMENT (FORCE ZÉRO REPRISE)
     try:
-        # On passe explicitement None pour forcer le Warmup
-        train_cgle_curriculum(model, cfg, explicit_resume_path=None)
+        # MODIFICATION ICI : Appel au Navigateur
+        # Le None force le Warmup au début
+        train_navigator(model, cfg, explicit_resume_path=None)
 
         # FINAL
         torch.save(model.state_dict(), os.path.join(run_dir, "model_final_cgl.pth"))
-        print("\n✅ Terminé !")
+        print("\n✅ Terminé avec succès !")
 
     except Exception as e:
-        print(f"\n❌ Erreur : {e}")
+        print(f"\n❌ Erreur Critique : {e}")
         raise e
 
 if __name__ == "__main__":
