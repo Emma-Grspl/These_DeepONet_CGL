@@ -268,7 +268,7 @@ def train_worker(model, cfg, t_max, start_lr, n_iters, batch_gen_func, context_n
     current_lr = start_lr
     
     # Init Poids Adaptatifs
-    current_pde_w, _ = get_dynamic_weights(t_max, cfg)
+    current_pde_w, current_ic_w = get_dynamic_weights(t_max, cfg)
     
     # --- ADAM LOOP ---
     model.load_state_dict(current_champion_state)
@@ -335,7 +335,8 @@ def train_worker(model, cfg, t_max, start_lr, n_iters, batch_gen_func, context_n
              grads_i = torch.autograd.grad(ui_bc.sum(), c_all_bc, create_graph=True)[0]
              loss_bc = torch.mean(grads_r[:, 0:1]**2 + grads_i[:, 0:1]**2)
 
-             loss = current_pde_w * l_pde_raw + weights['ic_loss'] * l_ic_raw + weights.get('bc_loss', 1.0) * loss_bc
+             # LOSS TOTALE CORRIGÉE (Pas de Key Error)
+             loss = current_pde_w * l_pde_raw + current_ic_w * l_ic_raw + weights.get('bc_loss', 1.0) * loss_bc
 
         # Sécurité Diag
         if stop_on_explosion and loss.item() > 100.0:
@@ -355,19 +356,20 @@ def train_worker(model, cfg, t_max, start_lr, n_iters, batch_gen_func, context_n
     if use_lbfgs and not stop_on_explosion and t_max > 1e-5:
         tqdm.write("    🔧 L-BFGS Finisher...")
         lbfgs = optim.LBFGS(model.parameters(), lr=0.5, max_iter=800, line_search_fn="strong_wolfe")
-        
         def closure():
             lbfgs.zero_grad()
             rr, ri = pde_residual_cgle(model, b_p, c_p, p_p, cfg)
             pr, pi = model(b_i, c_i)
-            loss_bfgs = current_pde_w * torch.mean(rr**2 + ri**2) + weights['ic_loss'] * torch.mean((pr-tr_re)**2 + (pi-tr_im)**2)
+            # Loss corrigée L-BFGS
+            loss_bfgs = current_pde_w * torch.mean(rr**2 + ri**2) + current_ic_w * torch.mean((pr-tr_re)**2 + (pi-tr_im)**2)
             loss_bfgs.backward()
             return loss_bfgs
         try: lbfgs.step(closure)
         except: pass
 
-    # Audit final
-    passed, _, score = run_audit(model, cfg, t_max, threshold=cfg['training'].get('target_error_global', 0.05), verbose=False)
+    # Audit Final avec Affichage Forcé
+    print(f"    📊 Audit de Fin de Cycle [{context_name}] :")
+    passed, _, score = run_audit(model, cfg, t_max, threshold=cfg['training'].get('target_error_global', 0.05), verbose=True)
     
     if score < current_champion_score:
         current_champion_state = copy.deepcopy(model.state_dict())
@@ -391,6 +393,7 @@ def run_controller(model, cfg, t_target, dt, global_iters_yaml):
     print(f"    🛡️ [Controller] Diagnostic (4000 it) pour valider dt={dt:.4f}...")
     diag_state = copy.deepcopy(model.state_dict())
     
+    # Le diag est silencieux par défaut, mais affichera l'audit final grâce au fix
     diag_success, _, diag_score = train_worker(
         model, cfg, t_target, start_lr=base_lr, n_iters=4000, 
         batch_gen_func=get_standard_batch_generator(cfg, device, t_target),
@@ -415,7 +418,8 @@ def run_controller(model, cfg, t_target, dt, global_iters_yaml):
     )
     model.load_state_dict(best_state)
 
-    # ÉTAPE 3 : AUDIT COMPLET
+    # ÉTAPE 3 : AUDIT DE DÉCISION
+    print(f"    🧐 Audit de Contrôle (Entraînement Spécifique requis ?) :")
     pass_global, failed_types, score_final = run_audit(model, cfg, t_target, threshold=target_err, verbose=True)
     
     if pass_global or not failed_types:
@@ -439,7 +443,8 @@ def run_controller(model, cfg, t_target, dt, global_iters_yaml):
         else:
             print(f"    ❌ Échec Spécifique Type {t_id} ({spec_score:.2%}).")
 
-    pass_final, _, score_final_ult = run_audit(model, cfg, t_target, threshold=target_err, verbose=False)
+    print(f"    📊 Audit Final Ultime :")
+    pass_final, _, score_final_ult = run_audit(model, cfg, t_target, threshold=target_err, verbose=True)
     
     if pass_final:
         print(f"    🏆 Sauvetage Réussi (Score: {score_final_ult:.2%}) !")
@@ -471,10 +476,15 @@ def train_navigator(model, cfg, explicit_resume_path=None):
         global_best_state=model.state_dict(), global_best_score=1.0,
         use_lbfgs=False
     )
+    
     if not ok_warmup:
         print("❌ Échec Warmup. Arrêt.")
         return
+        
+    print("\n📊 [PREUVE WARMUP] Audit Détaillé à t=0 :")
     model.load_state_dict(state_warmup)
+    run_audit(model, cfg, 0.0, threshold=0.035, verbose=True)
+    print("✅ Warmup Validé. Démarrage de la propagation.\n")
     
     # TIME LOOP
     print("🧭 [Navigator] Démarrage Séquence.")
@@ -487,9 +497,11 @@ def train_navigator(model, cfg, explicit_resume_path=None):
         print(f"\n🚀 [Navigator] Cap t={t_next:.4f} (+{dt:.4f}) | YAML Iters: {iters_yaml}")
         
         # 1. Easy Win
-        pass_easy, _, score = run_audit(model, cfg, t_next, threshold=cfg['training'].get('target_error_global', 0.05), verbose=False)
+        print(f"    🔎 Vérification Easy Win (Le modèle sait-il déjà prédire ?) :")
+        pass_easy, _, score = run_audit(model, cfg, t_next, threshold=cfg['training'].get('target_error_global', 0.05), verbose=True)
+        
         if pass_easy:
-            print(f"    🎉 EASY WIN ({score:.2%}).")
+            print(f"    🎉 EASY WIN VALIDÉ (Score: {score:.2%}). On saute l'entraînement.")
             t_curr = t_next
             dt = min(dt * 1.2, 0.1)
             torch.save({'model': model.state_dict(), 't': t_curr}, os.path.join(save_dir, f"ckpt_t{t_curr:.4f}.pth"))
