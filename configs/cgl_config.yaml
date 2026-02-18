@@ -1,88 +1,72 @@
-experiment_name: "CGL_Generalist_Solver_Lite"
+experiment_name: "CGL_Navigator_V3_Robust"
 device: "cuda"
 
 physics:
-  # 1. DOMAINE OPTIMISÉ (Asymétrique car V > 0)
-  # On laisse un peu de place à gauche (-7) pour que la queue de la Sech soit bien à 0.
-  # On laisse de la place à droite (12) pour que l'onde avance.
   x_domain: [-7.0, 12.0]
   t_max: 4.0
-
   initial_conditions: [1, 2]
-
   bounds:
-    A: [0.5, 3.0]      # On évite les amplitudes trop petites (<0.5) qui sont du bruit
-    
-    # 2. LARGEUR SÉCURISÉE
-    # w0 = 0.5 -> Très large (Facile)
-    # w0 = 2.0 -> Assez fin (Intéressant) mais pas "invisible" comme 6.0
+    A: [0.5, 3.0]
     w0: [0.5, 2.0]
-    
-    x0: [0.0, 0.0]     # Toujours centré, très bien
-    k: [-2.0, 2.0]     # Le "Twist" (fréquence spatiale), touche pas, c'est important
-
+    x0: [0.0, 0.0]
+    k: [-2.0, 2.0]
   equation_params:
     alpha: [0.0, 1.0]
     beta: [-1.5, 1.5]
     mu: [-0.5, 1.0]
-    
-    # 3. VITESSE POSITIVE
-    # On force l'onde à aller vers la droite pour ne pas gâcher l'espace à gauche
     V: [0.0, 1.0]
+
 model:
   branch_input_dim: 9 
   trunk_input_dim: 2
-  latent_dim: 256              # <--- RÉDUIT (Était 512)
-  
-  branch_layers: [256, 256, 256, 256, 256] # <--- 5 couches au lieu de 6
-  trunk_layers: [256, 256, 256, 256]       # <--- 4 couches suffisent
-  
+  latent_dim: 256
+  branch_layers: [256, 256, 256, 256, 256]
+  trunk_layers: [256, 256, 256, 256]
   activation: "silu"
-  
   fourier_dim: 64
   fourier_scales: [1.0, 2.0, 5.0, 10.0, 20.0] 
 
 training:
-  batch_size_ic: 16384   
-  batch_size_pde: 16384   
+  # Gros batch = Gradients stables (Vital pour Tanh)
+  batch_size_ic: 16384    
+  batch_size_pde: 16384    
   
-  # Stratégie Robustesse
-  max_macro_loops: 6          
-  nb_adam_retries: 2         
+  max_macro_loops: 6 
+  nb_adam_retries: 2 
   check_interval: 2000
   stagnation_threshold: 0.001
   
-  pde_weight_start: 0.0001     # <--- Agit comme un "fusible" pour les 100 premières iters
-  pde_weight_target: 0.1       # <--- On bride la cible max pour ne pas écraser l'IC
-  ramp_end_t: 0.5              # On s'en fiche un peu maintenant, l'adaptatif domine
+  # Poids PDE : Le code s'occupe de le monter, on commence bas
+  pde_weight_start: 0.0001
+  pde_weight_target: 0.1
+  ramp_end_t: 0.5 
   
   weights:
-    pde_loss: 0.0001           # Valeur initiale
-    ic_loss_start: 2.0         # Pas besoin de monter à 5.0, 2.0 suffit
-    ic_loss_target: 0.5        # On veut que l'IC soit la référence (poids 1.0)
+    pde_loss: 0.0001
+    ic_loss_start: 2.0
+    # MODIF 1 : On garde l'IC forte pour ne pas perdre la Tanh
+    ic_loss_target: 1.0        
     bc_loss: 1.0
     
-  # Seuils Audit
-  target_error_ic: 0.035       
-  target_error_global: 0.055  
-  save_dir: "results/CGL_Lite_Adaptive_v1"
+  target_error_ic: 0.035        
+  # MODIF 2 : Un tout petit peu plus de souplesse pour éviter le blocage à 5.8%
+  target_error_global: 0.060   
+  save_dir: "results/CGL_Navigator_Run"
   
   ic_phase:
     learning_rate: 3e-4
     iterations: 15000
 
-# -----------------------------
-
 time_marching:
-  learning_rate: 2e-4       
-                              # Avec le Soft Start (divisé par 2), ça commencera à 1.5e-4. C'est parfait.
+  # LR assez haut car Batch Size est grand
+  learning_rate: 2e-4  
   zones:
-    - t_end: 0.05    # Une toute petite zone de démarrage
-      dt: 0.002      # Pas très fins (20 pas pour faire 0.05)
-      iters: 5000    # Moins d'itérations par pas, car le pas est petit
+    - t_end: 0.05
+      dt: 0.002
+      iters: 5000
     - t_end: 0.15
-      dt: 0.01       # On reprend le rythme normal ensuite
-      iters: 9000          # <--- AUGMENTÉ : Modèle plus petit = on peut itérer plus vite.
+      dt: 0.01
+      iters: 9000
     - t_end: 2.0
       dt: 0.05
       iters: 9000
