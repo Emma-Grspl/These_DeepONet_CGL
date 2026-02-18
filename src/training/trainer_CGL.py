@@ -446,6 +446,7 @@ def run_controller(model, cfg, t_target, dt, global_iters_yaml):
 # ==============================================================================
 
 def train_navigator(model, cfg, explicit_resume_path=None):
+    """Pilote automatique du temps avec validation Easy Win stricte (Global + Spécifique)."""
     save_dir = cfg['training'].get('save_dir', "outputs/checkpoints")
     os.makedirs(save_dir, exist_ok=True)
     
@@ -458,7 +459,6 @@ def train_navigator(model, cfg, explicit_resume_path=None):
     if latest_ckpt:
         print(f"🔄 REPRISE DÉTECTÉE : {os.path.basename(latest_ckpt)} (t={resume_t:.4f})")
         checkpoint = torch.load(latest_ckpt)
-        # Gestion compatibilité ancienne structure vs nouvelle
         if 'model' in checkpoint: model.load_state_dict(checkpoint['model'])
         else: model.load_state_dict(checkpoint)
         t_curr = resume_t
@@ -491,16 +491,27 @@ def train_navigator(model, cfg, explicit_resume_path=None):
         
         print(f"\n🚀 [Navigator] Cap t={t_next:.4f} (+{dt:.4f}) | YAML Iters: {iters_yaml}")
         
-        print(f"    🔎 Vérification Easy Win :")
-        pass_easy, _, score = run_audit(model, cfg, t_next, threshold=cfg['training'].get('target_error_global', 0.05), verbose=True)
+        # 1. EASY WIN (Stricte : Global + Spécifique)
+        print(f"    🔎 Vérification Easy Win (Global + Spécifique) :")
+        threshold_global = cfg['training'].get('target_error_global', 0.05)
         
-        if pass_easy:
-            print(f"    🎉 EASY WIN VALIDÉ (Score: {score:.2%}).")
+        # On récupère failed_types pour vérifier l'audit spécifique
+        pass_global, failed_types, score = run_audit(model, cfg, t_next, threshold=threshold_global, verbose=True)
+        
+        # Condition Easy Win : Global OK ET aucune IC en échec
+        if pass_global and len(failed_types) == 0:
+            print(f"    🎉 EASY WIN TOTAL VALIDÉ (Score Global: {score:.2%}).")
             t_curr = t_next
             dt = min(dt * 1.2, 0.1)
             torch.save({'model': model.state_dict(), 't': t_curr}, os.path.join(save_dir, f"ckpt_t{t_curr:.4f}.pth"))
             continue
+        else:
+            if pass_global:
+                print(f"    ⚠️  Easy Win refusé : Global OK ({score:.2%}) mais échec spécifique sur {failed_types}.")
+            else:
+                print(f"    ❌ Easy Win refusé : Score Global trop élevé ({score:.2%}).")
 
+        # 2. CONTROLLER (Entraînement)
         success, new_state = run_controller(model, cfg, t_next, dt, global_iters_yaml=iters_yaml)
         
         if success:
