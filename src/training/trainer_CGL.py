@@ -408,9 +408,9 @@ def train_worker(model, cfg, t_max, start_lr, n_iters, batch_gen_func, context_n
         scheduler.step()
         
         # Sauvegarde RAM périodique pour KingOfTheHill
-        if i % 1000 == 0 and not stop_on_explosion:
-             _, _, qs = run_audit(model, cfg, t_max, threshold=1.0, verbose=False)
-             king.update(model, qs)
+        if i % 1000 == 0:
+            _, _, qs = run_audit(model, cfg, t_max, threshold=1.0, verbose=False)
+            king.update(model, qs)
 
     # --- FINISHER L-BFGS ---
     if use_lbfgs and not stop_on_explosion and t_max > 1e-5:
