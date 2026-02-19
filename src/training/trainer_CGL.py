@@ -450,62 +450,79 @@ def train_worker(model, cfg, t_max, start_lr, n_iters, batch_gen_func, context_n
 
 def run_controller(model, cfg, t_target, dt, global_iters_yaml):
     """
-    CONTRÔLEUR : Utilise l'Audit pour décider de la validité du pas.
+    CONTRÔLEUR À ÉTATS :
+    Diagnostic -> [Spécifique ou Global] -> Audit -> Re-bouclage.
+    Limite : max_macro_loops.
     """
     device = next(model.parameters()).device
     lr = float(cfg['time_marching'].get('learning_rate', 1e-4))
     target_err = cfg['training'].get('target_error_global', 0.05)
+    max_macro_loops = cfg['training'].get('max_macro_loops', 3)
     
-    # 1. DIAGNOSTIC (On est tolérant : on ne refuse que si NaN ou Audit > 2*Seuil)
+    # --- 1. DIAGNOSTIC INITIAL ---
     print(f"    🛡️ [Controller] Diagnostic (4000 it) dt={dt:.4f}...")
     diag_model_state = copy.deepcopy(model.state_dict())
     
+    # Le Diag utilise toujours le générateur standard (mélange Sech/Tanh)
     _, b_st, s_diag = train_worker(
         model, cfg, t_target, lr, 4000, 
         get_standard_batch_generator(cfg, device, t_target), 
         "DIAG", diag_model_state, 1e9, False, True
     )
 
-    # Logique de rejet stricte NLSE
-    if s_diag == 1e9:
-        print(f"    💥 Diagnostic rejeté : Instabilité numérique (NaN).")
+    # Sécurité technique (NaN ou explosion majeure)
+    if s_diag == 1e9 or s_diag > (3.0 * target_err):
+        print(f"    💥 Diagnostic instable. Réduction dt.")
         model.load_state_dict(diag_model_state)
         return False, diag_model_state
 
-    if s_diag > (2.0 * target_err):
-        print(f"    ⚠️ Diagnostic faiblard ({s_diag:.2%} > {2*target_err:.2%}). Réduction dt.")
+    # --- 2. BOUCLE DE RATTRAPAGE (MACRO LOOP) ---
+    for loop_idx in range(max_macro_loops):
+        # Audit pour décider de l'action
+        _, failed_types, current_score = run_audit(model, cfg, t_target, threshold=target_err, verbose=(loop_idx==0))
+        num_failed = len(failed_types)
+
+        # CONDITION DE SORTIE : Personne n'échoue
+        if num_failed == 0:
+            print(f"    ✅ Pas d'échec détecté (Loop {loop_idx}). Pas validé.")
+            return True, model.state_dict()
+        
+        print(f"    🔄 Macro-Loop {loop_idx+1}/{max_macro_loops} | Échecs: {failed_types}")
+
+        # DÉCISION DE L'ACTION
+        if num_failed == 1:
+            # CAS SPÉCIFIQUE : Une seule IC pêche
+            t_id = failed_types[0]
+            print(f"    🎯 Action : Entraînement SPÉCIFIQUE sur Type {t_id}.")
+            _, b_st, b_sc = train_worker(
+                model, cfg, t_target, lr, global_iters_yaml, 
+                get_biased_batch_generator(cfg, device, [t_id], t_target), 
+                f"SPEC_{t_id}_L{loop_idx}", model.state_dict(), current_score
+            )
+            model.load_state_dict(b_st)
+            
+        else:
+            # CAS GLOBAL : Les deux (ou plus) échouent
+            print(f"    🚀 Action : Entraînement GLOBAL (Multi-échecs).")
+            _, b_st, b_sc = train_worker(
+                model, cfg, t_target, lr, global_iters_yaml, 
+                get_standard_batch_generator(cfg, device, t_target), 
+                "GLOBAL_L" + str(loop_idx), model.state_dict(), 1.0
+            )
+            model.load_state_dict(b_st)
+
+        # Fin de l'action : la boucle for va repartir au début, faire l'audit et re-décider.
+
+    # --- 3. VERDICT FINAL APRES X BOUCLES ---
+    final_pass, final_failed, final_score = run_audit(model, cfg, t_target, threshold=target_err, verbose=True)
+    
+    if final_pass and not final_failed:
+        print(f"    ✅ Réussite in extremis après {max_macro_loops} boucles.")
+        return True, model.state_dict()
+    else:
+        print(f"    ❌ Échec persistant ({final_score:.2%}) après {max_macro_loops} boucles. Rollback.")
         model.load_state_dict(diag_model_state)
         return False, diag_model_state
-
-    # 2. ENTRAÎNEMENT GLOBAL (Le "vrai" travail)
-    print(f"    ✅ Diagnostic Validé. Lancement Global ({global_iters_yaml} it)...")
-    _, b_st, b_sc = train_worker(
-        model, cfg, t_target, lr, global_iters_yaml, 
-        get_standard_batch_generator(cfg, device, t_target), 
-        "GLOBAL", model.state_dict(), 1.0
-    )
-    model.load_state_dict(b_st)
-
-    # 3. AUDIT DE DÉCISION
-    print(f"    🧐 Audit de Contrôle (Entraînement Spécifique requis ?) :")
-    pass_g, failed, sc = run_audit(model, cfg, t_target, threshold=target_err, verbose=True)
-    
-    if pass_g and not failed:
-        return True, b_st
-
-    # 4. ENTRAÎNEMENT SPÉCIFIQUE (Si besoin)
-    print(f"    🎯 Échec Global ({sc:.2%}). Specialists sur {failed}...")
-    for t_id in failed:
-        _, b_st, b_sc = train_worker(
-            model, cfg, t_target, lr, global_iters_yaml, 
-            get_biased_batch_generator(cfg, device, [t_id], t_target), 
-            f"SPEC_{t_id}", b_st, sc
-        )
-        model.load_state_dict(b_st)
-    
-    # Verdict final après spécialistes
-    final_pass, _, final_score = run_audit(model, cfg, t_target, threshold=target_err, verbose=False)
-    return final_pass, model.state_dict()
 
 # ==============================================================================
 # 5. LE NAVIGATEUR (AVEC AUTO-RESUME)
