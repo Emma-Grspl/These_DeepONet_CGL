@@ -421,9 +421,20 @@ def train_worker(model, cfg, t_max, start_lr, n_iters, batch_gen_func, context_n
         scheduler.step()
         
         # Sauvegarde RAM périodique (KingOfTheHill) - Toujours active pour le Diag
+        # Sauvegarde RAM périodique (KingOfTheHill)
         if i % 1000 == 0:
-             _, _, qs = run_audit(model, cfg, t_max, threshold=1.0, verbose=False)
-             king.update(model, qs)
+             # On demande l'audit détaillé (silencieux)
+             _, failed, qs = run_audit(model, cfg, t_max, threshold=cfg['training'].get('target_error_global', 0.05), verbose=False)
+             
+             # Si c'est un entraînement SPECIFIQUE, on ne juge que sur la baisse de l'erreur globale brute
+             # sans faire de chichis.
+             if "SPEC" in context_name:
+                 # Dans un SPEC, on veut forcer la mise à jour même si c'est légèrement pire globalement, 
+                 # du moment qu'on explore. On utilise une pénalité douce pour l'update.
+                 king.update(model, loss.item()) # On se base sur la loss locale du worker, plus réactive !
+             else:
+                 # En DIAG ou GLOBAL, on reste strict sur l'audit L2
+                 king.update(model, qs)
 
     # --- FINISHER L-BFGS ---
     if use_lbfgs and not stop_on_explosion and t_max > 1e-5:
