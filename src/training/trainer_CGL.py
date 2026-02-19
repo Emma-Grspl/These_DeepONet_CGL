@@ -94,21 +94,24 @@ def find_latest_checkpoint(ckpt_dir):
 # ==============================================================================
 
 def get_rar_batch(model, cfg, device, t_current, n_candidates=10000, n_selected=2000):
-    """
-    Génère des points PDE aléatoires, évalue l'erreur physique, 
-    et garde uniquement les points les plus difficiles.
-    """
+    """Génère des points PDE là où le résidu est fort."""
     b_p, c_p, p_p = get_pde_batch_cgle(n_candidates, cfg, device, t_limit=t_current)
-    # On force t_current pour chercher les erreurs sur le front d'onde actuel
-    c_p[:, 1] = t_current 
-    c_p.requires_grad_(True)
+    
+    # On modifie t AVANT de mettre requires_grad
+    # On utilise .clone() pour éviter de toucher au leaf variable original
+    c_p_new = c_p.clone()
+    c_p_new[:, 1] = t_current 
+    c_p_new.requires_grad_(True)
     
     with torch.set_grad_enabled(True):
-        rr, ri = pde_residual_cgle(model, b_p, c_p, p_p, cfg)
+        rr, ri = pde_residual_cgle(model, b_p, c_p_new, p_p, cfg)
         residual = torch.sqrt(rr**2 + ri**2).detach()
     
     _, indices = torch.topk(residual.view(-1), n_selected)
-    return b_p[indices], c_p[indices], {k: v[indices] for k, v in p_p.items()}
+    
+    # On renvoie des versions détachées pour le stockage, 
+    # elles seront réactivées dans la boucle de train.
+    return b_p[indices], c_p_new[indices].detach(), {k: v[indices].detach() for k, v in p_p.items()}
 
 def get_biased_batch_generator(cfg, device, target_types, t_limit):
     def generator(batch_size_pde, batch_size_ic):
@@ -372,7 +375,6 @@ def train_worker(model, cfg, t_max, start_lr, n_iters, batch_gen_func, context_n
                                          f"{r_grad:.2f}", f"{cos_phi:.3f}", "0.0", f"{current_pde_w:.2e}"])
                   
                   # --- ACTIVATION RAR DYNAMIQUE ---
-                  # On l'active après le 1er quart du cycle pour laisser le réseau se placer
                   if i >= n_iters // 4 and not stop_on_explosion:
                       rar_active = True
                       rar_b, rar_c, rar_p = get_rar_batch(model, cfg, b_i.device, t_max)
@@ -380,13 +382,23 @@ def train_worker(model, cfg, t_max, start_lr, n_iters, batch_gen_func, context_n
                   else:
                       tqdm.write(f"\n📊 [t={t_max:.4f} | {i:04d}] Angle: {angle:.1f}° | W_pde: {current_pde_w:.1e}")
 
-             # BC Neumann
+             # --- 🛡️ CORRECTIF BC NEUMANN (Anti In-Place Error) ---
              idx_bc = torch.randperm(b_p.size(0))[:int(b_p.size(0)*0.25)]
-             b_bc = b_p[idx_bc]; c_bc = c_p[idx_bc].clone()
+             b_bc = b_p[idx_bc]
+             
+             # On détache et clone pour pouvoir modifier x sans perturber le graphe de gradient
+             c_bc_base = c_p[idx_bc].detach().clone()
              x_min, x_max = cfg['physics']['x_domain']
-             c_left = c_bc.clone(); c_left[:, 0] = x_min; c_right = c_bc.clone(); c_right[:, 0] = x_max
-             b_all_bc = torch.cat([b_bc, b_bc], dim=0); c_all_bc = torch.cat([c_left, c_right], dim=0)
-             c_all_bc.requires_grad_(True)
+             
+             c_left = c_bc_base.clone()
+             c_left[:, 0] = x_min
+             c_right = c_bc_base.clone()
+             c_right[:, 0] = x_max
+             
+             b_all_bc = torch.cat([b_bc, b_bc], dim=0)
+             c_all_bc = torch.cat([c_left, c_right], dim=0)
+             c_all_bc.requires_grad_(True) # Réactivation propre ici
+             
              ur_bc, ui_bc = model(b_all_bc, c_all_bc)
              grads_r = torch.autograd.grad(ur_bc.sum(), c_all_bc, create_graph=True)[0]
              grads_i = torch.autograd.grad(ui_bc.sum(), c_all_bc, create_graph=True)[0]
@@ -394,12 +406,13 @@ def train_worker(model, cfg, t_max, start_lr, n_iters, batch_gen_func, context_n
 
              loss = current_pde_w * l_pde + current_ic_w * l_ic + weights.get('bc_loss', 1.0) * loss_bc
 
-        # 5. ESQUIVE DES NAN (Immunité)
+        # 5. ESQUIVE DES NAN & FUSIBLE
         if torch.isnan(loss) or torch.isinf(loss):
             optimizer.zero_grad()
-            continue # On skip ce pas foireux sans faire péter l'entraînement
+            continue 
+            
         if stop_on_explosion and loss.item() > 1000.0:
-            tqdm.write(f"      💥 Divergence détectée (Loss = {loss.item():.1f} > 1000). Arrêt du Diag.")
+            tqdm.write(f"      💥 Divergence détectée (Loss = {loss.item():.1f} > 1000). Arrêt.")
             return False, king.best_state, 1e9
             
         loss.backward()
@@ -407,10 +420,10 @@ def train_worker(model, cfg, t_max, start_lr, n_iters, batch_gen_func, context_n
         optimizer.step()
         scheduler.step()
         
-        # Sauvegarde RAM périodique pour KingOfTheHill
+        # Sauvegarde RAM périodique (KingOfTheHill) - Toujours active pour le Diag
         if i % 1000 == 0:
-            _, _, qs = run_audit(model, cfg, t_max, threshold=1.0, verbose=False)
-            king.update(model, qs)
+             _, _, qs = run_audit(model, cfg, t_max, threshold=1.0, verbose=False)
+             king.update(model, qs)
 
     # --- FINISHER L-BFGS ---
     if use_lbfgs and not stop_on_explosion and t_max > 1e-5:
@@ -426,13 +439,11 @@ def train_worker(model, cfg, t_max, start_lr, n_iters, batch_gen_func, context_n
         _, _, fs = run_audit(model, cfg, t_max, threshold=1.0, verbose=False)
         king.update(model, fs)
 
-    # Restauration du meilleur état (La gloire du KingOfTheHill)
     score = king.restore(model)
     print(f"    📊 Audit Fin [{context_name}] (Best Retained) :")
     run_audit(model, cfg, t_max, threshold=cfg['training'].get('target_error_global', 0.05), verbose=True)
     
     return (score < cfg['training'].get('target_error_global', 0.05)), king.best_state, score
-
 # ==============================================================================
 # 4. LE CONTRÔLEUR
 # ==============================================================================
