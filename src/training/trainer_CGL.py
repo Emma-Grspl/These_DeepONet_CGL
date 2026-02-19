@@ -398,11 +398,10 @@ def train_worker(model, cfg, t_max, start_lr, n_iters, batch_gen_func, context_n
         if torch.isnan(loss) or torch.isinf(loss):
             optimizer.zero_grad()
             continue # On skip ce pas foireux sans faire péter l'entraînement
-
-        # On garde la limite "100" uniquement pour les explosions propres
-        if stop_on_explosion and loss.item() > 100.0:
+        if stop_on_explosion and loss.item() > 1000.0:
+            tqdm.write(f"      💥 Divergence détectée (Loss = {loss.item():.1f} > 1000). Arrêt du Diag.")
             return False, king.best_state, 1e9
-
+            
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
