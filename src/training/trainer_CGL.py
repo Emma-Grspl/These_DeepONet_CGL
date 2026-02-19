@@ -90,8 +90,25 @@ def find_latest_checkpoint(ckpt_dir):
     return best_file, max_t
 
 # ==============================================================================
-# 1. GÉNÉRATEURS DE BATCH
+# 1. GÉNÉRATEURS DE BATCH & RAR
 # ==============================================================================
+
+def get_rar_batch(model, cfg, device, t_current, n_candidates=10000, n_selected=2000):
+    """
+    Génère des points PDE aléatoires, évalue l'erreur physique, 
+    et garde uniquement les points les plus difficiles.
+    """
+    b_p, c_p, p_p = get_pde_batch_cgle(n_candidates, cfg, device, t_limit=t_current)
+    # On force t_current pour chercher les erreurs sur le front d'onde actuel
+    c_p[:, 1] = t_current 
+    c_p.requires_grad_(True)
+    
+    with torch.set_grad_enabled(True):
+        rr, ri = pde_residual_cgle(model, b_p, c_p, p_p, cfg)
+        residual = torch.sqrt(rr**2 + ri**2).detach()
+    
+    _, indices = torch.topk(residual.view(-1), n_selected)
+    return b_p[indices], c_p[indices], {k: v[indices] for k, v in p_p.items()}
 
 def get_biased_batch_generator(cfg, device, target_types, t_limit):
     def generator(batch_size_pde, batch_size_ic):
@@ -265,7 +282,7 @@ def train_worker(model, cfg, t_max, start_lr, n_iters, batch_gen_func, context_n
                  global_best_state, global_best_score, use_lbfgs=True, stop_on_explosion=False):
     """
     L'OUVRIER : Exécute N itérations. 
-    Intègre KingOfTheHill, NTK Lissé, et RAR.
+    Intègre KingOfTheHill, NTK Lissé, Bouclier Anti-NaN, et RAR Dynamique.
     """
     weights = cfg['training']['weights'].copy()
     save_dir = cfg['training'].get('save_dir', "outputs")
@@ -281,7 +298,7 @@ def train_worker(model, cfg, t_max, start_lr, n_iters, batch_gen_func, context_n
     
     # État RAR
     rar_active = False
-    rar_data = None
+    rar_b, rar_c, rar_p = None, None, None
 
     model.load_state_dict(king.best_state)
     optimizer = optim.Adam(model.parameters(), lr=current_lr)
@@ -290,27 +307,29 @@ def train_worker(model, cfg, t_max, start_lr, n_iters, batch_gen_func, context_n
     pbar = tqdm(range(n_iters), desc=f"  👷 [{context_name}]", leave=False)
     
     for i in pbar:
-        # 1. Fetch Batch
+        # 1. Fetch Batch Standard
         b_p, c_p, p_p, b_i, c_i, tr_re, tr_im, ux_re, ux_im = batch_gen_func(
             cfg['training']['batch_size_pde'], cfg['training']['batch_size_ic']
         )
         
-        # Injection RAR
-        if rar_active and rar_data is not None and b_p is not None:
-            rb, rc, rp = rar_data
-            b_p = torch.cat([b_p, rb], dim=0)
-            c_p = torch.cat([c_p, rc], dim=0)
-            for k in p_p: p_p[k] = torch.cat([p_p[k], rp[k]], dim=0)
+        # 2. INJECTION RAR DYNAMIQUE
+        if rar_active and rar_b is not None and b_p is not None:
+            # On colle les points difficiles à la fin du batch PDE
+            b_p = torch.cat([b_p, rar_b], dim=0)
+            c_p = torch.cat([c_p, rar_c], dim=0)
+            for k in p_p: 
+                p_p[k] = torch.cat([p_p[k], rar_p[k]], dim=0)
 
         optimizer.zero_grad(set_to_none=True)
         
-        # 2. Calcul Loss
+        # 3. Calcul Forward & Loss
         if t_max < 1e-5: # Mode Warmup
              c_i.requires_grad_(True)
              pr, pi = model(b_i, c_i)
              l_ic = torch.mean((pr-tr_re)**2 + (pi-tr_im)**2)
              gr = torch.autograd.grad(pr.sum(), c_i, create_graph=True)[0]
              gi = torch.autograd.grad(pi.sum(), c_i, create_graph=True)[0]
+             l_pde = torch.tensor(0.0).to(b_i.device)
              loss = l_ic + 1.0 * torch.mean((gr[:,0:1]-ux_re)**2 + (gi[:,0:1]-ux_im)**2)
         else:
              # Mode Time Marching
@@ -319,33 +338,69 @@ def train_worker(model, cfg, t_max, start_lr, n_iters, batch_gen_func, context_n
              l_pde = torch.mean(rr**2 + ri**2)
              l_ic = torch.mean((pr-tr_re)**2 + (pi-tr_im)**2)
 
-             # 3. NTK & RAR (tous les 500 pas)
+             # 4. NTK & MISE À JOUR RAR (tous les 500 pas)
              if i % 500 == 0:
                   params = [p for p in model.parameters() if p.requires_grad]
                   g_ic = torch.autograd.grad(l_ic, params, retain_graph=True, allow_unused=True)
                   g_pde = torch.autograd.grad(l_pde, params, retain_graph=True, allow_unused=True)
+                  
                   v_ic = torch.cat([g.flatten() for g in g_ic if g is not None])
                   v_pde = torch.cat([g.flatten() for g in g_pde if g is not None])
                   
-                  n_ic, n_pde = torch.norm(v_ic)+1e-9, torch.norm(v_pde)+1e-9
+                  # BOUCLIER ANTI-NAN : Clamp pour éviter la division par zéro
+                  n_ic = torch.clamp(torch.norm(v_ic), min=1e-8)
+                  n_pde = torch.clamp(torch.norm(v_pde), min=1e-8)
+                  
+                  r_grad = (n_pde / n_ic).item()
+                  target_w = np.clip(1.0 / r_grad, 1e-4, 100.0) # On borne la cible
+                  
                   cos_phi = torch.nn.functional.cosine_similarity(v_ic, v_pde, dim=0).item()
+                  if np.isnan(cos_phi): cos_phi = 0.0 # Sécurité NaN
                   angle = np.arccos(np.clip(cos_phi, -1.0, 1.0)) * 180 / np.pi
                   
-                  # Adaptation Poids
-                  target_w = (n_ic / n_pde).item()
-                  damp = 0.1 if angle > 135 else (0.5 if angle > 90 else 1.0)
-                  current_pde_w = 0.9 * current_pde_w + 0.1 * max(target_w * damp, 1e-4)
+                  # Gestion de Conflit
+                  dampener = 1.0
+                  if angle > 135: dampener = 0.1
+                  elif angle > 90: dampener = 0.5
+                  
+                  # Lissage NTK
+                  target_w = max(target_w * dampener, 1e-4)
+                  current_pde_w = 0.9 * current_pde_w + 0.1 * target_w
 
-                  # Activation RAR (à mi-chemin)
-                  if i >= n_iters // 2 and not rar_active and not stop_on_explosion:
+                  with open(log_path, 'a', newline='') as f:
+                        csv.writer(f).writerow([f"{t_max:.4f}", i, f"{l_ic.item():.2e}", f"{l_pde.item():.2e}", 
+                                         f"{r_grad:.2f}", f"{cos_phi:.3f}", "0.0", f"{current_pde_w:.2e}"])
+                  
+                  # --- ACTIVATION RAR DYNAMIQUE ---
+                  # On l'active après le 1er quart du cycle pour laisser le réseau se placer
+                  if i >= n_iters // 4 and not stop_on_explosion:
                       rar_active = True
-                      rar_data = get_rar_batch(model, cfg, b_i.device, t_max)
-                      tqdm.write(f"      🎯 RAR: Injection de points critiques.")
+                      rar_b, rar_c, rar_p = get_rar_batch(model, cfg, b_i.device, t_max)
+                      tqdm.write(f"\n📊 [t={t_max:.4f} | {i:04d}] Angle: {angle:.1f}° | W_pde: {current_pde_w:.1e} | 🎯 RAR Update")
+                  else:
+                      tqdm.write(f"\n📊 [t={t_max:.4f} | {i:04d}] Angle: {angle:.1f}° | W_pde: {current_pde_w:.1e}")
 
-             loss = current_pde_w * l_pde + current_ic_w * l_ic
+             # BC Neumann
+             idx_bc = torch.randperm(b_p.size(0))[:int(b_p.size(0)*0.25)]
+             b_bc = b_p[idx_bc]; c_bc = c_p[idx_bc].clone()
+             x_min, x_max = cfg['physics']['x_domain']
+             c_left = c_bc.clone(); c_left[:, 0] = x_min; c_right = c_bc.clone(); c_right[:, 0] = x_max
+             b_all_bc = torch.cat([b_bc, b_bc], dim=0); c_all_bc = torch.cat([c_left, c_right], dim=0)
+             c_all_bc.requires_grad_(True)
+             ur_bc, ui_bc = model(b_all_bc, c_all_bc)
+             grads_r = torch.autograd.grad(ur_bc.sum(), c_all_bc, create_graph=True)[0]
+             grads_i = torch.autograd.grad(ui_bc.sum(), c_all_bc, create_graph=True)[0]
+             loss_bc = torch.mean(grads_r[:, 0:1]**2 + grads_i[:, 0:1]**2)
 
-        # --- SÉCURITÉ : Uniquement sur NaN/Inf désormais ---
-        if stop_on_explosion and (torch.isnan(loss) or torch.isinf(loss)):
+             loss = current_pde_w * l_pde + current_ic_w * l_ic + weights.get('bc_loss', 1.0) * loss_bc
+
+        # 5. ESQUIVE DES NAN (Immunité)
+        if torch.isnan(loss) or torch.isinf(loss):
+            optimizer.zero_grad()
+            continue # On skip ce pas foireux sans faire péter l'entraînement
+
+        # On garde la limite "100" uniquement pour les explosions propres
+        if stop_on_explosion and loss.item() > 100.0:
             return False, king.best_state, 1e9
 
         loss.backward()
@@ -353,7 +408,7 @@ def train_worker(model, cfg, t_max, start_lr, n_iters, batch_gen_func, context_n
         optimizer.step()
         scheduler.step()
         
-        # Sauvegarde RAM périodique
+        # Sauvegarde RAM périodique pour KingOfTheHill
         if i % 1000 == 0 and not stop_on_explosion:
              _, _, qs = run_audit(model, cfg, t_max, threshold=1.0, verbose=False)
              king.update(model, qs)
@@ -372,13 +427,16 @@ def train_worker(model, cfg, t_max, start_lr, n_iters, batch_gen_func, context_n
         _, _, fs = run_audit(model, cfg, t_max, threshold=1.0, verbose=False)
         king.update(model, fs)
 
-    # Restauration du meilleur état
+    # Restauration du meilleur état (La gloire du KingOfTheHill)
     score = king.restore(model)
     print(f"    📊 Audit Fin [{context_name}] (Best Retained) :")
     run_audit(model, cfg, t_max, threshold=cfg['training'].get('target_error_global', 0.05), verbose=True)
     
     return (score < cfg['training'].get('target_error_global', 0.05)), king.best_state, score
 
+# ==============================================================================
+# 4. LE CONTRÔLEUR
+# ==============================================================================
 
 def run_controller(model, cfg, t_target, dt, global_iters_yaml):
     """
@@ -438,6 +496,7 @@ def run_controller(model, cfg, t_target, dt, global_iters_yaml):
     # Verdict final après spécialistes
     final_pass, _, final_score = run_audit(model, cfg, t_target, threshold=target_err, verbose=False)
     return final_pass, model.state_dict()
+
 # ==============================================================================
 # 5. LE NAVIGATEUR (AVEC AUTO-RESUME)
 # ==============================================================================
