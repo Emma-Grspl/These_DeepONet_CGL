@@ -12,9 +12,6 @@ from src.physics.pde_cgl import pde_residual_cgle
 from src.data.generators import get_ic_batch_cgle, get_pde_batch_cgle_causal, get_rar_batch
 from src.utils.solver_cgl import get_ground_truth_CGL
 
-import os
-import torch
-
 def save_checkpoint_cgl(model, optimizer, t, ckpt_dir, name=None):
     """ Sauvegarde complète de la physique, des poids et de la dynamique d'entraînement """
     os.makedirs(ckpt_dir, exist_ok=True)
@@ -36,6 +33,7 @@ def save_checkpoint_cgl(model, optimizer, t, ckpt_dir, name=None):
     # 2. Reprise : Mise à jour constante du point de reprise automatique
     latest_path = os.path.join(ckpt_dir, "model_latest.pth")
     torch.save(state, latest_path)
+
 # ==============================================================================
 # 0. OUTILS
 # ==============================================================================
@@ -128,7 +126,7 @@ def run_audit(model, cfg, t_max, threshold=0.05, n_global=60, verbose=False):
 # ==============================================================================
 # 2. LE WORKER ADAM (Hard Constraint)
 # ==============================================================================
-def train_worker(model, cfg, t_prev, t_curr, current_lr, n_iters):
+def train_worker(model, cfg, t_prev, t_curr, current_lr, n_iters, disable_rar=False):
     king = KingOfTheHill(model)
     king.update(model, 1.0)
     
@@ -181,27 +179,32 @@ def train_worker(model, cfg, t_prev, t_curr, current_lr, n_iters):
         # Loss totale (Hard Constraint = pas de l_ic !)
         loss = l_pde + weights.get('bc_loss', 1.0) * loss_bc
 
-        # Sécurité anti-explosion
+        # Sécurité anti-explosion avec seuil réaliste
+        if loss.item() > 10000:
+            raise ValueError(f"Loss gigantesque ({loss.item():.2e} > 10^4).")
+            
         if torch.isnan(loss) or torch.isinf(loss):
-            optimizer.zero_grad()
-            continue
+            raise ValueError("Loss est devenue NaN ou Inf.")
             
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         scheduler.step()
         
-        # RAR & Audit
-        if i % 1000 == 0:
+        # Activation du RAR toutes les 2000 itérations (si autorisé)
+        if not disable_rar and i > 0 and i % 2000 == 0:
             if i >= n_iters // 4:
                 rar_active = True
                 rar_b, rar_c, rar_p = get_rar_batch(model, cfg, device, t_prev, t_curr)
-            
-            _, score = run_audit(model, cfg, t_curr, verbose=False)
+                
+        # Audit et affichage toutes les 1000 itérations
+        if i % 1000 == 0:
+            target = cfg['training'].get('target_error_global', 0.06)
+            _, score = run_audit(model, cfg, t_curr, threshold=target, verbose=False)
             king.update(model, score)
             
             if i > 0:
-                tqdm.write(f"📊 [It {i}] L2: {score:.2%} | LR: {scheduler.get_last_lr()[0]:.1e}")
+                tqdm.write(f"📊 [It {i}] Loss Totale: {loss.item():.2e} (PDE: {l_pde.item():.2e}) | L2 Audit: {score:.2%} | LR: {scheduler.get_last_lr()[0]:.1e}")
 
     # Restaure le meilleur passage d'Adam avant de rendre la main à la macro-loop
     king.restore(model) 
@@ -215,12 +218,14 @@ def run_diagnostic(model, cfg, t_prev, t_curr, base_lr):
     print(f"    🛡️ Diagnostic (4000 it) de {t_prev:.3f} à {t_curr:.3f}...")
     diag_state = copy.deepcopy(model.state_dict())
     
-    _, score_in = run_audit(model, cfg, t_curr, verbose=False)
+    target = cfg['training'].get('target_error_global', 0.06)
+    _, score_in = run_audit(model, cfg, t_curr, threshold=target, verbose=False)
     
     try:
-        score_out = train_worker(model, cfg, t_prev, t_curr, base_lr, 4000)
+        # On désactive le RAR pour le diagnostic !
+        score_out = train_worker(model, cfg, t_prev, t_curr, base_lr, 4000, disable_rar=True)
     except Exception as e:
-        print("      💥 Explosion numérique détectée.")
+        print(f"      💥 Erreur ou vraie explosion pendant le Diag : {str(e)}")
         model.load_state_dict(diag_state)
         return False, "reduce_dt"
 
@@ -250,7 +255,7 @@ def run_macro_loop(model, cfg, t_prev, t_curr, base_lr, n_iters):
         print(f"\n    🔄 Macro-Loop {loop+1}/{max_loops} | LR: {current_lr:.1e}")
         model.load_state_dict(base_state) # Rollback de la boucle
         
-        # 1. Adam
+        # 1. Adam (Le RAR est actif par défaut ici)
         adam_score = train_worker(model, cfg, t_prev, t_curr, current_lr, n_iters)
         print(f"      👉 Fin Adam : L2 = {adam_score:.2%}")
         
