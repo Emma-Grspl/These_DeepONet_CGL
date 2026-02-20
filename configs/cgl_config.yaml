@@ -43,7 +43,7 @@ training:
     # L'IC n'existe plus en Hard Constraint, il ne reste que la pénalité des bords
     bc_loss: 1.0
     
-  target_error_global: 0.060   
+  target_error_global: 0.050   
   save_dir: "results/CGL_HardConstraint_Run"
 
 time_marching:
@@ -51,15 +51,15 @@ time_marching:
   learning_rate: 2e-4  
   # Nouvelles zones adaptées pour T_max = 10.0
   zones:
-    - t_end: 0.1
-      dt: 0.005
-      iters: 4000
     - t_end: 1.0
-      dt: 0.01
-      iters: 6000
-    - t_end: 5.0
-      dt: 0.05
-      iters: 8000
-    - t_end: 10.0
       dt: 0.1
+      iters: 7000
+    - t_end: 5.0
+      dt: 0.5
+      iters: 8000
+    - t_end: 7.0
+      dt: 1.0
+      iters: 9000
+    - t_end: 10.0
+      dt: 1.0
       iters: 10000

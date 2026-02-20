@@ -12,6 +12,30 @@ from src.physics.pde_cgl import pde_residual_cgle
 from src.data.generators import get_ic_batch_cgle, get_pde_batch_cgle_causal, get_rar_batch
 from src.utils.solver_cgl import get_ground_truth_CGL
 
+import os
+import torch
+
+def save_checkpoint_cgl(model, optimizer, t, ckpt_dir, name=None):
+    """ Sauvegarde complète de la physique, des poids et de la dynamique d'entraînement """
+    os.makedirs(ckpt_dir, exist_ok=True)
+    
+    # Capture de l'état global (gère le cas où l'optimiseur n'est pas passé)
+    state = {
+        'model_state': model.state_dict(),
+        't_curr': t
+    }
+    if optimizer is not None:
+        state['optimizer_state'] = optimizer.state_dict()
+    
+    # 1. Historique : Sauvegarde du fichier spécifique à ce temps t
+    if name is None:
+        file_name = f"model_t_{t:.3f}.pth"
+        save_path = os.path.join(ckpt_dir, file_name)
+        torch.save(state, save_path)
+    
+    # 2. Reprise : Mise à jour constante du point de reprise automatique
+    latest_path = os.path.join(ckpt_dir, "model_latest.pth")
+    torch.save(state, latest_path)
 # ==============================================================================
 # 0. OUTILS
 # ==============================================================================
@@ -108,9 +132,10 @@ def train_worker(model, cfg, t_prev, t_curr, current_lr, n_iters):
     king = KingOfTheHill(model)
     king.update(model, 1.0)
     
-    bs_pde, bs_ic = cfg['training']['batch_size_pde'], cfg['training']['batch_size_ic']
+    bs_pde = cfg['training']['batch_size_pde']
     weights = cfg['training']['weights'].copy()
     
+    # Création de l'optimiseur local pour ce pas de temps
     optimizer = optim.Adam(model.parameters(), lr=current_lr)
     # StepLR: On divise par 2 le LR toutes les 2000 itérations
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=2000, gamma=0.5)
@@ -156,6 +181,7 @@ def train_worker(model, cfg, t_prev, t_curr, current_lr, n_iters):
         # Loss totale (Hard Constraint = pas de l_ic !)
         loss = l_pde + weights.get('bc_loss', 1.0) * loss_bc
 
+        # Sécurité anti-explosion
         if torch.isnan(loss) or torch.isinf(loss):
             optimizer.zero_grad()
             continue
@@ -177,7 +203,8 @@ def train_worker(model, cfg, t_prev, t_curr, current_lr, n_iters):
             if i > 0:
                 tqdm.write(f"📊 [It {i}] L2: {score:.2%} | LR: {scheduler.get_last_lr()[0]:.1e}")
 
-    king.restore(model) # Restaure le meilleur passage d'Adam
+    # Restaure le meilleur passage d'Adam avant de rendre la main à la macro-loop
+    king.restore(model) 
     return king.best_score
 
 # ==============================================================================
