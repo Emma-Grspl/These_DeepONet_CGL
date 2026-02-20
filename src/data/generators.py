@@ -1,5 +1,6 @@
 import numpy as np
 import torch
+from src.physics.pde_cgl import pde_residual_cgle
 
 def get_ic_batch_cgle(batch_size, cfg, device):
     """
