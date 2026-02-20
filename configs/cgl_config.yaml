@@ -1,12 +1,16 @@
-experiment_name: "CGL_Navigator_V3_Robust"
+experiment_name: "CGL_HardConstraint_Gaussian"
 device: "cuda"
 
 physics:
-  x_domain: [-7.0, 12.0]
-  t_max: 4.0
-  initial_conditions: [1, 2]
+  # Domaine spatial réduit puisque la Gaussienne est centrée et s'étale peu
+  x_domain: [-8.0, 8.0] 
+  # Objectif long terme
+  t_max: 10.0
+  # Uniquement la Gaussienne
+  initial_conditions: [0]
   bounds:
-    A: [0.5, 3.0]
+    # Amplitude faible (régime quasi-linéaire)
+    A: [0.1, 0.3]
     w0: [0.5, 2.0]
     x0: [0.0, 0.0]
     k: [-2.0, 2.0]
@@ -14,7 +18,8 @@ physics:
     alpha: [0.0, 1.0]
     beta: [-1.5, 1.5]
     mu: [-0.5, 1.0]
-    V: [0.0, 1.0]
+    # Vitesse fixée à zéro
+    V: [0.0, 0.0]
 
 model:
   branch_input_dim: 9 
@@ -27,49 +32,34 @@ model:
   fourier_scales: [1.0, 2.0, 5.0, 10.0, 20.0] 
 
 training:
-  # Gros batch = Gradients stables (Vital pour Tanh)
+  # Gros batchs maintenus pour une exploration robuste de la PDE
   batch_size_ic: 16384    
   batch_size_pde: 16384    
   
+  # Paramètres de la Trust-Region (Macro-Loops)
   max_macro_loops: 6 
-  nb_adam_retries: 2 
-  check_interval: 2000
-  stagnation_threshold: 0.001
-  
-  # Poids PDE : Le code s'occupe de le monter, on commence bas
-  pde_weight_start: 0.0001
-  pde_weight_target: 0.1
-  ramp_end_t: 0.5 
   
   weights:
-    pde_loss: 0.0001
-    ic_loss_start: 2.0
-    # MODIF 1 : On garde l'IC forte pour ne pas perdre la Tanh
-    ic_loss_target: 1.0        
+    # L'IC n'existe plus en Hard Constraint, il ne reste que la pénalité des bords
     bc_loss: 1.0
     
-  target_error_ic: 0.035        
-  # MODIF 2 : Un tout petit peu plus de souplesse pour éviter le blocage à 5.8%
   target_error_global: 0.060   
-  save_dir: "results/CGL_Navigator_Run"
-  
-  ic_phase:
-    learning_rate: 3e-4
-    iterations: 15000
+  save_dir: "results/CGL_HardConstraint_Run"
 
 time_marching:
-  # LR assez haut car Batch Size est grand
+  # LR de départ de la Macro-Loop (qui sera divisé par 2 en cas d'échec)
   learning_rate: 2e-4  
+  # Nouvelles zones adaptées pour T_max = 10.0
   zones:
-    - t_end: 0.05
-      dt: 0.002
-      iters: 5000
-    - t_end: 0.15
+    - t_end: 0.1
+      dt: 0.005
+      iters: 4000
+    - t_end: 1.0
       dt: 0.01
-      iters: 9000
-    - t_end: 2.0
+      iters: 6000
+    - t_end: 5.0
       dt: 0.05
-      iters: 9000
-    - t_end: 4.0
+      iters: 8000
+    - t_end: 10.0
       dt: 0.1
       iters: 10000

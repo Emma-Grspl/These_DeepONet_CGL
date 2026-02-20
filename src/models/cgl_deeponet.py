@@ -19,44 +19,47 @@ class MultiScaleFourierFeatureEncoding(nn.Module):
         proj = 2.0 * np.pi * x @ self.B.t()
         return torch.cat([torch.sin(proj), torch.cos(proj)], dim=-1)
 
-# --- NOUVEAU : BLOC MODIFIÉ ---
+# --- BLOC MODIFIÉ (Injection + Initialisation) ---
 class ModifiedMLP(nn.Module):
     """
     Architecture avec connexions résiduelles et injection d'input (Wang et al.).
-    Empêche le gradient de disparaître et force le respect des paramètres physiques.
+    Intègre l'initialisation 'Zero-Output' pour le Hard Constraint.
     """
     def __init__(self, input_dim, hidden_layers, output_dim, activation=nn.SiLU()):
         super().__init__()
         self.activation = activation
         self.input_dim = input_dim
         
-        # Encodeurs U et V (portes d'injection)
         self.U_encoder = nn.Linear(input_dim, hidden_layers[0])
         self.V_encoder = nn.Linear(input_dim, hidden_layers[0])
         
         self.layers = nn.ModuleList()
-        # Première couche
         self.layers.append(nn.Linear(input_dim, hidden_layers[0]))
         
-        # Couches cachées
         for i in range(len(hidden_layers) - 1):
             self.layers.append(nn.Linear(hidden_layers[i], hidden_layers[i+1]))
             
-        # Couche de sortie
         self.output_layer = nn.Linear(hidden_layers[-1], output_dim)
 
+        # --- CORRECTION CRITIQUE : Initialisation "Zero-Output" ---
+        # Garantit que le réseau sort ~0 au début. 
+        # L'onde à t=0 sera donc PURÉMENT la Gaussienne analytique.
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight)
+                nn.init.constant_(m.bias, 0)
+                
+        nn.init.normal_(self.output_layer.weight, mean=0.0, std=1e-5)
+        nn.init.constant_(self.output_layer.bias, 0.0)
+
     def forward(self, x):
-        # On calcule les portes d'injection U et V à partir de l'input x
         U = self.activation(self.U_encoder(x))
         V = self.activation(self.V_encoder(x))
         
-        # Première couche standard
         H = self.activation(self.layers[0](x))
         
-        # Pour chaque couche suivante, on mixe l'info H avec l'input (U, V)
         for layer in self.layers[1:]:
             Z = self.activation(layer(H))
-            # Formule de réinjection : H_new = (1 - Z) * U + Z * V
             H = (1 - Z) * U + Z * V
             
         return self.output_layer(H)
@@ -112,7 +115,7 @@ class CGL_PI_DeepONet(nn.Module):
         self.register_buffer('x_max', torch.tensor(x_max))
         self.register_buffer('t_max', torch.tensor(t_max))
 
-        # --- BRANCH NET (Modified) ---
+        # --- BRANCH NET ---
         self.branch_input_dim = 9 
         self.branch_net = ModifiedMLP(
             input_dim=self.branch_input_dim,
@@ -120,7 +123,7 @@ class CGL_PI_DeepONet(nn.Module):
             output_dim=2 * latent_dim
         )
 
-        # --- TRUNK NET (Modified) ---
+        # --- TRUNK NET ---
         self.trunk_input_dim = 2
         self.trunk_encoding = MultiScaleFourierFeatureEncoding(self.trunk_input_dim, fourier_dim, scales)
         
@@ -141,7 +144,30 @@ class CGL_PI_DeepONet(nn.Module):
                                      torch.log10(torch.abs(x_min) + 1e-9), 
                                      torch.log10(torch.abs(x_max) + 1e-9))
 
+    # --- NOUVEAU : Calcul Analytique ---
+    def get_ic_analytical(self, params, coords):
+        """Calcule la Gaussienne exacte pour l'Ansatz."""
+        # params: [alpha, beta, mu, V, A, w0, x0, k, type]
+        A = params[:, 4:5]
+        w0 = params[:, 5:6]
+        x0 = params[:, 6:7]
+        k = params[:, 7:8]
+        
+        x = coords[:, 0:1]
+        
+        # Enveloppe Gaussienne
+        amp = A * torch.exp(-((x - x0)**2) / (w0**2 + 1e-12))
+        
+        # Phase (vitesse de phase initiale)
+        phase = k * (x - x0)
+        
+        return amp * torch.cos(phase), amp * torch.sin(phase)
+
     def forward(self, params, coords):
+        # 1. Base Analytique (Condition Initiale Hardcodée)
+        ic_re, ic_im = self.get_ic_analytical(params, coords)
+
+        # 2. Préparation Réseau
         norm_alpha = self.normalize_linear(params[:, 0:1], self.alpha_min, self.alpha_max)
         norm_beta  = self.normalize_linear(params[:, 1:2], self.beta_min, self.beta_max)
         norm_mu    = self.normalize_linear(params[:, 2:3], self.mu_min, self.mu_max)
@@ -163,6 +189,7 @@ class CGL_PI_DeepONet(nn.Module):
             self.normalize_linear(t_raw, 0.0, self.t_max) 
         ], dim=1)
 
+        # 3. Calcul Réseau
         B = self.branch_net(params_norm)             
         T = self.trunk_net(self.trunk_encoding(coords_norm))
         
@@ -170,4 +197,12 @@ class CGL_PI_DeepONet(nn.Module):
         out_re = torch.sum(B_re * T, dim=1, keepdim=True)
         out_im = torch.sum(B_im * T, dim=1, keepdim=True)
 
-        return out_re, out_im
+        # 4. L'Ansatz (Hard Constraint)
+        # Transition douce avec t : à t=0, le réseau est annulé.
+        # tau = 1.0 (ou 5.0 comme NLSE) adoucit la montée en puissance du réseau.
+        transition = 1.0 - torch.exp(-t_raw / 1.0) 
+
+        psi_re = ic_re + transition * out_re
+        psi_im = ic_im + transition * out_im
+
+        return psi_re, psi_im
