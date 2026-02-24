@@ -41,13 +41,12 @@ def get_ic_batch_cgle(batch_size, cfg, device):
     branch_tensor = torch.tensor(params, dtype=torch.float32).to(device)
     coords_tensor = torch.tensor(coords, dtype=torch.float32).to(device)
 
-    # En Hard Constraint, on n'a plus besoin de renvoyer les vraies valeurs de l'onde à t=0.
     return branch_tensor, coords_tensor
 
 
 def get_pde_batch_cgle_causal(n_samples, cfg, device, t_prev, t_curr):
     """
-    Générateur PDE avec Time Marching Causal (30% passé, 70% front) et Focus Spatial.
+    Générateur PDE avec Time Marching Causal (20% mémoire passé, 80% front actif) et Focus Spatial.
     """
     b = cfg['physics']['bounds'] if isinstance(cfg, dict) else cfg.physics['bounds']
     eq_p = cfg['physics']['equation_params'] if isinstance(cfg, dict) else cfg.physics['equation_params']
@@ -75,11 +74,11 @@ def get_pde_batch_cgle_causal(n_samples, cfg, device, t_prev, t_curr):
     x = torch.cat([x_center, x_uniform], dim=0)
     x = torch.clamp(x, x_min, x_max)
 
-    # 4. Échantillonnage Temporel Causal (30% passé, 70% front actif)
+    # 4. Échantillonnage Temporel Causal (20% Replay Buffer, 80% front actif)
     if t_prev <= 1e-5:
         t = torch.rand(n_samples, 1, device=device) * t_curr
     else:
-        n_past = int(0.3 * n_samples)
+        n_past = int(0.2 * n_samples)
         t_past = torch.rand(n_past, 1, device=device) * t_prev
         t_front = torch.rand(n_samples - n_past, 1, device=device) * (t_curr - t_prev) + t_prev
         t = torch.cat([t_past, t_front], dim=0)
@@ -93,7 +92,49 @@ def get_pde_batch_cgle_causal(n_samples, cfg, device, t_prev, t_curr):
 
     return branch, coords, params_dict
 
-# On garde get_rar_batch pour le worker
+def get_pde_batch_cgle_global(n_samples, cfg, device, t_max_local):
+    """
+    NOUVEAU : Générateur PDE Global (Uniforme sur tout [0, t_max_local]).
+    Utilisé pour la Rescue Loop et la boucle de polissage finale (sans notion de front).
+    """
+    b = cfg['physics']['bounds'] if isinstance(cfg, dict) else cfg.physics['bounds']
+    eq_p = cfg['physics']['equation_params'] if isinstance(cfg, dict) else cfg.physics['equation_params']
+    x_min, x_max = cfg['physics']['x_domain'] if isinstance(cfg, dict) else cfg.physics['x_domain']
+    
+    # 1. Equation Params
+    alpha = torch.rand(n_samples, 1, device=device) * (eq_p['alpha'][1] - eq_p['alpha'][0]) + eq_p['alpha'][0]
+    beta = torch.rand(n_samples, 1, device=device) * (eq_p['beta'][1] - eq_p['beta'][0]) + eq_p['beta'][0]
+    mu = torch.rand(n_samples, 1, device=device) * (eq_p['mu'][1] - eq_p['mu'][0]) + eq_p['mu'][0]
+    V = torch.rand(n_samples, 1, device=device) * (eq_p['V'][1] - eq_p['V'][0]) + eq_p['V'][0]
+
+    # 2. IC Params
+    A = torch.rand(n_samples, 1, device=device) * (b['A'][1] - b['A'][0]) + b['A'][0]
+    w0 = 10 ** (torch.rand(n_samples, 1, device=device) * np.log10(b['w0'][1]/b['w0'][0]) + np.log10(b['w0'][0]))
+    x0 = torch.rand(n_samples, 1, device=device) * (b['x0'][1] - b['x0'][0]) + b['x0'][0]
+    k_wav = torch.rand(n_samples, 1, device=device) * (b['k'][1] - b['k'][0]) + b['k'][0]
+    types = torch.zeros((n_samples, 1), device=device).float()
+    
+    branch = torch.cat([alpha, beta, mu, V, A, w0, x0, k_wav, types], dim=1)
+
+    # 3. Échantillonnage Spatial Focus (80% centre)
+    n_center = int(0.8 * n_samples)
+    x_center = x0[:n_center] + torch.randn(n_center, 1, device=device) * w0[:n_center] * 1.5
+    x_uniform = torch.rand(n_samples - n_center, 1, device=device) * (x_max - x_min) + x_min
+    x = torch.cat([x_center, x_uniform], dim=0)
+    x = torch.clamp(x, x_min, x_max)
+
+    # 4. Échantillonnage Temporel Uniforme
+    t = torch.rand(n_samples, 1, device=device) * t_max_local
+
+    # Shuffle final
+    idx = torch.randperm(n_samples)
+    branch, x, t = branch[idx], x[idx], t[idx]
+
+    coords = torch.cat([x, t], dim=1).requires_grad_(True)
+    params_dict = {"alpha": branch[:,0:1], "beta": branch[:,1:2], "mu": branch[:,2:3], "V": branch[:,3:4]}
+
+    return branch, coords, params_dict
+
 def get_rar_batch(model, cfg, device, t_prev, t_curr, n_candidates=10000, n_selected=2000):
     """Génère des points PDE là où le résidu est fort sur la zone temporelle actuelle."""
     b_p, c_p, p_p = get_pde_batch_cgle_causal(n_candidates, cfg, device, t_prev, t_curr)

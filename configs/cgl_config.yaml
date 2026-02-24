@@ -5,7 +5,7 @@ physics:
   # Domaine spatial réduit puisque la Gaussienne est centrée et s'étale peu
   x_domain: [-8.0, 8.0] 
   # Objectif long terme
-  t_max: 10.0
+  t_max: 5.0
   # Uniquement la Gaussienne
   initial_conditions: [0]
   bounds:
@@ -37,10 +37,9 @@ training:
   batch_size_pde: 16384    
   
   # Paramètres de la Trust-Region (Macro-Loops)
-  max_macro_loops: 6 
+  max_macro_loops: 3 
   
   weights:
-    # L'IC n'existe plus en Hard Constraint, il ne reste que la pénalité des bords
     bc_loss: 1.0
     
   target_error_global: 0.050   
@@ -51,15 +50,15 @@ time_marching:
   learning_rate: 2e-4  
   # Nouvelles zones adaptées pour T_max = 10.0
   zones:
-    - t_end: 1.0
+    - t_end: 0.5
       dt: 0.1
-      iters: 7000
-    - t_end: 5.0
+      iters: 10000
+    - t_end: 2.0
+      dt: 0.2
+      iters: 10000
+    - t_end: 3.0
       dt: 0.5
-      iters: 8000
-    - t_end: 7.0
-      dt: 1.0
-      iters: 9000
-    - t_end: 10.0
+      iters: 10000
+    - t_end: 5.0
       dt: 1.0
       iters: 10000
