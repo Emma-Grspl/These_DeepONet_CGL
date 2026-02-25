@@ -134,19 +134,17 @@ def run_audit(model, cfg, t_max, threshold=0.05, n_global=60, verbose=False, his
 # ==============================================================================
 # 2. LE WORKER ADAM (Optimiseur Persistant)
 # ==============================================================================
-def train_worker(model, optimizer, cfg, t_prev, t_curr, current_lr, n_iters, disable_rar=False, is_global=False):
+def train_worker(model, optimizer, cfg, t_prev, t_curr, current_lr, n_iters, disable_rar=False, is_global=False, target_error=0.05):
     king = KingOfTheHill(model)
     king.update(model, 1.0)
     
     bs_pde = cfg['training']['batch_size_pde']
     weights = cfg['training']['weights'].copy()
     
-    # Mise à jour manuelle du LR sur l'optimiseur persistant
     for param_group in optimizer.param_groups:
         param_group['lr'] = current_lr
         
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=2000, gamma=0.5)
-    
     rar_active = False
     rar_b, rar_c, rar_p = None, None, None
     
@@ -156,13 +154,11 @@ def train_worker(model, optimizer, cfg, t_prev, t_curr, current_lr, n_iters, dis
     for i in pbar:
         device = next(model.parameters()).device
         
-        # Choix du générateur (Local/Causal vs Global/Rescue)
         if is_global:
             b_p, c_p, p_p = get_pde_batch_cgle_global(bs_pde, cfg, device, t_curr)
         else:
             b_p, c_p, p_p = get_pde_batch_cgle_causal(bs_pde, cfg, device, t_prev, t_curr)
         
-        # RAR Injection
         if rar_active and rar_b is not None and b_p is not None:
             b_p = torch.cat([b_p, rar_b], dim=0)
             c_p = torch.cat([c_p, rar_c], dim=0)
@@ -170,11 +166,9 @@ def train_worker(model, optimizer, cfg, t_prev, t_curr, current_lr, n_iters, dis
 
         optimizer.zero_grad(set_to_none=True)
 
-        # Résidu PDE
         rr, ri = pde_residual_cgle(model, b_p, c_p, p_p, cfg)
         l_pde = torch.mean(rr**2 + ri**2)
         
-        # BC Neumann
         idx_bc = torch.randperm(b_p.size(0))[:int(b_p.size(0)*0.25)]
         b_bc = b_p[idx_bc]
         c_bc_base = c_p[idx_bc].detach().clone()
@@ -190,12 +184,10 @@ def train_worker(model, optimizer, cfg, t_prev, t_curr, current_lr, n_iters, dis
         grads_i = torch.autograd.grad(ui_bc.sum(), c_all_bc, create_graph=True)[0]
         loss_bc = torch.mean(grads_r[:, 0:1]**2 + grads_i[:, 0:1]**2)
 
-        # Loss totale
         loss = l_pde + weights.get('bc_loss', 1.0) * loss_bc
 
         if loss.item() > 10000:
             raise ValueError(f"Loss gigantesque ({loss.item():.2e} > 10^4).")
-            
         if torch.isnan(loss) or torch.isinf(loss):
             raise ValueError("Loss est devenue NaN ou Inf.")
             
@@ -210,53 +202,56 @@ def train_worker(model, optimizer, cfg, t_prev, t_curr, current_lr, n_iters, dis
                 rar_b, rar_c, rar_p = get_rar_batch(model, cfg, device, t_prev, t_curr)
                 
         if i % 1000 == 0:
-            target = cfg['training'].get('target_error_global', 0.04)
-            _, score = run_audit(model, cfg, t_curr, threshold=target, verbose=False, historical=is_global)
+            _, score = run_audit(model, cfg, t_curr, threshold=target_error, verbose=False, historical=is_global)
             king.update(model, score)
             
             if i > 0:
                 tqdm.write(f"📊 [It {i}] Loss Totale: {loss.item():.2e} (PDE: {l_pde.item():.2e}) | L2 Audit: {score:.2%} | LR: {scheduler.get_last_lr()[0]:.1e}")
+                
+                # --- L'ARRÊT PRÉMATURÉ EST ICI ---
+                if score < target_error:
+                    tqdm.write(f"    🎯 Cible atteinte ({score:.2%} < {target_error:.2%}) ! Arrêt anticipé.")
+                    break
 
     king.restore(model) 
     return king.best_score
-
 # ==============================================================================
 # 3. LE DIAGNOSTIC (Fail-Fast)
 # ==============================================================================
 def run_diagnostic(model, optimizer, cfg, t_prev, t_curr, base_lr):
     print(f"    🛡️ Diagnostic (4000 it) de {t_prev:.3f} à {t_curr:.3f}...")
     diag_state = copy.deepcopy(model.state_dict())
-    diag_opt_state = copy.deepcopy(optimizer.state_dict()) # Sauvegarde d'Adam
+    diag_opt_state = copy.deepcopy(optimizer.state_dict())
     
-    target = cfg['training'].get('target_error_global', 0.04)
+    target = cfg['training'].get('target_error_global', 0.05)
     _, score_in = run_audit(model, cfg, t_curr, threshold=target, verbose=False)
     
     try:
-        score_out = train_worker(model, optimizer, cfg, t_prev, t_curr, base_lr, 4000, disable_rar=True)
+        # On passe 'target' au worker pour qu'il puisse s'arrêter tôt
+        score_out = train_worker(model, optimizer, cfg, t_prev, t_curr, base_lr, 4000, disable_rar=True, target_error=target)
     except Exception as e:
         print(f"      💥 Erreur ou vraie explosion pendant le Diag : {str(e)}")
         model.load_state_dict(diag_state)
         optimizer.load_state_dict(diag_opt_state)
-        return False, "reduce_dt"
+        return False, "reduce_dt", float('inf')
 
     model.load_state_dict(diag_state)
-    optimizer.load_state_dict(diag_opt_state) # Rollback intégral pour préserver les momentums
+    optimizer.load_state_dict(diag_opt_state) 
     
     if score_out > score_in * 2.0 and score_in < 0.10:
         print(f"      ⚠️ Destruction (In: {score_in:.1%} -> Out: {score_out:.1%}). LR et dt trop grands.")
-        return False, "reduce_both"
+        return False, "reduce_both", score_out
     elif score_out > 0.50:
         print("      ⚠️ Stagnation extrême.")
-        return False, "reduce_dt"
+        return False, "reduce_dt", score_out
         
     print(f"      ✅ Diag OK (Score projeté: {score_out:.1%}).")
-    return True, "ok"
-
+    return True, "ok", score_out
 # ==============================================================================
 # 4. LA MACRO LOOP (Sans L-BFGS)
 # ==============================================================================
 def run_macro_loop(model, optimizer, cfg, t_prev, t_curr, base_lr, n_iters, is_global=False):
-    target = cfg['training'].get('target_error_global', 0.04)
+    target = cfg['training'].get('target_error_global', 0.05)
     max_loops = cfg['training'].get('max_macro_loops', 3)
     
     base_state = copy.deepcopy(model.state_dict())
@@ -269,7 +264,7 @@ def run_macro_loop(model, optimizer, cfg, t_prev, t_curr, base_lr, n_iters, is_g
         model.load_state_dict(base_state) 
         optimizer.load_state_dict(base_opt_state)
         
-        adam_score = train_worker(model, optimizer, cfg, t_prev, t_curr, current_lr, n_iters, is_global=is_global)
+        adam_score = train_worker(model, optimizer, cfg, t_prev, t_curr, current_lr, n_iters, is_global=is_global, target_error=target)
         print(f"      👉 Fin Adam : L2 = {adam_score:.2%}")
         
         if adam_score < target:
@@ -362,12 +357,29 @@ def train_navigator(model, cfg, explicit_resume_path=None):
             easy_win_streak = 0
             
             # --- 2. Diagnostic (Fail-Fast) ---
-            diag_ok, action = run_diagnostic(model, optimizer, cfg, t_prev, t_curr, base_lr)
+            diag_ok, action, diag_score = run_diagnostic(model, optimizer, cfg, t_prev, t_curr, base_lr)
             if not diag_ok:
                 if action == "reduce_both": base_lr *= 0.75; dt *= 0.75
                 elif action == "reduce_dt": dt *= 0.75
                 print(f"    🔄 Repli tactique : dt={dt:.4f}, LR={base_lr:.1e}")
                 continue
+            
+            # COURT-CIRCUIT : Le diagnostic a fait tout le travail !
+            if diag_score < target:
+                print(f"    ⚡ Validation Express ! Le diagnostic a suffi ({diag_score:.2%}).")
+                step_validated = True
+                
+            else:
+                # --- 3. Macro Loop (Local) ---
+                iters = get_zone_config(t_curr, cfg)
+                success, final_score = run_macro_loop(model, optimizer, cfg, t_prev, t_curr, base_lr, iters, is_global=False)
+                
+                if success:
+                    print(f"    ✅ Pas validé avec {final_score:.2%}")
+                    step_validated = True
+                else:
+                    print("    🛑 Échec de la Macro-Loop locale. Réduction de dt.")
+                    dt *= 0.75
                 
             # --- 3. Macro Loop (Local) ---
             iters = get_zone_config(t_curr, cfg)

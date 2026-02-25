@@ -42,7 +42,7 @@ training:
   weights:
     bc_loss: 1.0
     
-  target_error_global: 0.050   
+  target_error_global: 0.030   
   save_dir: "results/CGL_HardConstraint_Run"
 
 time_marching:
