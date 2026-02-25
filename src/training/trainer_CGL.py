@@ -250,33 +250,50 @@ def run_diagnostic(model, optimizer, cfg, t_prev, t_curr, base_lr):
 # ==============================================================================
 # 4. LA MACRO LOOP (Sans L-BFGS)
 # ==============================================================================
+# ==============================================================================
+# 4. LA MACRO LOOP (Continuité Intelligente)
+# ==============================================================================
 def run_macro_loop(model, optimizer, cfg, t_prev, t_curr, base_lr, n_iters, is_global=False):
-    target = cfg['training'].get('target_error_global', 0.05)
+    target = cfg['training'].get('target_error_global', 0.04)
     max_loops = cfg['training'].get('max_macro_loops', 3)
     
+    # Points de sauvegarde de sécurité initiale
     base_state = copy.deepcopy(model.state_dict())
     base_opt_state = copy.deepcopy(optimizer.state_dict())
     
     current_lr = base_lr
     
     for loop in range(max_loops):
-        print(f"\n    🔄 Macro-Loop {loop+1}/{max_loops} | LR: {current_lr:.1e}")
-        model.load_state_dict(base_state) 
-        optimizer.load_state_dict(base_opt_state)
+        print(f"\n    🔄 Macro-Loop {loop+1}/{max_loops} | LR de départ: {current_lr:.1e}")
         
+        # Le train_worker gère désormais son arrêt prématuré grâce au 'target_error'
         adam_score = train_worker(model, optimizer, cfg, t_prev, t_curr, current_lr, n_iters, is_global=is_global, target_error=target)
         print(f"      👉 Fin Adam : L2 = {adam_score:.2%}")
         
         if adam_score < target:
             return True, adam_score
             
-        print("      ⚠️ Adam insuffisant. Nouvelle boucle avec LR*0.75.")
-        current_lr *= 0.75
+        # --- ÉVALUATION DE L'ÉCHEC ---
+        if adam_score > 0.15:
+            # Échec critique (Divergence) : On annule tout et on recommence depuis le début du pas temporel
+            print("      ⚠️ Divergence détectée. Rollback des poids et réduction du LR.")
+            model.load_state_dict(base_state)
+            optimizer.load_state_dict(base_opt_state)
+            current_lr *= 0.5 
+        else:
+            # Near Miss (Proche du but) : On garde les poids acquis !
+            print("      ⚠️ Proche du but. Conservation des poids pour affinage.")
+            
+            # On récupère le TOUT DERNIER LR utilisé par Adam à la fin du worker précédent
+            last_lr = optimizer.param_groups[0]['lr']
+            # On le réduit légèrement pour l'affinage
+            current_lr = last_lr * 0.75 
+            print(f"      📉 Nouveau LR adapté : {current_lr:.1e}")
 
+    # Si on épuise toutes les boucles sans succès, on sécurise en restaurant l'état avant le pas
     model.load_state_dict(base_state)
     optimizer.load_state_dict(base_opt_state)
     return False, float('inf')
-
 # ==============================================================================
 # 5. POLISSAGE FINAL (Adam Global + L-BFGS)
 # ==============================================================================
