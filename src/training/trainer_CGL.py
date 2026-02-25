@@ -317,7 +317,11 @@ def train_navigator(model, cfg, explicit_resume_path=None):
     os.makedirs(save_dir, exist_ok=True)
     
     t_prev = 0.0
-    dt = 0.005 
+    
+    # --- CORRECTION ICI ---
+    dt = float(cfg['time_marching']['zones'][0]['dt']) 
+    # ----------------------
+    
     t_max = cfg['physics']['t_max']
     base_lr = float(cfg['time_marching'].get('learning_rate', 2e-4))
     
