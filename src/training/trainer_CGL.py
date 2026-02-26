@@ -132,21 +132,31 @@ def run_audit(model, cfg, t_max, threshold=0.05, n_global=60, verbose=False, his
     return (score < threshold), score
 
 # ==============================================================================
-# 2. LE WORKER ADAM (Optimiseur Persistant)
+# 2. LE WORKER ADAM UNIQUE & ADAPTATIF
 # ==============================================================================
-def train_worker(model, optimizer, cfg, t_prev, t_curr, current_lr, n_iters, disable_rar=False, is_global=False, target_error=0.05):
+def train_step_adaptive(model, optimizer, cfg, t_prev, t_curr, base_lr, n_iters, is_global=False):
     king = KingOfTheHill(model)
     king.update(model, 1.0)
     
     bs_pde = cfg['training']['batch_size_pde']
     weights = cfg['training']['weights'].copy()
     
+    # Réinitialisation du LR de départ pour ce pas
     for param_group in optimizer.param_groups:
-        param_group['lr'] = current_lr
+        param_group['lr'] = base_lr
         
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=2000, gamma=0.5)
+    # --- TA STRATÉGIE GRADUELLE ---
+    # Baisse douce : * 0.8 toutes les 2000 itérations
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=2000, gamma=0.8)
+    
     rar_active = False
     rar_b, rar_c, rar_p = None, None, None
+    
+    # Cibles dynamiques
+    target_strict = cfg['training'].get('target_error_global', 0.03) 
+    target_relaxed = target_strict + 0.005 # Relaxation à +0.5%
+    current_target = target_strict
+    relax_threshold_iter = n_iters // 2 # On relaxe à mi-parcours
     
     mode_tag = "[Adam Global]" if is_global else f"[Adam] dt={t_curr-t_prev:.4f}"
     pbar = tqdm(range(n_iters), desc=f"  👷 {mode_tag}", leave=False)
@@ -154,6 +164,11 @@ def train_worker(model, optimizer, cfg, t_prev, t_curr, current_lr, n_iters, dis
     for i in pbar:
         device = next(model.parameters()).device
         
+        # --- RELAXATION DE LA CIBLE ---
+        if i == relax_threshold_iter:
+            current_target = target_relaxed
+            tqdm.write(f"    ⚠️ Mi-parcours atteint. Cible relaxée à {current_target:.2%}")
+
         if is_global:
             b_p, c_p, p_p = get_pde_batch_cgle_global(bs_pde, cfg, device, t_curr)
         else:
@@ -196,25 +211,28 @@ def train_worker(model, optimizer, cfg, t_prev, t_curr, current_lr, n_iters, dis
         optimizer.step()
         scheduler.step()
         
-        if not disable_rar and i > 0 and i % 2000 == 0:
+        # RAR toutes les 2000 itérations
+        if i > 0 and i % 2000 == 0:
             if i >= n_iters // 4:
                 rar_active = True
                 rar_b, rar_c, rar_p = get_rar_batch(model, cfg, device, t_prev, t_curr)
                 
+        # Audit toutes les 1000 itérations
         if i % 1000 == 0:
-            _, score = run_audit(model, cfg, t_curr, threshold=target_error, verbose=False, historical=is_global)
+            _, score = run_audit(model, cfg, t_curr, threshold=current_target, verbose=False, historical=is_global)
             king.update(model, score)
             
             if i > 0:
-                tqdm.write(f"📊 [It {i}] Loss Totale: {loss.item():.2e} (PDE: {l_pde.item():.2e}) | L2 Audit: {score:.2%} | LR: {scheduler.get_last_lr()[0]:.1e}")
+                tqdm.write(f"📊 [It {i}] Loss: {loss.item():.2e} | L2: {score:.2%} (Cible: {current_target:.2%}) | LR: {scheduler.get_last_lr()[0]:.1e}")
                 
-                # --- L'ARRÊT PRÉMATURÉ EST ICI ---
-                if score < target_error:
-                    tqdm.write(f"    🎯 Cible atteinte ({score:.2%} < {target_error:.2%}) ! Arrêt anticipé.")
-                    break
+                # --- ARRÊT PRÉMATURÉ ---
+                if score < current_target:
+                    tqdm.write(f"    🎯 Cible atteinte ({score:.2%} < {current_target:.2%}) ! Arrêt anticipé.")
+                    king.restore(model)
+                    return True, score
 
     king.restore(model) 
-    return king.best_score
+    return False, king.best_score
 # ==============================================================================
 # 3. LE DIAGNOSTIC (Fail-Fast)
 # ==============================================================================
@@ -247,53 +265,7 @@ def run_diagnostic(model, optimizer, cfg, t_prev, t_curr, base_lr):
         
     print(f"      ✅ Diag OK (Score projeté: {score_out:.1%}).")
     return True, "ok", score_out
-# ==============================================================================
-# 4. LA MACRO LOOP (Sans L-BFGS)
-# ==============================================================================
-# ==============================================================================
-# 4. LA MACRO LOOP (Continuité Intelligente)
-# ==============================================================================
-def run_macro_loop(model, optimizer, cfg, t_prev, t_curr, base_lr, n_iters, is_global=False):
-    target = cfg['training'].get('target_error_global', 0.04)
-    max_loops = cfg['training'].get('max_macro_loops', 3)
-    
-    # Points de sauvegarde de sécurité initiale
-    base_state = copy.deepcopy(model.state_dict())
-    base_opt_state = copy.deepcopy(optimizer.state_dict())
-    
-    current_lr = base_lr
-    
-    for loop in range(max_loops):
-        print(f"\n    🔄 Macro-Loop {loop+1}/{max_loops} | LR de départ: {current_lr:.1e}")
-        
-        # Le train_worker gère désormais son arrêt prématuré grâce au 'target_error'
-        adam_score = train_worker(model, optimizer, cfg, t_prev, t_curr, current_lr, n_iters, is_global=is_global, target_error=target)
-        print(f"      👉 Fin Adam : L2 = {adam_score:.2%}")
-        
-        if adam_score < target:
-            return True, adam_score
-            
-        # --- ÉVALUATION DE L'ÉCHEC ---
-        if adam_score > 0.15:
-            # Échec critique (Divergence) : On annule tout et on recommence depuis le début du pas temporel
-            print("      ⚠️ Divergence détectée. Rollback des poids et réduction du LR.")
-            model.load_state_dict(base_state)
-            optimizer.load_state_dict(base_opt_state)
-            current_lr *= 0.5 
-        else:
-            # Near Miss (Proche du but) : On garde les poids acquis !
-            print("      ⚠️ Proche du but. Conservation des poids pour affinage.")
-            
-            # On récupère le TOUT DERNIER LR utilisé par Adam à la fin du worker précédent
-            last_lr = optimizer.param_groups[0]['lr']
-            # On le réduit légèrement pour l'affinage
-            current_lr = last_lr * 0.75 
-            print(f"      📉 Nouveau LR adapté : {current_lr:.1e}")
 
-    # Si on épuise toutes les boucles sans succès, on sécurise en restaurant l'état avant le pas
-    model.load_state_dict(base_state)
-    optimizer.load_state_dict(base_opt_state)
-    return False, float('inf')
 # ==============================================================================
 # 5. POLISSAGE FINAL (Adam Global + L-BFGS)
 # ==============================================================================
@@ -324,16 +296,15 @@ def run_polishing_loop(model, optimizer, cfg, t_max):
 # ==============================================================================
 # 6. LE NAVIGATEUR
 # ==============================================================================
+# ==============================================================================
+# 6. LE NAVIGATEUR
+# ==============================================================================
 def train_navigator(model, cfg, explicit_resume_path=None):
     save_dir = cfg['training'].get('save_dir', "outputs/checkpoints")
     os.makedirs(save_dir, exist_ok=True)
     
     t_prev = 0.0
-    
-    # --- CORRECTION ICI ---
     dt = float(cfg['time_marching']['zones'][0]['dt']) 
-    # ----------------------
-    
     t_max = cfg['physics']['t_max']
     base_lr = float(cfg['time_marching'].get('learning_rate', 2e-4))
     
@@ -374,6 +345,8 @@ def train_navigator(model, cfg, explicit_resume_path=None):
             easy_win_streak = 0
             
             # --- 2. Diagnostic (Fail-Fast) ---
+            # (Note: Tu l'as laissé, il fera 4000 itérations avec arrêt prématuré. S'il ne réussit pas, 
+            # il n'aura rien coûté car il a désactivé le RAR, donc c'est un bon "échauffement").
             diag_ok, action, diag_score = run_diagnostic(model, optimizer, cfg, t_prev, t_curr, base_lr)
             if not diag_ok:
                 if action == "reduce_both": base_lr *= 0.75; dt *= 0.75
@@ -387,27 +360,17 @@ def train_navigator(model, cfg, explicit_resume_path=None):
                 step_validated = True
                 
             else:
-                # --- 3. Macro Loop (Local) ---
+                # --- 3. La GRANDE Boucle Adaptative ---
+                # (On a remplacé run_macro_loop par train_step_adaptive)
                 iters = get_zone_config(t_curr, cfg)
-                success, final_score = run_macro_loop(model, optimizer, cfg, t_prev, t_curr, base_lr, iters, is_global=False)
+                success, final_score = train_step_adaptive(model, optimizer, cfg, t_prev, t_curr, base_lr, iters, is_global=False)
                 
                 if success:
                     print(f"    ✅ Pas validé avec {final_score:.2%}")
                     step_validated = True
                 else:
-                    print("    🛑 Échec de la Macro-Loop locale. Réduction de dt.")
+                    print("    🛑 Échec de la boucle adaptative. Réduction de dt.")
                     dt *= 0.75
-                
-            # --- 3. Macro Loop (Local) ---
-            iters = get_zone_config(t_curr, cfg)
-            success, final_score = run_macro_loop(model, optimizer, cfg, t_prev, t_curr, base_lr, iters, is_global=False)
-            
-            if success:
-                print(f"    ✅ Pas validé avec {final_score:.2%}")
-                step_validated = True
-            else:
-                print("    🛑 Échec de la Macro-Loop locale. Réduction de dt.")
-                dt *= 0.75
                 
         # --- 4. Validation Historique & Rescue Loop ---
         if step_validated:
@@ -416,8 +379,8 @@ def train_navigator(model, cfg, explicit_resume_path=None):
             
             if not hist_ok:
                 print(f"    ⚠️ Oubli catastrophique détecté (Audit Histo: {hist_score:.2%}). Lancement Rescue Loop.")
-                # Entraînement global d'urgence sur [0, t_curr]
-                success_rescue, _ = run_macro_loop(model, optimizer, cfg, 0.0, t_curr, base_lr, 5000, is_global=True)
+                # Entraînement global d'urgence sur [0, t_curr] (10000 itérations suffisent généralement)
+                success_rescue, _ = train_step_adaptive(model, optimizer, cfg, 0.0, t_curr, base_lr, 10000, is_global=True)
                 if not success_rescue:
                     print("    🛑 La Rescue Loop a peiné, mais on sauvegarde et on avance prudemment.")
                     dt *= 0.75

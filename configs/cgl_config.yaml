@@ -33,11 +33,11 @@ model:
 
 training:
   # Gros batchs maintenus pour une exploration robuste de la PDE
-  batch_size_ic: 16384    
-  batch_size_pde: 16384    
+  batch_size_ic: 8192    
+  batch_size_pde: 8192    
   
   # Paramètres de la Trust-Region (Macro-Loops)
-  max_macro_loops: 3 
+  max_macro_loops: 1 #on s'en fiche logiquement
   
   weights:
     bc_loss: 1.0
@@ -52,13 +52,13 @@ time_marching:
   zones:
     - t_end: 0.5
       dt: 0.1
-      iters: 10000
+      iters: 20000
     - t_end: 2.0
       dt: 0.2
-      iters: 10000
+      iters: 20000
     - t_end: 3.0
       dt: 0.5
-      iters: 10000
+      iters: 20000
     - t_end: 5.0
       dt: 1.0
-      iters: 10000
+      iters: 30000
