@@ -135,7 +135,7 @@ def run_audit(model, cfg, t_max, threshold=0.05, n_global=60, verbose=False, his
 # ==============================================================================
 # 2. LE WORKER ADAM UNIQUE & ADAPTATIF
 # ==============================================================================
-def train_step_adaptive(model, optimizer, cfg, t_prev, t_curr, base_lr, n_iters, is_global=False, disable_rar=False, target_error=0.03):
+def train_step_adaptive(model, optimizer, cfg, t_prev, t_curr, base_lr, n_iters, is_global=False, disable_rar=False, target_error=0.03, allow_relaxation=True):
     king = KingOfTheHill(model)
     king.update(model, 1.0)
     
@@ -166,7 +166,7 @@ def train_step_adaptive(model, optimizer, cfg, t_prev, t_curr, base_lr, n_iters,
         device = next(model.parameters()).device
         
         # --- RELAXATION DE LA CIBLE ---
-        if i == relax_threshold_iter:
+        if allow_relaxation and i == relax_threshold_iter:
             current_target = target_relaxed
             tqdm.write(f"    ⚠️ Mi-parcours atteint. Cible relaxée à {current_target:.2%}")
 
@@ -247,7 +247,7 @@ def run_diagnostic(model, optimizer, cfg, t_prev, t_curr, base_lr):
     _, score_in = run_audit(model, cfg, t_curr, threshold=target, verbose=False)
     
     try:
-        _, score_out = train_step_adaptive(model, optimizer, cfg, t_prev, t_curr, base_lr, 4000, disable_rar=True, target_error=target)
+        _, score_out = train_step_adaptive(model, optimizer, cfg, t_prev, t_curr, base_lr, 4000, disable_rar=True, target_error=target, allow_relaxation=False)
     except Exception as e:
         print(f"      💥 Erreur ou vraie explosion pendant le Diag : {str(e)}")
         model.load_state_dict(diag_state)
@@ -275,7 +275,7 @@ def run_polishing_loop(model, optimizer, cfg, t_max):
     device = next(model.parameters()).device
     
     print("\n    🧹 Dégrossissage Adam Global...")
-    train_step_adaptive(model, optimizer, cfg, 0.0, t_max, 5e-5, 8000, is_global=True, target_error=target)
+    train_step_adaptive(model, optimizer, cfg, 0.0, t_max, 5e-5, 8000, is_global=True, target_error=target, allow_relaxation=False)
     
     print("    ⚙️ Finition au scalpel L-BFGS...")
     lbfgs = optim.LBFGS(model.parameters(), lr=0.5, max_iter=50)
@@ -373,7 +373,7 @@ def train_navigator(model, cfg, explicit_resume_path=None):
             
             if not hist_ok:
                 print(f"    ⚠️ Oubli catastrophique détecté (Audit Histo: {hist_score:.2%}). Lancement Rescue Loop.")
-                success_rescue, _ = train_step_adaptive(model, optimizer, cfg, 0.0, t_curr, base_lr, 10000, is_global=True, target_error=target)
+                success_rescue, _ = train_step_adaptive(model, optimizer, cfg, 0.0, t_curr, base_lr, 10000, is_global=True, target_error=target, allow_relaxation=False)
                 if not success_rescue:
                     print("    🛑 La Rescue Loop a peiné, mais on sauvegarde et on avance prudemment.")
                     dt *= 0.75
