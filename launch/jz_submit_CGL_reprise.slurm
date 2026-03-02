@@ -32,4 +32,4 @@ nvidia-smi
 
 # 5. Lancement
 # Note : Python va créer automatiquement results/CGL_run_DATE/
-srun python scripts/train_cgl.py --resume latest --config configs/cgl_config.yaml
+srun python scripts/train_cgl_resume.py --resume CGL_Navigator_Run_20260227-160743 --config configs/cgl_config.yaml

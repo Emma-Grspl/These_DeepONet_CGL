@@ -16,7 +16,7 @@ def save_checkpoint_cgl(model, optimizer, t, ckpt_dir, name=None):
     """ Sauvegarde complète de la physique, des poids et de la dynamique d'entraînement """
     os.makedirs(ckpt_dir, exist_ok=True)
     
-    # Capture de l'état global (gère le cas où l'optimiseur n'est pas passé)
+    # Capture de l'état global
     state = {
         'model_state': model.state_dict(),
         't_curr': t
@@ -25,10 +25,10 @@ def save_checkpoint_cgl(model, optimizer, t, ckpt_dir, name=None):
         state['optimizer_state'] = optimizer.state_dict()
     
     # 1. Historique : Sauvegarde du fichier spécifique à ce temps t
-    if name is None:
-        file_name = f"model_t_{t:.3f}.pth"
-        save_path = os.path.join(ckpt_dir, file_name)
-        torch.save(state, save_path)
+    # CORRECTION : On utilise 'name' s'il existe, sinon on prend la valeur par défaut
+    file_name = name if name is not None else f"model_t_{t:.4f}.pth"
+    save_path = os.path.join(ckpt_dir, file_name)
+    torch.save(state, save_path)
     
     # 2. Reprise : Mise à jour constante du point de reprise automatique
     latest_path = os.path.join(ckpt_dir, "model_latest.pth")
@@ -61,9 +61,25 @@ def get_zone_config(t_target, cfg):
     if selected_iters < 100: selected_iters = 5000
     return selected_iters
 
-def find_latest_checkpoint(ckpt_dir):
-    if not os.path.exists(ckpt_dir): return None, 0.0
-    files = glob.glob(os.path.join(ckpt_dir, "ckpt_t*.pth"))
+def find_latest_checkpoint(ckpt_dir_or_file):
+    """
+    Si on donne un dossier, cherche le plus grand ckpt_tXXX.pth.
+    Si on donne un fichier .pth (ex: model_latest.pth), le charge directement.
+    """
+    if not os.path.exists(ckpt_dir_or_file):
+        return None, 0.0
+        
+    # Si c'est directement un fichier
+    if os.path.isfile(ckpt_dir_or_file) and ckpt_dir_or_file.endswith('.pth'):
+        try:
+            ckpt = torch.load(ckpt_dir_or_file, map_location='cpu')
+            t_curr = ckpt.get('t_curr', 0.0) # Récupère le temps s'il existe
+            return ckpt_dir_or_file, t_curr
+        except:
+            return None, 0.0
+
+    # Si c'est un dossier (comportement classique)
+    files = glob.glob(os.path.join(ckpt_dir_or_file, "ckpt_t*.pth"))
     if not files: return None, 0.0
     max_t = -1.0; best_file = None
     for f in files:
@@ -297,8 +313,13 @@ def run_polishing_loop(model, optimizer, cfg, t_max):
 # ==============================================================================
 # 5. LE NAVIGATEUR
 # ==============================================================================
+# ==============================================================================
+# 5. LE NAVIGATEUR
+# ==============================================================================
 def train_navigator(model, cfg, explicit_resume_path=None):
-    save_dir = cfg['training'].get('save_dir', "outputs/checkpoints")
+    # On force l'utilisation du dossier checkpoints si tu veux la même structure
+    base_save_dir = cfg['training'].get('save_dir', "outputs/CGL_Run")
+    save_dir = os.path.join(base_save_dir, "checkpoints")
     os.makedirs(save_dir, exist_ok=True)
     
     t_prev = 0.0
@@ -306,22 +327,37 @@ def train_navigator(model, cfg, explicit_resume_path=None):
     t_max = cfg['physics']['t_max']
     base_lr = float(cfg['time_marching'].get('learning_rate', 2e-4))
     
-    # Création de l'Optimiseur Persistant
     optimizer = optim.Adam(model.parameters(), lr=base_lr)
     
-    latest_ckpt, resume_t = find_latest_checkpoint(save_dir)
+    # --- LOGIQUE DE REPRISE CORRIGÉE ---
+    # Si tu as fourni un chemin explicite (ex: model_latest.pth), on l'utilise.
+    # Sinon, on fouille dans le dossier de sauvegarde actuel.
+    target_path = explicit_resume_path if explicit_resume_path else save_dir
+    latest_ckpt, resume_t = find_latest_checkpoint(target_path)
+    
     if latest_ckpt:
-        print(f"🔄 REPRISE : {os.path.basename(latest_ckpt)} (t={resume_t:.4f})")
-        ckpt = torch.load(latest_ckpt)
-        model.load_state_dict(ckpt['model_state'] if 'model_state' in ckpt else ckpt)
+        print(f"🔄 REPRISE DEPUIS : {latest_ckpt} (Temps détecté: t={resume_t:.4f})")
+        ckpt = torch.load(latest_ckpt, map_location='cuda' if torch.cuda.is_available() else 'cpu')
+        
+        # Gestion des différentes structures de dictionnaires possibles
+        if 'model_state' in ckpt:
+            model.load_state_dict(ckpt['model_state'])
+        elif 'model' in ckpt:
+            model.load_state_dict(ckpt['model'])
+        else:
+            model.load_state_dict(ckpt) # Cas où seuls les poids sont sauvés
+            
         if 'optimizer_state' in ckpt:
             optimizer.load_state_dict(ckpt['optimizer_state'])
+            
         t_prev = resume_t
+    # -----------------------------------
         
     easy_win_streak = 0
     target = cfg['training'].get('target_error_global', 0.03)
 
     print("\n🧭 [Navigator] Démarrage de la séquence (Hard Constraint).")
+    
 
     while t_prev < t_max:
         t_curr = min(t_prev + dt, t_max)
