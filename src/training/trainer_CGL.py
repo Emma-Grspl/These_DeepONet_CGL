@@ -292,7 +292,10 @@ def train_step_adaptive(model, optimizer, cfg, t_prev, t_curr, base_lr, n_iters,
 # ==============================================================================
 def run_diagnostic(model, optimizer, cfg, t_prev, t_curr, base_lr):
     print(f"    🛡️ Diagnostic (4000 it) de {t_prev:.3f} à {t_curr:.3f}...")
-    diag_state = copy.deepcopy(model.state_dict())
+    
+    # 📌 CORRECTIF MÉMOIRE: deepcopy STRICT des états pour éviter toute fuite (leak)
+    # PyTorch modifie in-place les tenseurs dans le state_dict si on ne force pas la copie complète.
+    diag_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
     diag_opt_state = copy.deepcopy(optimizer.state_dict())
     
     target = cfg['training'].get('target_error_global', 0.05)
@@ -306,6 +309,7 @@ def run_diagnostic(model, optimizer, cfg, t_prev, t_curr, base_lr):
         optimizer.load_state_dict(diag_opt_state)
         return False, "reduce_dt", float('inf')
 
+    # 📌 RESTAURATION EXACTE DE L'ÉTAT INITIAL DU DIAGNOSTIC
     model.load_state_dict(diag_state)
     optimizer.load_state_dict(diag_opt_state) 
     
