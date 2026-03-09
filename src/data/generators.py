@@ -74,11 +74,11 @@ def get_pde_batch_cgle_causal(n_samples, cfg, device, t_prev, t_curr):
     x = torch.cat([x_center, x_uniform], dim=0)
     x = torch.clamp(x, x_min, x_max)
 
-    # 4. Échantillonnage Temporel Causal (20% Replay Buffer, 80% front actif)
+    # 4. Échantillonnage Temporel Causal (30% Replay Buffer, 70% front actif)
     if t_prev <= 1e-5:
         t = torch.rand(n_samples, 1, device=device) * t_curr
     else:
-        n_past = int(0.2 * n_samples)
+        n_past = int(0.3 * n_samples)
         t_past = torch.rand(n_past, 1, device=device) * t_prev
         t_front = torch.rand(n_samples - n_past, 1, device=device) * (t_curr - t_prev) + t_prev
         t = torch.cat([t_past, t_front], dim=0)

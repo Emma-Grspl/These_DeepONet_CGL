@@ -151,7 +151,7 @@ def run_audit(model, cfg, t_max, threshold=0.05, n_global=60, verbose=False, his
 # ==============================================================================
 # 2. LE WORKER ADAM UNIQUE & ADAPTATIF
 # ==============================================================================
-def train_step_adaptive(model, optimizer, cfg, t_prev, t_curr, base_lr, n_iters, is_global=False, disable_rar=False, target_error=0.03, allow_relaxation=True):
+def train_step_adaptive(model, optimizer, cfg, t_prev, t_curr, base_lr, n_iters, is_global=False, disable_rar=False, target_error=0.03, allow_relaxation=True, fast_fail_diagnostic=False):
     king = KingOfTheHill(model)
     king.update(model, 1.0)
     
@@ -177,6 +177,14 @@ def train_step_adaptive(model, optimizer, cfg, t_prev, t_curr, base_lr, n_iters,
     
     mode_tag = "[Adam Global]" if is_global else f"[Adam] dt={t_curr-t_prev:.4f}"
     pbar = tqdm(range(n_iters), desc=f"  👷 {mode_tag}", leave=False)
+    
+    
+    # --- RELOBRALO (EMA) ---
+    ema_alpha = 0.999 # Lissage temporel
+    w_pde = 1.0
+    w_bc = 1.0
+    loss_pde_ema = None
+    loss_bc_ema = None
     
     for i in pbar:
         device = next(model.parameters()).device
@@ -216,7 +224,28 @@ def train_step_adaptive(model, optimizer, cfg, t_prev, t_curr, base_lr, n_iters,
         grads_i = torch.autograd.grad(ui_bc.sum(), c_all_bc, create_graph=True)[0]
         loss_bc = torch.mean(grads_r[:, 0:1]**2 + grads_i[:, 0:1]**2)
 
-        loss = l_pde + weights.get('bc_loss', 1.0) * loss_bc
+        
+        # --- RELOBRALO : Mise à jour des EMA et Poids ---
+        with torch.no_grad():
+            if loss_pde_ema is None:
+                loss_pde_ema = l_pde.item()
+                loss_bc_ema = loss_bc.item()
+            else:
+                loss_pde_ema = ema_alpha * loss_pde_ema + (1 - ema_alpha) * l_pde.item()
+                loss_bc_ema = ema_alpha * loss_bc_ema + (1 - ema_alpha) * loss_bc.item()
+            
+            # Équilibrage réactif : Le poids d'une loss augmente si sa norme EMA est plus grande (ou vice-versa).
+            # Formule ultra-stable : w_i = (Loss_total_EMA / Loss_i_EMA)^temperature
+            # Ici une version simple d'équilibrage proportionnel :
+            tot_ema = loss_pde_ema + loss_bc_ema + 1e-9
+            target_w_pde = tot_ema / (2 * loss_pde_ema + 1e-9)
+            target_w_bc = tot_ema / (2 * loss_bc_ema + 1e-9)
+            
+            w_pde = ema_alpha * w_pde + (1 - ema_alpha) * target_w_pde
+            w_bc = ema_alpha * w_bc + (1 - ema_alpha) * target_w_bc
+
+        # Application de la pondération dynamique
+        loss = w_pde * l_pde + w_bc * loss_bc
 
         if loss.item() > 10000:
             raise ValueError(f"Loss gigantesque ({loss.item():.2e} > 10^4).")
@@ -239,6 +268,13 @@ def train_step_adaptive(model, optimizer, cfg, t_prev, t_curr, base_lr, n_iters,
             _, score = run_audit(model, cfg, t_curr, threshold=current_target, verbose=False, historical=is_global)
             king.update(model, score)
             
+            # --- FAIL-FAST DIAGNOSTIC ---
+            if fast_fail_diagnostic and i == 2000:
+                if score > target_strict + 0.02: # Si on est à > Cible + 2%, c'est mort.
+                    tqdm.write(f"    💥 Fail-Fast déclenché à it=2000 (Score: {score:.2%} > {target_strict+0.02:.2%}).")
+                    king.restore(model)
+                    raise RuntimeError("Fail-Fast Diagnostic Triggered")
+
             if i > 0:
                 tqdm.write(f"📊 [It {i}] Loss: {loss.item():.2e} | L2: {score:.2%} (Cible: {current_target:.2%}) | LR: {scheduler.get_last_lr()[0]:.1e}")
                 
@@ -263,7 +299,7 @@ def run_diagnostic(model, optimizer, cfg, t_prev, t_curr, base_lr):
     _, score_in = run_audit(model, cfg, t_curr, threshold=target, verbose=False)
     
     try:
-        _, score_out = train_step_adaptive(model, optimizer, cfg, t_prev, t_curr, base_lr, 4000, disable_rar=True, target_error=target, allow_relaxation=False)
+        _, score_out = train_step_adaptive(model, optimizer, cfg, t_prev, t_curr, base_lr, 4000, disable_rar=True, target_error=target, allow_relaxation=False, fast_fail_diagnostic=True)
     except Exception as e:
         print(f"      💥 Erreur ou vraie explosion pendant le Diag : {str(e)}")
         model.load_state_dict(diag_state)
@@ -324,6 +360,7 @@ def train_navigator(model, cfg, explicit_resume_path=None):
     
     t_prev = 0.0
     dt = float(cfg['time_marching']['zones'][0]['dt']) 
+    dt_min = 0.005 # Plancher de tolérance pour le Soft Accept
     t_max = cfg['physics']['t_max']
     base_lr = float(cfg['time_marching'].get('learning_rate', 2e-4))
     
@@ -360,11 +397,17 @@ def train_navigator(model, cfg, explicit_resume_path=None):
     
 
     while t_prev < t_max:
+        soft_accept_mode = False
+        if dt < dt_min:
+            print(f"\n    ⚠️ Attention: dt ({dt:.5f}) < dt_min ({dt_min}). Activation du mode Soft Accept.")
+            dt = dt_min
+            soft_accept_mode = True
+            
         t_curr = min(t_prev + dt, t_max)
-        print(f"\n🚀 Cap t={t_curr:.4f} (+{dt:.4f}) | Streak: {easy_win_streak}")
+        print(f"\n🚀 Cap t={t_curr:.4f} (+{dt:.4f}) | Streak: {easy_win_streak}{' [SOFT ACCEPT]' if soft_accept_mode else ''}")
         
         # --- 1. Easy Win ---
-        is_easy_win, score = run_audit(model, cfg, t_curr, threshold=target, verbose=True, historical=False)
+        is_easy_win, score = run_audit(model, cfg, t_curr, threshold=target if not soft_accept_mode else target * 2.0, verbose=True, historical=False)
         step_validated = False
         
         if is_easy_win:
@@ -394,10 +437,14 @@ def train_navigator(model, cfg, explicit_resume_path=None):
             else:
                 # --- 3. La GRANDE Boucle Adaptative ---
                 iters = get_zone_config(t_curr, cfg)
-                success, final_score = train_step_adaptive(model, optimizer, cfg, t_prev, t_curr, base_lr, iters, is_global=False, target_error=target)
+                current_target = target if not soft_accept_mode else target * 2.0
+                success, final_score = train_step_adaptive(model, optimizer, cfg, t_prev, t_curr, base_lr, iters, is_global=False, target_error=current_target)
                 
-                if success:
-                    print(f"    ✅ Pas validé avec {final_score:.2%}")
+                if success or soft_accept_mode:
+                    if soft_accept_mode and not success:
+                        print(f"    🛡️ Soft Accept forcé avec {final_score:.2%} (Déléguera le rattrapage au L-BFGS).")
+                    else:
+                        print(f"    ✅ Pas validé avec {final_score:.2%}")
                     step_validated = True
                 else:
                     print("    🛑 Échec de la boucle adaptative. Réduction de dt.")
@@ -405,9 +452,9 @@ def train_navigator(model, cfg, explicit_resume_path=None):
                 
         # --- 4. Validation Historique & Rescue Loop ---
         if step_validated:
-            hist_ok, hist_score = run_audit(model, cfg, t_curr, threshold=target, verbose=True, historical=True)
+            hist_ok, hist_score = run_audit(model, cfg, t_curr, threshold=target if not soft_accept_mode else target * 2.0, verbose=True, historical=True)
             
-            if not hist_ok:
+            if not hist_ok and not soft_accept_mode:
                 print(f"    ⚠️ Oubli catastrophique détecté (Audit Histo: {hist_score:.2%}). Lancement Rescue Loop.")
                 success_rescue, _ = train_step_adaptive(model, optimizer, cfg, 0.0, t_curr, base_lr, 10000, is_global=True, target_error=target, allow_relaxation=False)
                 if not success_rescue:
