@@ -12,14 +12,15 @@ from src.physics.pde_cgl import pde_residual_cgle
 from src.data.generators import get_ic_batch_cgle, get_pde_batch_cgle_causal, get_rar_batch, get_pde_batch_cgle_global
 from src.utils.solver_cgl import get_ground_truth_CGL
 
-def save_checkpoint_cgl(model, optimizer, t, ckpt_dir, name=None):
+def save_checkpoint_cgl(model, optimizer, t, dt, ckpt_dir, name=None):
     """ Sauvegarde complète de la physique, des poids et de la dynamique d'entraînement """
     os.makedirs(ckpt_dir, exist_ok=True)
     
     # Capture de l'état global
     state = {
         'model_state': model.state_dict(),
-        't_curr': t
+        't_curr': t,
+        'dt': dt
     }
     if optimizer is not None:
         state['optimizer_state'] = optimizer.state_dict()
@@ -238,8 +239,8 @@ def train_step_adaptive(model, optimizer, cfg, t_prev, t_curr, base_lr, n_iters,
             # Formule ultra-stable : w_i = (Loss_total_EMA / Loss_i_EMA)^temperature
             # Ici une version simple d'équilibrage proportionnel :
             tot_ema = loss_pde_ema + loss_bc_ema + 1e-9
-            target_w_pde = tot_ema / (2 * loss_pde_ema + 1e-9)
-            target_w_bc = tot_ema / (2 * loss_bc_ema + 1e-9)
+            target_w_pde = min(tot_ema / (2 * loss_pde_ema + 1e-9), 5.0)
+            target_w_bc = min(tot_ema / (2 * loss_bc_ema + 1e-9), 5.0)
             
             w_pde = ema_alpha * w_pde + (1 - ema_alpha) * target_w_pde
             w_bc = ema_alpha * w_bc + (1 - ema_alpha) * target_w_bc
@@ -392,6 +393,10 @@ def train_navigator(model, cfg, explicit_resume_path=None):
             optimizer.load_state_dict(ckpt['optimizer_state'])
             
         t_prev = resume_t
+        
+        if 'dt' in ckpt:
+            dt = ckpt['dt']
+            print(f"   (dt restauré à {dt:.4f})")
     # -----------------------------------
         
     easy_win_streak = 0
@@ -426,15 +431,19 @@ def train_navigator(model, cfg, explicit_resume_path=None):
             easy_win_streak = 0
             
             # --- 2. Diagnostic (Fail-Fast) ---
-            diag_ok, action, diag_score = run_diagnostic(model, optimizer, cfg, t_prev, t_curr, base_lr)
-            if not diag_ok:
-                if action == "reduce_both": base_lr *= 0.75; dt *= 0.75
-                elif action == "reduce_dt": dt *= 0.75
-                print(f"    🔄 Repli tactique : dt={dt:.4f}, LR={base_lr:.1e}")
-                continue
+            if soft_accept_mode:
+                print("    🛡️ Mode Soft Accept actif : contournement du Fail-Fast diagnostic.")
+                diag_ok, action, diag_score = True, "ok", 0.0
+            else:
+                diag_ok, action, diag_score = run_diagnostic(model, optimizer, cfg, t_prev, t_curr, base_lr)
+                if not diag_ok:
+                    if action == "reduce_both": base_lr *= 0.75; dt *= 0.75
+                    elif action == "reduce_dt": dt *= 0.75
+                    print(f"    🔄 Repli tactique : dt={dt:.4f}, LR={base_lr:.1e}")
+                    continue
             
             # COURT-CIRCUIT : Le diagnostic a fait tout le travail !
-            if diag_score < target:
+            if diag_score < target and not soft_accept_mode:
                 print(f"    ⚡ Validation Express ! Le diagnostic a suffi ({diag_score:.2%}).")
                 step_validated = True
                 
@@ -466,9 +475,9 @@ def train_navigator(model, cfg, explicit_resume_path=None):
                     dt *= 0.75
                     
             t_prev = t_curr
-            save_checkpoint_cgl(model, optimizer, t_curr, save_dir, name=f"ckpt_t{t_curr:.4f}.pth")
+            save_checkpoint_cgl(model, optimizer, t_curr, dt, save_dir, name=f"ckpt_t{t_curr:.4f}.pth")
 
     print("\n✨ Objectif temporel atteint. Lancement de la boucle de polissage final...")
     final_score = run_polishing_loop(model, optimizer, cfg, t_max)
     print(f"🏁 Entraînement terminé. Score global final : {final_score:.2%}")
-    save_checkpoint_cgl(model, optimizer, t_max, save_dir, name="ckpt_FINAL.pth")
+    save_checkpoint_cgl(model, optimizer, t_max, dt, save_dir, name="ckpt_FINAL.pth")
