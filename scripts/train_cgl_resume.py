@@ -101,7 +101,8 @@ def main():
     # 5. ENTRAÎNEMENT
     try:
         # Si on est en mode reprise, on pointe directement vers model_latest.pth
-        resume_file = os.path.join(ckpt_dir, "model_latest.pth") if args.resume else None
+        # Si on est en mode reprise, on donne directement le dossier entier au Navigator
+        resume_file = ckpt_dir if args.resume else None
 
         # On passe ce chemin explicite au Navigator
         train_navigator(model, cfg, explicit_resume_path=resume_file)
