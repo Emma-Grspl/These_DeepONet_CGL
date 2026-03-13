@@ -317,10 +317,11 @@ def run_polishing_loop(model, optimizer, cfg, t_max):
 # 5. LE NAVIGATEUR
 # ==============================================================================
 def train_navigator(model, cfg, explicit_resume_path=None):
-    # On force l'utilisation du dossier checkpoints si tu veux la même structure
-    base_save_dir = cfg['training'].get('save_dir', "outputs/CGL_Run")
-    save_dir = os.path.join(base_save_dir, "checkpoints")
+    # --- MODIFICATION ICI ---
+    # Au lieu d'ajouter "checkpoints", on utilise directement le dossier fourni
+    save_dir = cfg['training'].get('save_dir', "outputs/checkpoints")
     os.makedirs(save_dir, exist_ok=True)
+    # -------------------------
     
     t_prev = 0.0
     dt = float(cfg['time_marching']['zones'][0]['dt']) 
