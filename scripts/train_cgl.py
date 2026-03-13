@@ -7,8 +7,8 @@ import glob
 from datetime import datetime
 
 # --- GESTION DES CHEMINS ---
-project_root = os.getcwd()
-sys.path.append(project_root)
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, project_root)
 
 # --- IMPORTS ---
 from src.models.cgl_deeponet import CGL_PI_DeepONet
