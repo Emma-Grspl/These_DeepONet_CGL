@@ -55,10 +55,10 @@ time_marching:
       iters: 20000
     - t_end: 2.0
       dt: 0.2
-      iters: 20000
+      iters: 40000
     - t_end: 3.0
       dt: 0.5
-      iters: 20000
+      iters: 40000
     - t_end: 5.0
       dt: 1.0
-      iters: 30000
+      iters: 40000
