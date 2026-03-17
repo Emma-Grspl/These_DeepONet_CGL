@@ -332,7 +332,7 @@ def train_navigator(model, cfg, explicit_resume_path=None):
     
     t_prev = 0.0
     dt = float(cfg['time_marching']['zones'][0]['dt']) 
-    dt_min = 0.005 # Plancher de tolérance pour le Soft Accept
+    dt_min = 0.1 # Plancher de tolérance strict (Garde-fou)
     t_max = cfg['physics']['t_max']
     base_lr = float(cfg['time_marching'].get('learning_rate', 2e-4))
     
@@ -362,8 +362,8 @@ def train_navigator(model, cfg, explicit_resume_path=None):
         t_prev = resume_t
         
         if 'dt' in ckpt:
-            dt = ckpt['dt']
-            print(f"   (dt restauré à {dt:.4f})")
+            dt = max(ckpt['dt'], dt_min)
+            print(f"   (dt restauré à {dt:.4f} [Plancher {dt_min} appliqué])")
     # -----------------------------------
         
     easy_win_streak = 0
@@ -413,7 +413,7 @@ def train_navigator(model, cfg, explicit_resume_path=None):
             else:
                 print("    🛑 Échec de la boucle adaptative. Réduction de dt.")
                 dt *= 0.75
-                dt = max(dt, 0.1)  # Garde-fou : plancher strict
+                dt = max(dt, dt_min)  # Garde-fou : plancher strict
                 
         # --- 4. Validation Historique & Rescue Loop ---
         if step_validated:
@@ -425,7 +425,7 @@ def train_navigator(model, cfg, explicit_resume_path=None):
                 if not success_rescue:
                     print("    🛑 La Rescue Loop a peiné, mais on sauvegarde et on avance prudemment.")
                     dt *= 0.75
-                    dt = max(dt, 0.1) # Garde-fou : plancher strict
+                    dt = max(dt, dt_min) # Garde-fou : plancher strict
                     
             t_prev = t_curr
             save_checkpoint_cgl(model, optimizer, t_curr, dt, save_dir, name=f"ckpt_t{t_curr:.4f}.pth")
