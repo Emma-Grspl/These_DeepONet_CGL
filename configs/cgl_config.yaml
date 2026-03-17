@@ -3,7 +3,7 @@ device: "cuda"
 
 physics:
   # Domaine spatial réduit puisque la Gaussienne est centrée et s'étale peu
-  x_domain: [-8.0, 8.0] 
+  x_domain: [-40.0, 40.0] 
   # Objectif long terme
   t_max: 5.0
   # Uniquement la Gaussienne

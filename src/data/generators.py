@@ -46,7 +46,8 @@ def get_ic_batch_cgle(batch_size, cfg, device):
 
 def get_pde_batch_cgle_causal(n_samples, cfg, device, t_prev, t_curr):
     """
-    Générateur PDE avec Time Marching Causal (20% mémoire passé, 80% front actif) et Focus Spatial.
+    Générateur PDE avec Time Marching Causal (30% mémoire passé, 70% front actif)
+    et Focus Spatial Dynamique (Suit l'étalement W(t) de la Gaussienne).
     """
     b = cfg['physics']['bounds'] if isinstance(cfg, dict) else cfg.physics['bounds']
     eq_p = cfg['physics']['equation_params'] if isinstance(cfg, dict) else cfg.physics['equation_params']
@@ -67,14 +68,7 @@ def get_pde_batch_cgle_causal(n_samples, cfg, device, t_prev, t_curr):
     
     branch = torch.cat([alpha, beta, mu, V, A, w0, x0, k_wav, types], dim=1)
 
-    # 3. Échantillonnage Spatial Focus (80% centre)
-    n_center = int(0.8 * n_samples)
-    x_center = x0[:n_center] + torch.randn(n_center, 1, device=device) * w0[:n_center] * 1.5
-    x_uniform = torch.rand(n_samples - n_center, 1, device=device) * (x_max - x_min) + x_min
-    x = torch.cat([x_center, x_uniform], dim=0)
-    x = torch.clamp(x, x_min, x_max)
-
-    # 4. Échantillonnage Temporel Causal (30% Replay Buffer, 70% front actif)
+    # 3. Échantillonnage Temporel Causal (Doit être fait AVANT l'espace)
     if t_prev <= 1e-5:
         t = torch.rand(n_samples, 1, device=device) * t_curr
     else:
@@ -83,7 +77,19 @@ def get_pde_batch_cgle_causal(n_samples, cfg, device, t_prev, t_curr):
         t_front = torch.rand(n_samples - n_past, 1, device=device) * (t_curr - t_prev) + t_prev
         t = torch.cat([t_past, t_front], dim=0)
 
-    # Shuffle final
+    # 4. Échantillonnage Spatial Focus DYNAMIQUE (80% centre)
+    n_center = int(0.8 * n_samples)
+    
+    # Largeur dynamique de l'enveloppe
+    W_t = w0[:n_center] * torch.sqrt(1.0 + (2.0 * t[:n_center])**2)
+    
+    x_center = x0[:n_center] + torch.randn(n_center, 1, device=device) * W_t * 1.5
+    x_uniform = torch.rand(n_samples - n_center, 1, device=device) * (x_max - x_min) + x_min
+    
+    x = torch.cat([x_center, x_uniform], dim=0)
+    x = torch.clamp(x, x_min, x_max)
+
+    # 5. Shuffle final
     idx = torch.randperm(n_samples)
     branch, x, t = branch[idx], x[idx], t[idx]
 
@@ -92,10 +98,11 @@ def get_pde_batch_cgle_causal(n_samples, cfg, device, t_prev, t_curr):
 
     return branch, coords, params_dict
 
+
 def get_pde_batch_cgle_global(n_samples, cfg, device, t_max_local):
     """
-    NOUVEAU : Générateur PDE Global (Uniforme sur tout [0, t_max_local]).
-    Utilisé pour la Rescue Loop et la boucle de polissage finale (sans notion de front).
+    Générateur PDE Global (Uniforme sur tout [0, t_max_local]).
+    Avec Focus Spatial Dynamique adapté au temps.
     """
     b = cfg['physics']['bounds'] if isinstance(cfg, dict) else cfg.physics['bounds']
     eq_p = cfg['physics']['equation_params'] if isinstance(cfg, dict) else cfg.physics['equation_params']
@@ -116,17 +123,21 @@ def get_pde_batch_cgle_global(n_samples, cfg, device, t_max_local):
     
     branch = torch.cat([alpha, beta, mu, V, A, w0, x0, k_wav, types], dim=1)
 
-    # 3. Échantillonnage Spatial Focus (80% centre)
+    # 3. Échantillonnage Temporel Uniforme D'ABORD
+    t = torch.rand(n_samples, 1, device=device) * t_max_local
+
+    # 4. Échantillonnage Spatial Focus DYNAMIQUE (80% centre)
     n_center = int(0.8 * n_samples)
-    x_center = x0[:n_center] + torch.randn(n_center, 1, device=device) * w0[:n_center] * 1.5
+    
+    W_t = w0[:n_center] * torch.sqrt(1.0 + (2.0 * t[:n_center])**2)
+    
+    x_center = x0[:n_center] + torch.randn(n_center, 1, device=device) * W_t * 1.5
     x_uniform = torch.rand(n_samples - n_center, 1, device=device) * (x_max - x_min) + x_min
+    
     x = torch.cat([x_center, x_uniform], dim=0)
     x = torch.clamp(x, x_min, x_max)
 
-    # 4. Échantillonnage Temporel Uniforme
-    t = torch.rand(n_samples, 1, device=device) * t_max_local
-
-    # Shuffle final
+    # 5. Shuffle final
     idx = torch.randperm(n_samples)
     branch, x, t = branch[idx], x[idx], t[idx]
 
@@ -134,6 +145,7 @@ def get_pde_batch_cgle_global(n_samples, cfg, device, t_max_local):
     params_dict = {"alpha": branch[:,0:1], "beta": branch[:,1:2], "mu": branch[:,2:3], "V": branch[:,3:4]}
 
     return branch, coords, params_dict
+
 
 def get_rar_batch(model, cfg, device, t_prev, t_curr, n_candidates=10000, n_selected=2000):
     """Génère des points PDE là où le résidu est fort sur la zone temporelle actuelle."""

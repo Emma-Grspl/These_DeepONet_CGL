@@ -105,7 +105,7 @@ def run_audit(model, cfg, t_max, threshold=0.05, n_global=60, verbose=False, his
 
     def evaluate_point(p_dict, t_eval):
         t_for_solver = 0.01 if t_eval < 0.01 else t_eval
-        X, T, U_cplx = get_ground_truth_CGL(p_dict, x_domain[0], x_domain[1], t_for_solver, Nx=128, Nt=None)
+        X, T, U_cplx = get_ground_truth_CGL(p_dict, x_domain[0], x_domain[1], t_for_solver, Nx=512, Nt=None)
         
         U_true = U_cplx[:, 0] if t_eval < 0.01 else U_cplx.flatten()
         X_flat = X[:, 0] if t_eval < 0.01 else X.flatten()

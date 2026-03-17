@@ -167,7 +167,7 @@ class CGL_PI_DeepONet(nn.Module):
         # 1. Base Analytique (Condition Initiale Hardcodée)
         ic_re, ic_im = self.get_ic_analytical(params, coords)
 
-        # 2. Préparation Réseau
+        # 2. Préparation Réseau (Paramètres)
         norm_alpha = self.normalize_linear(params[:, 0:1], self.alpha_min, self.alpha_max)
         norm_beta  = self.normalize_linear(params[:, 1:2], self.beta_min, self.beta_max)
         norm_mu    = self.normalize_linear(params[:, 2:3], self.mu_min, self.mu_max)
@@ -184,10 +184,23 @@ class CGL_PI_DeepONet(nn.Module):
         x_raw = coords[:, 0:1]
         t_raw = coords[:, 1:2]
         
-        coords_norm = torch.cat([
-            self.normalize_linear(x_raw, self.x_min, self.x_max),
-            self.normalize_linear(t_raw, 0.0, self.t_max) 
-        ], dim=1)
+        # --- DÉBUT DE LA TRANSFORMATION GÉOMÉTRIQUE (Option 1) ---
+        w0_raw = params[:, 5:6]
+        x0_raw = params[:, 6:7]
+        
+        # W(t) : L'enveloppe qui suit la diffusion de la gaussienne
+        # Le facteur 2.0 est empirique pour assurer que la boîte grandisse assez vite
+        W_t = w0_raw * torch.sqrt(1.0 + (2.0 * t_raw)**2)
+        
+        # Coordonnée spatiale dynamique (surfe sur la vague)
+        xi = (x_raw - x0_raw) / (W_t + 1e-9)
+        
+        # On normalise xi sur une échelle de référence [-4.0, 4.0] (99% de l'énergie d'une gaussienne)
+        xi_norm = self.normalize_linear(xi, torch.tensor(-4.0, device=xi.device), torch.tensor(4.0, device=xi.device))
+        t_norm = self.normalize_linear(t_raw, 0.0, self.t_max)
+        
+        coords_norm = torch.cat([xi_norm, t_norm], dim=1)
+        # --- FIN DE LA TRANSFORMATION ---
 
         # 3. Calcul Réseau
         B = self.branch_net(params_norm)             
@@ -198,8 +211,6 @@ class CGL_PI_DeepONet(nn.Module):
         out_im = torch.sum(B_im * T, dim=1, keepdim=True)
 
         # 4. L'Ansatz (Hard Constraint)
-        # Transition douce avec t : à t=0, le réseau est annulé.
-        # tau = 1.0 (ou 5.0 comme NLSE) adoucit la montée en puissance du réseau.
         transition = 1.0 - torch.exp(-t_raw / 1.0) 
 
         psi_re = ic_re + transition * out_re
