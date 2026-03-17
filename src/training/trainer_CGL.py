@@ -255,6 +255,11 @@ def train_step_adaptive(model, optimizer, cfg, t_prev, t_curr, base_lr, n_iters,
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         scheduler.step()
+
+        # Garde-fou LR : Ne pas descendre sous 5e-6
+        for param_group in optimizer.param_groups:
+            if param_group['lr'] < 5e-6:
+                param_group['lr'] = 5e-6
         
         # RAR toutes les 2000 itérations
         if not disable_rar and i > 0 and i % 2000 == 0:
