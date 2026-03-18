@@ -43,7 +43,7 @@ training:
     bc_loss: 1.0
     
   target_error_global: 0.030   
-  save_dir: "results/CGL_Talanov_V1
+  save_dir: "results/CGL_Talanov_V1"
 
 time_marching:
   # LR de départ de la Macro-Loop (qui sera divisé par 2 en cas d'échec)
