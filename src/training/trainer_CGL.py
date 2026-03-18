@@ -163,8 +163,8 @@ def train_step_adaptive(model, optimizer, cfg, t_prev, t_curr, base_lr, n_iters,
     for param_group in optimizer.param_groups:
         param_group['lr'] = base_lr
         
-    # Baisse douce : * 0.8 toutes les 2000 itérations
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=2000, gamma=0.8)
+    # Baisse douce : * 0.85 toutes les 5000 itérations
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5000, gamma=0.85)
     
     rar_active = False
     rar_b, rar_c, rar_p = None, None, None
@@ -292,6 +292,49 @@ def train_step_adaptive(model, optimizer, cfg, t_prev, t_curr, base_lr, n_iters,
                 tqdm.write(f"    🎯 Cible atteinte ({score:.2%} < {current_target:.2%}) ! Arrêt anticipé.")
                 king.restore(model)
                 return True, score
+
+    # --- L-BFGS FINISHER : Si on est proche de la cible à la fin d'Adam ---
+    best_attained = king.best_score < current_target
+    if not best_attained and king.best_score < current_target + 0.03:
+        tqdm.write(f"    🎯 Proche de la cible ({king.best_score:.2%}). Lancement du Finisher L-BFGS...")
+        king.restore(model)
+        
+        # Initialisation L-BFGS avec paramètres spécifiques
+        optimizer_lbfgs = optim.LBFGS(model.parameters(), lr=0.1, max_iter=100)
+        
+        # Closure : Utilise les DERNIERS batches générés par Adam
+        # On fige w_pde et w_bc (RELOBRALO) pour cette étape de finition.
+        def closure():
+            optimizer_lbfgs.zero_grad()
+            
+            # 1. Résidu PDE
+            rr, ri = pde_residual_cgle(model, b_p, c_p, p_p, cfg)
+            l_pde = torch.mean(rr**2 + ri**2)
+            
+            # 2. Conditions aux Bords
+            ur_bc, ui_bc = model(b_all_bc, c_all_bc)
+            grads_r = torch.autograd.grad(ur_bc.sum(), c_all_bc, create_graph=True)[0]
+            grads_i = torch.autograd.grad(ui_bc.sum(), c_all_bc, create_graph=True)[0]
+            loss_bc = torch.mean(grads_r[:, 0:1]**2 + grads_i[:, 0:1]**2)
+            
+            # 3. Loss Totale pondérée (poids RELOBRALO figés)
+            total_loss = w_pde * l_pde + w_bc * loss_bc
+            total_loss.backward()
+            return total_loss
+            
+        try:
+            optimizer_lbfgs.step(closure)
+            
+            # Ultime run_audit pour voir si le finisher a réussi
+            _, score = run_audit(model, cfg, t_curr, threshold=current_target, verbose=False, historical=is_global)
+            if score < current_target:
+                tqdm.write(f"    ✨ L-BFGS a réussi ! Score final: {score:.2%}")
+                return True, score
+            else:
+                tqdm.write(f"    📉 L-BFGS n'a pas suffi (Score: {score:.2%}).")
+                king.update(model, score) # On garde quand même le bénéfice s'il y en a un
+        except Exception as e:
+            tqdm.write(f"    ⚠️ Échec L-BFGS Finisher: {e}")
 
     king.restore(model)
     return False, king.best_score
