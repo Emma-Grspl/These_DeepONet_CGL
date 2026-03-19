@@ -9,7 +9,14 @@ import glob
 import re
 
 from src.physics.pde_cgl import pde_residual_cgle
-from src.data.generators import get_ic_batch_cgle, get_pde_batch_cgle_causal, get_rar_batch, get_pde_batch_cgle_global
+from src.data.generators import (
+    get_ic_batch_cgle,
+    get_interface_batch_cgle,
+    get_mass_balance_batch_cgle,
+    get_pde_batch_cgle_causal,
+    get_pde_batch_cgle_global,
+    get_rar_batch,
+)
 from src.utils.solver_cgl import get_ground_truth_CGL
 
 def save_checkpoint_cgl(model, optimizer, t, dt, ckpt_dir, name=None):
@@ -90,6 +97,101 @@ def find_latest_checkpoint(ckpt_dir_or_file):
             best_file = f
     return best_file, max_t
 
+
+def _get_physics_loss_cfg(cfg):
+    defaults = {
+        'pde_relative_weight': 0.5,
+        'weak_weight': 0.05,
+        'mass_weight': 0.05,
+        'continuity_weight': 0.1,
+        'mass_n_cases': 16,
+        'mass_n_x': 128,
+        'continuity_batch_size': 2048,
+    }
+    training_cfg = cfg['training'] if isinstance(cfg, dict) else cfg.training
+    user_cfg = training_cfg.get('physics_losses', {})
+    return {k: user_cfg.get(k, v) for k, v in defaults.items()}
+
+
+def _compute_relative_pde_loss(components):
+    res_norm = torch.sqrt(components['res_re'] ** 2 + components['res_im'] ** 2 + 1e-12)
+    term_norm = torch.sqrt(
+        components['du_dt_re'] ** 2 + components['du_dt_im'] ** 2 +
+        components['diff_re'] ** 2 + components['diff_im'] ** 2 +
+        components['lin_re'] ** 2 + components['lin_im'] ** 2 +
+        components['nl_re'] ** 2 + components['nl_im'] ** 2 +
+        components['adv_re'] ** 2 + components['adv_im'] ** 2 +
+        1e-12
+    )
+    return torch.mean((res_norm / (term_norm + 1e-6)) ** 2)
+
+
+def _compute_weak_pde_loss(components, coords, cfg):
+    x_min, x_max = cfg['physics']['x_domain']
+    t_max = cfg['physics']['t_max']
+    x_norm = 2.0 * (coords[:, 0:1] - x_min) / (x_max - x_min + 1e-9) - 1.0
+    t_norm = 2.0 * coords[:, 1:2] / (t_max + 1e-9) - 1.0
+
+    basis = [
+        torch.ones_like(x_norm),
+        x_norm,
+        t_norm,
+        torch.sin(np.pi * x_norm),
+        torch.cos(np.pi * x_norm),
+        x_norm * t_norm,
+    ]
+    weak_terms = []
+    for phi in basis:
+        weak_terms.append(torch.mean(components['res_re'] * phi) ** 2)
+        weak_terms.append(torch.mean(components['res_im'] * phi) ** 2)
+    return torch.stack(weak_terms).mean()
+
+
+def _compute_mass_balance_loss(model, cfg, device, t_low, t_high, loss_cfg):
+    branch, coords, params_dict, n_cases, n_x = get_mass_balance_batch_cgle(
+        int(loss_cfg['mass_n_cases']),
+        int(loss_cfg['mass_n_x']),
+        cfg,
+        device,
+        t_low,
+        t_high,
+    )
+    components = pde_residual_cgle(model, branch, coords, params_dict, cfg, return_components=True)
+
+    u_sq = (components['u_re'] ** 2 + components['u_im'] ** 2).view(n_cases, n_x)
+    u_quart = (u_sq ** 2)
+    ux_sq = (components['du_dx_re'] ** 2 + components['du_dx_im'] ** 2).view(n_cases, n_x)
+
+    density = u_sq.view(-1, 1)
+    density_dt = torch.autograd.grad(density.sum(), coords, create_graph=True)[0][:, 1:2].view(n_cases, n_x)
+
+    x_min, x_max = cfg['physics']['x_domain']
+    domain_length = x_max - x_min
+
+    dM_dt = domain_length * torch.mean(density_dt, dim=1, keepdim=True)
+    M = domain_length * torch.mean(u_sq, dim=1, keepdim=True)
+    grad_term = domain_length * torch.mean(ux_sq, dim=1, keepdim=True)
+    quartic_term = domain_length * torch.mean(u_quart, dim=1, keepdim=True)
+    mu_term = domain_length * torch.mean(params_dict['mu'].view(n_cases, n_x) * u_sq, dim=1, keepdim=True)
+    rhs = -2.0 * grad_term + 2.0 * mu_term - 2.0 * quartic_term
+
+    scale = torch.abs(rhs) + torch.abs(M) + 1e-4
+    return torch.mean(((dM_dt - rhs) / scale) ** 2)
+
+
+def _compute_continuity_loss(model, teacher_model, cfg, device, t_prev, loss_cfg):
+    if teacher_model is None or t_prev <= 1e-8:
+        return torch.tensor(0.0, device=device)
+
+    branch, coords, _ = get_interface_batch_cgle(int(loss_cfg['continuity_batch_size']), cfg, device, t_prev)
+    with torch.no_grad():
+        teacher_re, teacher_im = teacher_model(branch, coords.detach())
+
+    student_re, student_im = model(branch, coords)
+    diff_sq = (student_re - teacher_re) ** 2 + (student_im - teacher_im) ** 2
+    ref_sq = teacher_re ** 2 + teacher_im ** 2
+    return torch.mean(diff_sq / (ref_sq + 1e-6))
+
 # ==============================================================================
 # 1. AUDIT DE VALIDATION (Local & Historique)
 # ==============================================================================
@@ -130,7 +232,9 @@ def run_audit(model, cfg, t_max, threshold=0.05, n_global=60, verbose=False, his
                  'V':     np.random.uniform(eq_p['V'][0],     eq_p['V'][1]),
                  'A':     np.random.uniform(bounds['A'][0], bounds['A'][1]),
                  'w0':    10**np.random.uniform(np.log10(bounds['w0'][0]), np.log10(bounds['w0'][1])),
-                 'x0': 0.0, 'k': 1.0, 'type': 0}
+                 'x0': np.random.uniform(bounds['x0'][0], bounds['x0'][1]),
+                 'k': np.random.uniform(bounds['k'][0], bounds['k'][1]),
+                 'type': 0}
             
             # Tirage temporel : Point fixe (t_max) ou aléatoire dans le passé (historical)
             if historical and t_max > 1e-5:
@@ -152,12 +256,12 @@ def run_audit(model, cfg, t_max, threshold=0.05, n_global=60, verbose=False, his
 # ==============================================================================
 # 2. LE WORKER ADAM UNIQUE & ADAPTATIF
 # ==============================================================================
-def train_step_adaptive(model, optimizer, cfg, t_prev, t_curr, base_lr, n_iters, is_global=False, disable_rar=False, target_error=0.03, allow_relaxation=True):
+def train_step_adaptive(model, optimizer, cfg, t_prev, t_curr, base_lr, n_iters, is_global=False, disable_rar=False, target_error=0.03, allow_relaxation=True, teacher_model=None):
     king = KingOfTheHill(model)
     king.update(model, 1.0)
     
     bs_pde = cfg['training']['batch_size_pde']
-    weights = cfg['training']['weights'].copy()
+    loss_cfg = _get_physics_loss_cfg(cfg)
     
     # Réinitialisation du LR de départ pour ce pas
     for param_group in optimizer.param_groups:
@@ -209,8 +313,11 @@ def train_step_adaptive(model, optimizer, cfg, t_prev, t_curr, base_lr, n_iters,
 
         optimizer.zero_grad(set_to_none=True)
 
-        rr, ri = pde_residual_cgle(model, b_p, c_p, p_p, cfg)
-        l_pde = torch.mean(rr**2 + ri**2)
+        components = pde_residual_cgle(model, b_p, c_p, p_p, cfg, return_components=True)
+        l_pde_abs = torch.mean(components['res_re'] ** 2 + components['res_im'] ** 2)
+        l_pde_rel = _compute_relative_pde_loss(components)
+        l_pde_weak = _compute_weak_pde_loss(components, c_p, cfg)
+        l_pde = l_pde_abs + float(loss_cfg['pde_relative_weight']) * l_pde_rel + float(loss_cfg['weak_weight']) * l_pde_weak
         
         idx_bc = torch.randperm(b_p.size(0))[:int(b_p.size(0)*0.25)]
         b_bc = b_p[idx_bc]
@@ -226,15 +333,22 @@ def train_step_adaptive(model, optimizer, cfg, t_prev, t_curr, base_lr, n_iters,
         grads_r = torch.autograd.grad(ur_bc.sum(), c_all_bc, create_graph=True)[0]
         grads_i = torch.autograd.grad(ui_bc.sum(), c_all_bc, create_graph=True)[0]
         loss_bc = torch.mean(grads_r[:, 0:1]**2 + grads_i[:, 0:1]**2)
+        loss_mass = _compute_mass_balance_loss(model, cfg, device, 0.0 if is_global else t_prev, t_curr, loss_cfg)
+        loss_continuity = _compute_continuity_loss(model, teacher_model, cfg, device, t_prev, loss_cfg)
 
         # --- RELOBRALO : Mise à jour des EMA et Poids ---
         with torch.no_grad():
             if loss_pde_ema is None:
                 loss_pde_ema = l_pde.item()
-                loss_bc_ema = loss_bc.item()
+                loss_bc_ema = (
+                    loss_bc
+                    + float(loss_cfg['mass_weight']) * loss_mass
+                    + float(loss_cfg['continuity_weight']) * loss_continuity
+                ).item()
             else:
                 loss_pde_ema = ema_alpha * loss_pde_ema + (1 - ema_alpha) * l_pde.item()
-                loss_bc_ema = ema_alpha * loss_bc_ema + (1 - ema_alpha) * loss_bc.item()
+                aux_loss = loss_bc + float(loss_cfg['mass_weight']) * loss_mass + float(loss_cfg['continuity_weight']) * loss_continuity
+                loss_bc_ema = ema_alpha * loss_bc_ema + (1 - ema_alpha) * aux_loss.item()
             
             tot_ema = loss_pde_ema + loss_bc_ema + 1e-9
             target_w_pde = min(tot_ema / (2 * loss_pde_ema + 1e-9), 5.0)
@@ -244,7 +358,8 @@ def train_step_adaptive(model, optimizer, cfg, t_prev, t_curr, base_lr, n_iters,
             w_bc = ema_alpha * w_bc + (1 - ema_alpha) * target_w_bc
 
         # Application de la pondération dynamique
-        loss = w_pde * l_pde + w_bc * loss_bc
+        aux_loss = loss_bc + float(loss_cfg['mass_weight']) * loss_mass + float(loss_cfg['continuity_weight']) * loss_continuity
+        loss = w_pde * l_pde + w_bc * aux_loss
 
         if loss.item() > 10000:
             raise ValueError(f"Loss gigantesque ({loss.item():.2e} > 10^4).")
@@ -273,7 +388,12 @@ def train_step_adaptive(model, optimizer, cfg, t_prev, t_curr, base_lr, n_iters,
             king.update(model, score)
 
             if i > 0:
-                tqdm.write(f"📊 [It {i}] Loss: {loss.item():.2e} | L2: {score:.2%} (Cible: {current_target:.2%}) | LR: {scheduler.get_last_lr()[0]:.1e}")
+                tqdm.write(
+                    f"📊 [It {i}] Loss: {loss.item():.2e} | L2: {score:.2%} "
+                    f"| PDE(abs/rel/weak)=({l_pde_abs.item():.2e}/{l_pde_rel.item():.2e}/{l_pde_weak.item():.2e}) "
+                    f"| Mass: {loss_mass.item():.2e} | Cont: {loss_continuity.item():.2e} "
+                    f"| LR: {scheduler.get_last_lr()[0]:.1e}"
+                )
 
             # --- FAIL-FAST INTERNE à it=4000 ---
             if i == 4000:
@@ -308,17 +428,23 @@ def train_step_adaptive(model, optimizer, cfg, t_prev, t_curr, base_lr, n_iters,
             optimizer_lbfgs.zero_grad()
             
             # 1. Résidu PDE
-            rr, ri = pde_residual_cgle(model, b_p, c_p, p_p, cfg)
-            l_pde = torch.mean(rr**2 + ri**2)
+            components = pde_residual_cgle(model, b_p, c_p, p_p, cfg, return_components=True)
+            l_pde_abs = torch.mean(components['res_re'] ** 2 + components['res_im'] ** 2)
+            l_pde_rel = _compute_relative_pde_loss(components)
+            l_pde_weak = _compute_weak_pde_loss(components, c_p, cfg)
+            l_pde = l_pde_abs + float(loss_cfg['pde_relative_weight']) * l_pde_rel + float(loss_cfg['weak_weight']) * l_pde_weak
             
             # 2. Conditions aux Bords
             ur_bc, ui_bc = model(b_all_bc, c_all_bc)
             grads_r = torch.autograd.grad(ur_bc.sum(), c_all_bc, create_graph=True)[0]
             grads_i = torch.autograd.grad(ui_bc.sum(), c_all_bc, create_graph=True)[0]
             loss_bc = torch.mean(grads_r[:, 0:1]**2 + grads_i[:, 0:1]**2)
+            loss_mass = _compute_mass_balance_loss(model, cfg, device, 0.0 if is_global else t_prev, t_curr, loss_cfg)
+            loss_continuity = _compute_continuity_loss(model, teacher_model, cfg, device, t_prev, loss_cfg)
             
             # 3. Loss Totale pondérée (poids RELOBRALO figés)
-            total_loss = w_pde * l_pde + w_bc * loss_bc
+            aux_loss = loss_bc + float(loss_cfg['mass_weight']) * loss_mass + float(loss_cfg['continuity_weight']) * loss_continuity
+            total_loss = w_pde * l_pde + w_bc * aux_loss
             total_loss.backward()
             return total_loss
             
@@ -357,8 +483,8 @@ def run_polishing_loop(model, optimizer, cfg, t_max):
     def closure():
         lbfgs.zero_grad()
         b_p, c_p, p_p = get_pde_batch_cgle_global(cfg['training']['batch_size_pde'], cfg, device, t_max)
-        rr, ri = pde_residual_cgle(model, b_p, c_p, p_p, cfg)
-        l = torch.mean(rr**2 + ri**2)
+        components = pde_residual_cgle(model, b_p, c_p, p_p, cfg, return_components=True)
+        l = torch.mean(components['res_re']**2 + components['res_im']**2)
         l.backward()
         return l
         
@@ -447,9 +573,12 @@ def train_navigator(model, cfg, explicit_resume_path=None):
 
             # --- 2. La GRANDE Boucle Adaptative (Fail-Fast interne à it=4000) ---
             current_target = target if not soft_accept_mode else target * 2.0
+            teacher_model = copy.deepcopy(model).to(next(model.parameters()).device).eval()
+            for param in teacher_model.parameters():
+                param.requires_grad_(False)
             success, final_score = train_step_adaptive(
                 model, optimizer, cfg, t_prev, t_curr, base_lr,
-                n_iters=40000, is_global=False, target_error=current_target
+                n_iters=40000, is_global=False, target_error=current_target, teacher_model=teacher_model
             )
 
             if success or soft_accept_mode:

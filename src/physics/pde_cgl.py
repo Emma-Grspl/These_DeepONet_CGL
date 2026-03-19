@@ -1,6 +1,7 @@
 import torch
 
-def pde_residual_cgle(model, branch, coords, equation_params, cfg):
+
+def pde_residual_cgle(model, branch, coords, equation_params, cfg, return_components=False):
     """
     Calcule le résidu de l'équation CGL généraliste.
     
@@ -63,5 +64,25 @@ def pde_residual_cgle(model, branch, coords, equation_params, cfg):
     # 6. Résidu Final
     res_re = du_dt_re - (diff_re + lin_re + nl_re + adv_re)
     res_im = du_dt_im - (diff_im + lin_im + nl_im + adv_im)
+
+    if return_components:
+        return {
+            'res_re': res_re,
+            'res_im': res_im,
+            'u_re': u_re,
+            'u_im': u_im,
+            'du_dx_re': du_dx_re,
+            'du_dx_im': du_dx_im,
+            'du_dt_re': du_dt_re,
+            'du_dt_im': du_dt_im,
+            'diff_re': diff_re,
+            'diff_im': diff_im,
+            'lin_re': lin_re,
+            'lin_im': lin_im,
+            'nl_re': nl_re,
+            'nl_im': nl_im,
+            'adv_re': adv_re,
+            'adv_im': adv_im,
+        }
 
     return res_re, res_im
