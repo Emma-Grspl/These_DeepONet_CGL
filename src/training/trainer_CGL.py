@@ -113,6 +113,19 @@ def _get_physics_loss_cfg(cfg):
     return {k: user_cfg.get(k, v) for k, v in defaults.items()}
 
 
+def _get_early_stop_cfg(cfg):
+    defaults = {
+        'enabled': True,
+        'min_iters': 12000,
+        'patience_audits': 8,
+        'min_score_improvement': 0.001,
+        'min_loss_improvement_rel': 0.03,
+    }
+    training_cfg = cfg['training'] if isinstance(cfg, dict) else cfg.training
+    user_cfg = training_cfg.get('early_stop', {})
+    return {k: user_cfg.get(k, v) for k, v in defaults.items()}
+
+
 def _compute_relative_pde_loss(components):
     res_norm = torch.sqrt(components['res_re'] ** 2 + components['res_im'] ** 2 + 1e-12)
     term_norm = torch.sqrt(
@@ -262,6 +275,7 @@ def train_step_adaptive(model, optimizer, cfg, t_prev, t_curr, base_lr, n_iters,
     
     bs_pde = cfg['training']['batch_size_pde']
     loss_cfg = _get_physics_loss_cfg(cfg)
+    early_stop_cfg = _get_early_stop_cfg(cfg)
     
     # Réinitialisation du LR de départ pour ce pas
     for param_group in optimizer.param_groups:
@@ -292,6 +306,9 @@ def train_step_adaptive(model, optimizer, cfg, t_prev, t_curr, base_lr, n_iters,
     w_bc = 1.0
     loss_pde_ema = None
     loss_bc_ema = None
+    best_plateau_score = None
+    best_plateau_loss = None
+    plateau_audits = 0
     
     for i in pbar:
         device = next(model.parameters()).device
@@ -387,6 +404,22 @@ def train_step_adaptive(model, optimizer, cfg, t_prev, t_curr, base_lr, n_iters,
             _, score = run_audit(model, cfg, t_curr, threshold=current_target, verbose=False, historical=is_global)
             king.update(model, score)
 
+            current_loss_ema = loss_pde_ema + loss_bc_ema if (loss_pde_ema is not None and loss_bc_ema is not None) else loss.item()
+            score_improved = False
+            loss_improved = False
+
+            if best_plateau_score is None or score < best_plateau_score - float(early_stop_cfg['min_score_improvement']):
+                best_plateau_score = score
+                score_improved = True
+            if best_plateau_loss is None or current_loss_ema < best_plateau_loss * (1.0 - float(early_stop_cfg['min_loss_improvement_rel'])):
+                best_plateau_loss = current_loss_ema
+                loss_improved = True
+
+            if score_improved or loss_improved:
+                plateau_audits = 0
+            else:
+                plateau_audits += 1
+
             if i > 0:
                 tqdm.write(
                     f"📊 [It {i}] Loss: {loss.item():.2e} | L2: {score:.2%} "
@@ -412,6 +445,18 @@ def train_step_adaptive(model, optimizer, cfg, t_prev, t_curr, base_lr, n_iters,
                 tqdm.write(f"    🎯 Cible atteinte ({score:.2%} < {current_target:.2%}) ! Arrêt anticipé.")
                 king.restore(model)
                 return True, score
+
+            # --- EARLY STOP SUR PLATEAU ---
+            if (
+                early_stop_cfg['enabled']
+                and i >= int(early_stop_cfg['min_iters'])
+                and plateau_audits >= int(early_stop_cfg['patience_audits'])
+            ):
+                tqdm.write(
+                    f"    ⏹️ Plateau détecté à it={i} "
+                    f"(best L2: {king.best_score:.2%}, audits sans progrès: {plateau_audits}). Arrêt anticipé Adam."
+                )
+                break
 
     # --- L-BFGS FINISHER : Si on est proche de la cible à la fin d'Adam ---
     best_attained = king.best_score < current_target
@@ -573,12 +618,13 @@ def train_navigator(model, cfg, explicit_resume_path=None):
 
             # --- 2. La GRANDE Boucle Adaptative (Fail-Fast interne à it=4000) ---
             current_target = target if not soft_accept_mode else target * 2.0
+            zone_iters = get_zone_config(t_curr, cfg)
             teacher_model = copy.deepcopy(model).to(next(model.parameters()).device).eval()
             for param in teacher_model.parameters():
                 param.requires_grad_(False)
             success, final_score = train_step_adaptive(
                 model, optimizer, cfg, t_prev, t_curr, base_lr,
-                n_iters=40000, is_global=False, target_error=current_target, teacher_model=teacher_model
+                n_iters=zone_iters, is_global=False, target_error=current_target, teacher_model=teacher_model
             )
 
             if success or soft_accept_mode:
@@ -598,7 +644,8 @@ def train_navigator(model, cfg, explicit_resume_path=None):
             
             if not hist_ok and not soft_accept_mode:
                 print(f"    ⚠️ Oubli catastrophique détecté (Audit Histo: {hist_score:.2%}). Lancement Rescue Loop.")
-                success_rescue, _ = train_step_adaptive(model, optimizer, cfg, 0.0, t_curr, base_lr, n_iters=10000, is_global=True, target_error=target, allow_relaxation=False)
+                rescue_iters = max(4000, min(10000, get_zone_config(t_curr, cfg) // 3))
+                success_rescue, _ = train_step_adaptive(model, optimizer, cfg, 0.0, t_curr, base_lr, n_iters=rescue_iters, is_global=True, target_error=target, allow_relaxation=False)
                 if not success_rescue:
                     print("    🛑 La Rescue Loop a peiné, mais on sauvegarde et on avance prudemment.")
                     dt *= 0.75
