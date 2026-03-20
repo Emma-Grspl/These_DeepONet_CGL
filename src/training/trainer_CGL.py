@@ -14,6 +14,7 @@ from src.data.generators import (
     get_interface_batch_cgle,
     get_mass_balance_batch_cgle,
     get_pde_batch_cgle_causal,
+    get_pde_batch_cgle_causal_mixed,
     get_pde_batch_cgle_global,
     get_rar_batch,
 )
@@ -124,6 +125,151 @@ def _get_early_stop_cfg(cfg):
     training_cfg = cfg['training'] if isinstance(cfg, dict) else cfg.training
     user_cfg = training_cfg.get('early_stop', {})
     return {k: user_cfg.get(k, v) for k, v in defaults.items()}
+
+
+def _get_hard_audit_cfg(cfg):
+    defaults = {
+        'enabled': True,
+        'skip_first_step': True,
+        'n_cases': 60,
+        'medium_factor': 1.5,
+        'mix_hard': 0.5,
+        'mix_medium': 0.2,
+        'mix_global': 0.3,
+    }
+    training_cfg = cfg['training'] if isinstance(cfg, dict) else cfg.training
+    user_cfg = training_cfg.get('hard_audit', {})
+    return {k: user_cfg.get(k, v) for k, v in defaults.items()}
+
+
+def _case_signature(case_row):
+    return "|".join([
+        f"{case_row['alpha']:.6f}",
+        f"{case_row['beta']:.6f}",
+        f"{case_row['mu']:.6f}",
+        f"{case_row['V']:.6f}",
+        f"{case_row['A']:.6f}",
+        f"{case_row['w0']:.6f}",
+        f"{case_row['x0']:.6f}",
+        f"{case_row['k']:.6f}",
+        f"{case_row['type']:.0f}",
+    ])
+
+
+def _sample_audit_case(cfg, t_eval):
+    eq_p = cfg['physics']['equation_params']
+    bounds = cfg['physics']['bounds']
+    return {
+        'alpha': np.random.uniform(eq_p['alpha'][0], eq_p['alpha'][1]),
+        'beta': np.random.uniform(eq_p['beta'][0], eq_p['beta'][1]),
+        'mu': np.random.uniform(eq_p['mu'][0], eq_p['mu'][1]),
+        'V': np.random.uniform(eq_p['V'][0], eq_p['V'][1]),
+        'A': np.random.uniform(bounds['A'][0], bounds['A'][1]),
+        'w0': 10 ** np.random.uniform(np.log10(bounds['w0'][0]), np.log10(bounds['w0'][1])),
+        'x0': np.random.uniform(bounds['x0'][0], bounds['x0'][1]),
+        'k': np.random.uniform(bounds['k'][0], bounds['k'][1]),
+        'type': 0,
+        't_eval': t_eval,
+    }
+
+
+def _evaluate_audit_case(model, case_row, cfg):
+    device = next(model.parameters()).device
+    x_domain = cfg['physics']['x_domain']
+    t_eval = case_row['t_eval']
+    t_for_solver = 0.01 if t_eval < 0.01 else t_eval
+    X, T, U_cplx = get_ground_truth_CGL(case_row, x_domain[0], x_domain[1], t_for_solver, Nx=512, Nt=None)
+
+    U_true = U_cplx[:, 0] if t_eval < 0.01 else U_cplx.flatten()
+    X_flat = X[:, 0] if t_eval < 0.01 else X.flatten()
+    T_flat = np.zeros_like(X_flat) + t_eval if t_eval < 0.01 else T.flatten()
+    xt_t = torch.tensor(np.stack([X_flat, T_flat], axis=1), dtype=torch.float32, device=device)
+    p_vec = np.array([case_row[k] for k in ['alpha', 'beta', 'mu', 'V', 'A', 'w0', 'x0', 'k', 'type']], dtype=np.float32)
+    p_t = torch.tensor(p_vec, dtype=torch.float32, device=device).unsqueeze(0).repeat(len(X_flat), 1)
+
+    with torch.no_grad():
+        ur, ui = model(p_t, xt_t)
+        up = (ur + 1j * ui).cpu().numpy().flatten()
+
+    norm = np.linalg.norm(U_true)
+    return np.linalg.norm(U_true - up) / (norm if norm > 1e-9 else 1e-9)
+
+
+def run_hard_audit(model, cfg, t_curr, threshold, save_dir, n_cases=60, medium_factor=1.5):
+    os.makedirs(save_dir, exist_ok=True)
+    rng_state = np.random.get_state()
+    np.random.seed(123 + int(round(t_curr * 1000)))
+    records = []
+
+    for _ in range(n_cases):
+        try:
+            case_row = _sample_audit_case(cfg, t_curr)
+            score = _evaluate_audit_case(model, case_row, cfg)
+            case_row['score'] = score
+            case_row['bucket'] = 'hard' if score > medium_factor * threshold else ('medium' if score > threshold else 'easy')
+            case_row['signature'] = _case_signature(case_row)
+            records.append(case_row)
+        except Exception:
+            continue
+
+    np.random.set_state(rng_state)
+    if not records:
+        return {'hard': [], 'medium': [], 'easy': []}
+
+    audit_path = os.path.join(save_dir, "hard_audit_cases.csv")
+    write_header = not os.path.exists(audit_path)
+    with open(audit_path, 'a', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=['t_eval', 'alpha', 'beta', 'mu', 'V', 'A', 'w0', 'x0', 'k', 'type', 'score', 'bucket', 'signature'])
+        if write_header:
+            writer.writeheader()
+        for row in records:
+            writer.writerow(row)
+
+    persistent_counts = {}
+    for row in records:
+        if row['bucket'] != 'easy':
+            persistent_counts[row['signature']] = persistent_counts.get(row['signature'], 0) + 1
+
+    groups = {'hard': [], 'medium': [], 'easy': []}
+    for row in records:
+        groups[row['bucket']].append(row)
+
+    summary_path = os.path.join(save_dir, "hard_audit_summary.csv")
+    write_header = not os.path.exists(summary_path)
+    with open(summary_path, 'a', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=['t_eval', 'n_cases', 'n_hard', 'n_medium', 'n_easy', 'mean_score', 'max_score'])
+        if write_header:
+            writer.writeheader()
+        writer.writerow({
+            't_eval': t_curr,
+            'n_cases': len(records),
+            'n_hard': len(groups['hard']),
+            'n_medium': len(groups['medium']),
+            'n_easy': len(groups['easy']),
+            'mean_score': float(np.mean([r['score'] for r in records])),
+            'max_score': float(np.max([r['score'] for r in records])),
+        })
+
+    persistence = {}
+    if os.path.exists(audit_path):
+        with open(audit_path, 'r', newline='') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row['bucket'] in {'hard', 'medium'}:
+                    sig = row['signature']
+                    item = persistence.setdefault(sig, {'count': 0, 'worst_score': 0.0, 'last_t_eval': 0.0, 'alpha': row['alpha'], 'beta': row['beta'], 'mu': row['mu'], 'V': row['V'], 'A': row['A'], 'w0': row['w0'], 'x0': row['x0'], 'k': row['k'], 'type': row['type']})
+                    item['count'] += 1
+                    item['worst_score'] = max(item['worst_score'], float(row['score']))
+                    item['last_t_eval'] = max(item['last_t_eval'], float(row['t_eval']))
+
+    persistent_path = os.path.join(save_dir, "hard_audit_persistent.csv")
+    with open(persistent_path, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=['signature', 'count', 'worst_score', 'last_t_eval', 'alpha', 'beta', 'mu', 'V', 'A', 'w0', 'x0', 'k', 'type'])
+        writer.writeheader()
+        for sig, item in sorted(persistence.items(), key=lambda kv: (-kv[1]['count'], -kv[1]['worst_score'])):
+            writer.writerow({'signature': sig, **item})
+
+    return groups
 
 
 def _compute_relative_pde_loss(components):
@@ -269,7 +415,7 @@ def run_audit(model, cfg, t_max, threshold=0.05, n_global=60, verbose=False, his
 # ==============================================================================
 # 2. LE WORKER ADAM UNIQUE & ADAPTATIF
 # ==============================================================================
-def train_step_adaptive(model, optimizer, cfg, t_prev, t_curr, base_lr, n_iters, is_global=False, disable_rar=False, target_error=0.03, allow_relaxation=True, teacher_model=None):
+def train_step_adaptive(model, optimizer, cfg, t_prev, t_curr, base_lr, n_iters, is_global=False, disable_rar=False, target_error=0.03, allow_relaxation=True, teacher_model=None, case_groups=None, group_weights=None):
     king = KingOfTheHill(model)
     king.update(model, 1.0)
     
@@ -321,7 +467,10 @@ def train_step_adaptive(model, optimizer, cfg, t_prev, t_curr, base_lr, n_iters,
         if is_global:
             b_p, c_p, p_p = get_pde_batch_cgle_global(bs_pde, cfg, device, t_curr)
         else:
-            b_p, c_p, p_p = get_pde_batch_cgle_causal(bs_pde, cfg, device, t_prev, t_curr)
+            if case_groups:
+                b_p, c_p, p_p = get_pde_batch_cgle_causal_mixed(bs_pde, cfg, device, t_prev, t_curr, case_groups=case_groups, group_weights=group_weights)
+            else:
+                b_p, c_p, p_p = get_pde_batch_cgle_causal(bs_pde, cfg, device, t_prev, t_curr)
         
         if rar_active and rar_b is not None and b_p is not None:
             b_p = torch.cat([b_p, rar_b], dim=0)
@@ -554,6 +703,7 @@ def train_navigator(model, cfg, explicit_resume_path=None):
     dt_min = 0.1 # Plancher de tolérance strict (Garde-fou)
     t_max = cfg['physics']['t_max']
     base_lr = float(cfg['time_marching'].get('learning_rate', 2e-4))
+    hard_audit_cfg = _get_hard_audit_cfg(cfg)
     
     optimizer = optim.Adam(model.parameters(), lr=base_lr)
     
@@ -619,12 +769,34 @@ def train_navigator(model, cfg, explicit_resume_path=None):
             # --- 2. La GRANDE Boucle Adaptative (Fail-Fast interne à it=4000) ---
             current_target = target if not soft_accept_mode else target * 2.0
             zone_iters = get_zone_config(t_curr, cfg)
+            case_groups = None
+            group_weights = None
+            if hard_audit_cfg['enabled'] and not is_easy_win and not (hard_audit_cfg['skip_first_step'] and t_prev <= 1e-8):
+                case_groups = run_hard_audit(
+                    model,
+                    cfg,
+                    t_curr,
+                    current_target,
+                    save_dir,
+                    n_cases=int(hard_audit_cfg['n_cases']),
+                    medium_factor=float(hard_audit_cfg['medium_factor']),
+                )
+                group_weights = {
+                    'hard': float(hard_audit_cfg['mix_hard']),
+                    'medium': float(hard_audit_cfg['mix_medium']),
+                    'global': float(hard_audit_cfg['mix_global']),
+                }
+                print(
+                    f"    🧪 Hard audit dt: hard={len(case_groups['hard'])}, "
+                    f"medium={len(case_groups['medium'])}, easy={len(case_groups['easy'])}"
+                )
             teacher_model = copy.deepcopy(model).to(next(model.parameters()).device).eval()
             for param in teacher_model.parameters():
                 param.requires_grad_(False)
             success, final_score = train_step_adaptive(
                 model, optimizer, cfg, t_prev, t_curr, base_lr,
-                n_iters=zone_iters, is_global=False, target_error=current_target, teacher_model=teacher_model
+                n_iters=zone_iters, is_global=False, target_error=current_target, teacher_model=teacher_model,
+                case_groups=case_groups, group_weights=group_weights
             )
 
             if success or soft_accept_mode:

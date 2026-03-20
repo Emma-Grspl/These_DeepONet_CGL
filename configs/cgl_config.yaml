@@ -57,6 +57,15 @@ training:
     patience_audits: 6
     min_score_improvement: 0.001
     min_loss_improvement_rel: 0.03
+
+  hard_audit:
+    enabled: true
+    skip_first_step: true
+    n_cases: 60
+    medium_factor: 1.5
+    mix_hard: 0.5
+    mix_medium: 0.2
+    mix_global: 0.3
     
   target_error_global: 0.045   
   save_dir: "results/CGL_Talanov_V1"

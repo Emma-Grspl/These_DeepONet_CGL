@@ -25,6 +25,45 @@ def _sample_cgl_branch(n_samples, cfg, device):
 def _params_dict_from_branch(branch):
     return {"alpha": branch[:, 0:1], "beta": branch[:, 1:2], "mu": branch[:, 2:3], "V": branch[:, 3:4]}
 
+
+def _sample_causal_times(n_samples, device, t_prev, t_curr):
+    if t_prev <= 1e-5:
+        return torch.rand(n_samples, 1, device=device) * t_curr
+
+    n_past = int(0.3 * n_samples)
+    t_past = torch.rand(n_past, 1, device=device) * t_prev
+    t_front = torch.rand(n_samples - n_past, 1, device=device) * (t_curr - t_prev) + t_prev
+    return torch.cat([t_past, t_front], dim=0)
+
+
+def _sample_coords_from_branch(branch, cfg, device, t_prev, t_curr):
+    x_min, x_max = cfg['physics']['x_domain'] if isinstance(cfg, dict) else cfg.physics['x_domain']
+    n_samples = branch.shape[0]
+    w0 = branch[:, 5:6]
+    x0 = branch[:, 6:7]
+    t = _sample_causal_times(n_samples, device, t_prev, t_curr)
+
+    n_center = int(0.8 * n_samples)
+    W_t = w0[:n_center] * torch.sqrt(1.0 + (2.0 * t[:n_center])**2)
+    x_center = x0[:n_center] + torch.randn(n_center, 1, device=device) * W_t * 1.5
+    x_uniform = torch.rand(n_samples - n_center, 1, device=device) * (x_max - x_min) + x_min
+    x = torch.cat([x_center, x_uniform], dim=0)
+    x = torch.clamp(x, x_min, x_max)
+
+    idx = torch.randperm(n_samples, device=device)
+    branch, x, t = branch[idx], x[idx], t[idx]
+    coords = torch.cat([x, t], dim=1).requires_grad_(True)
+    return branch, coords, _params_dict_from_branch(branch)
+
+
+def _cases_to_branch(case_rows, cfg, device, n_samples):
+    if not case_rows or n_samples <= 0:
+        return None
+
+    idx = np.random.randint(0, len(case_rows), size=n_samples)
+    selected = np.array([[case_rows[i][k] for k in ['alpha', 'beta', 'mu', 'V', 'A', 'w0', 'x0', 'k', 'type']] for i in idx], dtype=np.float32)
+    return torch.tensor(selected, dtype=torch.float32, device=device)
+
 def get_ic_batch_cgle(batch_size, cfg, device):
     """
     Génère un batch de CI (t=0) : UNIQUEMENT GAUSSIENNE (0).
@@ -72,38 +111,45 @@ def get_pde_batch_cgle_causal(n_samples, cfg, device, t_prev, t_curr):
     Générateur PDE avec Time Marching Causal (30% mémoire passé, 70% front actif)
     et Focus Spatial Dynamique (Suit l'étalement W(t) de la Gaussienne).
     """
-    x_min, x_max = cfg['physics']['x_domain'] if isinstance(cfg, dict) else cfg.physics['x_domain']
     branch = _sample_cgl_branch(n_samples, cfg, device)
-    w0 = branch[:, 5:6]
-    x0 = branch[:, 6:7]
+    return _sample_coords_from_branch(branch, cfg, device, t_prev, t_curr)
 
-    # 3. Échantillonnage Temporel Causal (Doit être fait AVANT l'espace)
-    if t_prev <= 1e-5:
-        t = torch.rand(n_samples, 1, device=device) * t_curr
-    else:
-        n_past = int(0.3 * n_samples)
-        t_past = torch.rand(n_past, 1, device=device) * t_prev
-        t_front = torch.rand(n_samples - n_past, 1, device=device) * (t_curr - t_prev) + t_prev
-        t = torch.cat([t_past, t_front], dim=0)
 
-    # 4. Échantillonnage Spatial Focus DYNAMIQUE (80% centre)
-    n_center = int(0.8 * n_samples)
-    
-    # Largeur dynamique de l'enveloppe
-    W_t = w0[:n_center] * torch.sqrt(1.0 + (2.0 * t[:n_center])**2)
-    
-    x_center = x0[:n_center] + torch.randn(n_center, 1, device=device) * W_t * 1.5
-    x_uniform = torch.rand(n_samples - n_center, 1, device=device) * (x_max - x_min) + x_min
-    
-    x = torch.cat([x_center, x_uniform], dim=0)
-    x = torch.clamp(x, x_min, x_max)
+def get_pde_batch_cgle_causal_mixed(n_samples, cfg, device, t_prev, t_curr, case_groups=None, group_weights=None):
+    """Batch PDE causal avec mélange de cas ciblés et tirage global."""
+    if not case_groups:
+        return get_pde_batch_cgle_causal(n_samples, cfg, device, t_prev, t_curr)
 
-    # 5. Shuffle final
-    idx = torch.randperm(n_samples)
-    branch, x, t = branch[idx], x[idx], t[idx]
+    weights = {'hard': 0.5, 'medium': 0.2, 'global': 0.3}
+    if group_weights:
+        weights.update(group_weights)
 
-    coords = torch.cat([x, t], dim=1).requires_grad_(True)
-    return branch, coords, _params_dict_from_branch(branch)
+    n_hard = int(n_samples * weights['hard']) if case_groups.get('hard') else 0
+    n_medium = int(n_samples * weights['medium']) if case_groups.get('medium') else 0
+    n_global = max(0, n_samples - n_hard - n_medium)
+
+    chunks = []
+    hard_branch = _cases_to_branch(case_groups.get('hard', []), cfg, device, n_hard)
+    if hard_branch is not None:
+        chunks.append(hard_branch)
+    medium_branch = _cases_to_branch(case_groups.get('medium', []), cfg, device, n_medium)
+    if medium_branch is not None:
+        chunks.append(medium_branch)
+    if n_global > 0:
+        chunks.append(_sample_cgl_branch(n_global, cfg, device))
+
+    if not chunks:
+        return get_pde_batch_cgle_causal(n_samples, cfg, device, t_prev, t_curr)
+
+    branch = torch.cat(chunks, dim=0)
+    if branch.shape[0] < n_samples:
+        extra = _sample_cgl_branch(n_samples - branch.shape[0], cfg, device)
+        branch = torch.cat([branch, extra], dim=0)
+    elif branch.shape[0] > n_samples:
+        idx = torch.randperm(branch.shape[0], device=device)[:n_samples]
+        branch = branch[idx]
+
+    return _sample_coords_from_branch(branch, cfg, device, t_prev, t_curr)
 
 
 def get_pde_batch_cgle_global(n_samples, cfg, device, t_max_local):
