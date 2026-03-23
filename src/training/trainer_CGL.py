@@ -143,6 +143,35 @@ def _get_hard_audit_cfg(cfg):
     return {k: user_cfg.get(k, v) for k, v in defaults.items()}
 
 
+def _get_target_cfg(cfg):
+    defaults = {
+        'base_target_error': None,
+        'early_time_relaxation':
+            [
+                {'t_max': 0.1, 'target_error': 0.09},
+                {'t_max': 0.2, 'target_error': 0.07},
+                {'t_max': 0.5, 'target_error': 0.055},
+            ],
+    }
+    training_cfg = cfg['training'] if isinstance(cfg, dict) else cfg.training
+    merged = defaults.copy()
+    user_cfg = training_cfg.get('target_schedule', {})
+    merged.update(user_cfg)
+    return merged
+
+
+def _get_step_target(cfg, t_curr):
+    schedule_cfg = _get_target_cfg(cfg)
+    base_target = schedule_cfg['base_target_error']
+    if base_target is None:
+        base_target = (cfg['training'] if isinstance(cfg, dict) else cfg.training).get('target_error_global', 0.03)
+
+    for item in schedule_cfg.get('early_time_relaxation', []):
+        if t_curr <= item['t_max'] + 1e-12:
+            return float(max(base_target, item['target_error']))
+    return float(base_target)
+
+
 def _case_signature(case_row):
     return "|".join([
         f"{case_row['alpha']:.6f}",
@@ -776,6 +805,7 @@ def train_navigator(model, cfg, explicit_resume_path=None):
         
     easy_win_streak = 0
     target = cfg['training'].get('target_error_global', 0.03)
+    first_attempt_done = False
 
     print("\n🧭 [Navigator] Démarrage de la séquence (Hard Constraint).")
     
@@ -788,10 +818,11 @@ def train_navigator(model, cfg, explicit_resume_path=None):
             soft_accept_mode = True
             
         t_curr = min(t_prev + dt, t_max)
+        step_target = _get_step_target(cfg, t_curr)
         print(f"\n🚀 Cap t={t_curr:.4f} (+{dt:.4f}) | Streak: {easy_win_streak}{' [SOFT ACCEPT]' if soft_accept_mode else ''}")
         
         # --- 1. Easy Win ---
-        is_easy_win, score = run_audit(model, cfg, t_curr, threshold=target if not soft_accept_mode else target * 2.0, verbose=True, historical=False)
+        is_easy_win, score = run_audit(model, cfg, t_curr, threshold=step_target if not soft_accept_mode else step_target * 2.0, verbose=True, historical=False)
         step_validated = False
         
         if is_easy_win:
@@ -806,11 +837,12 @@ def train_navigator(model, cfg, explicit_resume_path=None):
             easy_win_streak = 0
 
             # --- 2. La GRANDE Boucle Adaptative (Fail-Fast interne à it=4000) ---
-            current_target = target if not soft_accept_mode else target * 2.0
+            current_target = step_target if not soft_accept_mode else step_target * 2.0
             zone_iters = get_zone_config(t_curr, cfg)
             case_groups = None
             group_weights = None
-            if hard_audit_cfg['enabled'] and not is_easy_win and not (hard_audit_cfg['skip_first_step'] and t_prev <= 1e-8):
+            skip_hard_audit = hard_audit_cfg['skip_first_step'] and not first_attempt_done
+            if hard_audit_cfg['enabled'] and not is_easy_win and not skip_hard_audit:
                 case_groups = run_hard_audit(
                     model,
                     cfg,
@@ -837,6 +869,7 @@ def train_navigator(model, cfg, explicit_resume_path=None):
                 n_iters=zone_iters, is_global=False, target_error=current_target, teacher_model=teacher_model,
                 case_groups=case_groups, group_weights=group_weights
             )
+            first_attempt_done = True
 
             if success or soft_accept_mode:
                 if soft_accept_mode and not success:
@@ -851,12 +884,12 @@ def train_navigator(model, cfg, explicit_resume_path=None):
                 
         # --- 4. Validation Historique & Rescue Loop ---
         if step_validated:
-            hist_ok, hist_score = run_audit(model, cfg, t_curr, threshold=target if not soft_accept_mode else target * 2.0, verbose=True, historical=True)
+            hist_ok, hist_score = run_audit(model, cfg, t_curr, threshold=step_target if not soft_accept_mode else step_target * 2.0, verbose=True, historical=True)
             
             if not hist_ok and not soft_accept_mode:
                 print(f"    ⚠️ Oubli catastrophique détecté (Audit Histo: {hist_score:.2%}). Lancement Rescue Loop.")
                 rescue_iters = max(4000, min(10000, get_zone_config(t_curr, cfg) // 3))
-                success_rescue, _ = train_step_adaptive(model, optimizer, cfg, 0.0, t_curr, base_lr, n_iters=rescue_iters, is_global=True, target_error=target, allow_relaxation=False)
+                success_rescue, _ = train_step_adaptive(model, optimizer, cfg, 0.0, t_curr, base_lr, n_iters=rescue_iters, is_global=True, target_error=step_target, allow_relaxation=False)
                 if not success_rescue:
                     print("    🛑 La Rescue Loop a peiné, mais on sauvegarde et on avance prudemment.")
                     dt *= 0.75
