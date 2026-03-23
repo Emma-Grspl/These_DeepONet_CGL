@@ -124,15 +124,18 @@ def get_pde_batch_cgle_causal_mixed(n_samples, cfg, device, t_prev, t_curr, case
     if group_weights:
         weights.update(group_weights)
 
-    n_hard = int(n_samples * weights['hard']) if case_groups.get('hard') else 0
-    n_medium = int(n_samples * weights['medium']) if case_groups.get('medium') else 0
+    hard_pool = list(case_groups.get('hard', [])) + list(case_groups.get('persistent_hard', []))
+    medium_pool = list(case_groups.get('medium', [])) + list(case_groups.get('persistent_medium', []))
+
+    n_hard = int(n_samples * weights['hard']) if hard_pool else 0
+    n_medium = int(n_samples * weights['medium']) if medium_pool else 0
     n_global = max(0, n_samples - n_hard - n_medium)
 
     chunks = []
-    hard_branch = _cases_to_branch(case_groups.get('hard', []), cfg, device, n_hard)
+    hard_branch = _cases_to_branch(hard_pool, cfg, device, n_hard)
     if hard_branch is not None:
         chunks.append(hard_branch)
-    medium_branch = _cases_to_branch(case_groups.get('medium', []), cfg, device, n_medium)
+    medium_branch = _cases_to_branch(medium_pool, cfg, device, n_medium)
     if medium_branch is not None:
         chunks.append(medium_branch)
     if n_global > 0:

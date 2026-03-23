@@ -184,7 +184,7 @@ def get_ground_truth_CGL(params_dict, x_min, x_max, T_max, Nx=256, Nt=None):
     # --- Génération IC ---
     A  = params_dict.get('A', 1.0)
     w0 = params_dict.get('w0', 1.0)
-    x0 = params_dict.get('x0', 0.0)
+    x0 = 0.0
     k  = params_dict.get('k', 1.0)
 
     # Grille temporaire pour l'IC
@@ -194,7 +194,7 @@ def get_ground_truth_CGL(params_dict, x_min, x_max, T_max, Nx=256, Nt=None):
         x_grid = np.linspace(x_min, x_max, Nx, endpoint=True)
 
     X = (x_grid - x0) / (w0 + 1e-9)
-    Phase = np.exp(1j * k * x_grid)
+    Phase = np.exp(1j * k * (x_grid - x0))
     
     if ic_type == 0:   Env = A * np.exp(-X**2)
     elif ic_type == 1: Env = A / np.cosh(X)

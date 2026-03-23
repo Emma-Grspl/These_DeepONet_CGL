@@ -136,6 +136,7 @@ def _get_hard_audit_cfg(cfg):
         'mix_hard': 0.5,
         'mix_medium': 0.2,
         'mix_global': 0.3,
+        'persistent_top_k': 20,
     }
     training_cfg = cfg['training'] if isinstance(cfg, dict) else cfg.training
     user_cfg = training_cfg.get('hard_audit', {})
@@ -166,7 +167,7 @@ def _sample_audit_case(cfg, t_eval):
         'V': np.random.uniform(eq_p['V'][0], eq_p['V'][1]),
         'A': np.random.uniform(bounds['A'][0], bounds['A'][1]),
         'w0': 10 ** np.random.uniform(np.log10(bounds['w0'][0]), np.log10(bounds['w0'][1])),
-        'x0': np.random.uniform(bounds['x0'][0], bounds['x0'][1]),
+        'x0': 0.0,
         'k': np.random.uniform(bounds['k'][0], bounds['k'][1]),
         'type': 0,
         't_eval': t_eval,
@@ -269,6 +270,29 @@ def run_hard_audit(model, cfg, t_curr, threshold, save_dir, n_cases=60, medium_f
         for sig, item in sorted(persistence.items(), key=lambda kv: (-kv[1]['count'], -kv[1]['worst_score'])):
             writer.writerow({'signature': sig, **item})
 
+    persistent_hard = []
+    persistent_medium = []
+    for sig, item in sorted(persistence.items(), key=lambda kv: (-kv[1]['count'], -kv[1]['worst_score'])):
+        row = {
+            'alpha': float(item['alpha']),
+            'beta': float(item['beta']),
+            'mu': float(item['mu']),
+            'V': float(item['V']),
+            'A': float(item['A']),
+            'w0': float(item['w0']),
+            'x0': 0.0,
+            'k': float(item['k']),
+            'type': float(item['type']),
+            'score': float(item['worst_score']),
+            'signature': sig,
+        }
+        if item['count'] >= 2:
+            persistent_hard.append(row)
+        else:
+            persistent_medium.append(row)
+
+    groups['persistent_hard'] = persistent_hard
+    groups['persistent_medium'] = persistent_medium
     return groups
 
 
@@ -367,10 +391,15 @@ def run_audit(model, cfg, t_max, threshold=0.05, n_global=60, verbose=False, his
     def evaluate_point(p_dict, t_eval):
         t_for_solver = 0.01 if t_eval < 0.01 else t_eval
         X, T, U_cplx = get_ground_truth_CGL(p_dict, x_domain[0], x_domain[1], t_for_solver, Nx=512, Nt=None)
-        
-        U_true = U_cplx[:, 0] if t_eval < 0.01 else U_cplx.flatten()
-        X_flat = X[:, 0] if t_eval < 0.01 else X.flatten()
-        T_flat = np.zeros_like(X_flat) + t_eval if t_eval < 0.01 else T.flatten()
+
+        if historical:
+            U_true = U_cplx[:, 0] if t_eval < 0.01 else U_cplx.flatten()
+            X_flat = X[:, 0] if t_eval < 0.01 else X.flatten()
+            T_flat = np.zeros_like(X_flat) + t_eval if t_eval < 0.01 else T.flatten()
+        else:
+            U_true = U_cplx[:, 0] if t_eval < 0.01 else U_cplx[:, -1]
+            X_flat = X[:, 0]
+            T_flat = np.zeros_like(X_flat) + t_eval
             
         xt_t = torch.tensor(np.stack([X_flat, T_flat], axis=1), dtype=torch.float32).to(device)
         p_vec = np.array([p_dict[k] for k in ['alpha','beta','mu','V','A','w0','x0','k','type']])
@@ -391,7 +420,7 @@ def run_audit(model, cfg, t_max, threshold=0.05, n_global=60, verbose=False, his
                  'V':     np.random.uniform(eq_p['V'][0],     eq_p['V'][1]),
                  'A':     np.random.uniform(bounds['A'][0], bounds['A'][1]),
                  'w0':    10**np.random.uniform(np.log10(bounds['w0'][0]), np.log10(bounds['w0'][1])),
-                 'x0': np.random.uniform(bounds['x0'][0], bounds['x0'][1]),
+                 'x0': 0.0,
                  'k': np.random.uniform(bounds['k'][0], bounds['k'][1]),
                  'type': 0}
             
@@ -485,7 +514,7 @@ def train_step_adaptive(model, optimizer, cfg, t_prev, t_curr, base_lr, n_iters,
         l_pde_weak = _compute_weak_pde_loss(components, c_p, cfg)
         l_pde = l_pde_abs + float(loss_cfg['pde_relative_weight']) * l_pde_rel + float(loss_cfg['weak_weight']) * l_pde_weak
         
-        idx_bc = torch.randperm(b_p.size(0))[:int(b_p.size(0)*0.25)]
+        idx_bc = torch.randperm(b_p.size(0), device=device)[:int(b_p.size(0)*0.25)]
         b_bc = b_p[idx_bc]
         c_bc_base = c_p[idx_bc].detach().clone()
         x_min, x_max = cfg['physics']['x_domain']
@@ -498,7 +527,17 @@ def train_step_adaptive(model, optimizer, cfg, t_prev, t_curr, base_lr, n_iters,
         ur_bc, ui_bc = model(b_all_bc, c_all_bc)
         grads_r = torch.autograd.grad(ur_bc.sum(), c_all_bc, create_graph=True)[0]
         grads_i = torch.autograd.grad(ui_bc.sum(), c_all_bc, create_graph=True)[0]
-        loss_bc = torch.mean(grads_r[:, 0:1]**2 + grads_i[:, 0:1]**2)
+        n_bc = b_bc.size(0)
+        ur_left, ur_right = ur_bc[:n_bc], ur_bc[n_bc:]
+        ui_left, ui_right = ui_bc[:n_bc], ui_bc[n_bc:]
+        du_dx_r_left, du_dx_r_right = grads_r[:n_bc, 0:1], grads_r[n_bc:, 0:1]
+        du_dx_i_left, du_dx_i_right = grads_i[:n_bc, 0:1], grads_i[n_bc:, 0:1]
+        loss_bc = torch.mean(
+            (ur_left - ur_right) ** 2 +
+            (ui_left - ui_right) ** 2 +
+            (du_dx_r_left - du_dx_r_right) ** 2 +
+            (du_dx_i_left - du_dx_i_right) ** 2
+        )
         loss_mass = _compute_mass_balance_loss(model, cfg, device, 0.0 if is_global else t_prev, t_curr, loss_cfg)
         loss_continuity = _compute_continuity_loss(model, teacher_model, cfg, device, t_prev, loss_cfg)
 
