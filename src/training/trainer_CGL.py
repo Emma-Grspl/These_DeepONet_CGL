@@ -137,6 +137,8 @@ def _get_hard_audit_cfg(cfg):
         'mix_medium': 0.2,
         'mix_global': 0.3,
         'persistent_top_k': 20,
+        'hard_top_fraction': 0.2,
+        'medium_top_fraction': 0.2,
     }
     training_cfg = cfg['training'] if isinstance(cfg, dict) else cfg.training
     user_cfg = training_cfg.get('hard_audit', {})
@@ -231,12 +233,13 @@ def run_hard_audit(model, cfg, t_curr, threshold, save_dir, n_cases=60, medium_f
     np.random.seed(123 + int(round(t_curr * 1000)))
     records = []
 
+    hard_cfg = _get_hard_audit_cfg(cfg)
+
     for _ in range(n_cases):
         try:
             case_row = _sample_audit_case(cfg, t_curr)
             score = _evaluate_audit_case(model, case_row, cfg)
             case_row['score'] = score
-            case_row['bucket'] = 'hard' if score > medium_factor * threshold else ('medium' if score > threshold else 'easy')
             case_row['signature'] = _case_signature(case_row)
             records.append(case_row)
         except Exception:
@@ -245,6 +248,24 @@ def run_hard_audit(model, cfg, t_curr, threshold, save_dir, n_cases=60, medium_f
     np.random.set_state(rng_state)
     if not records:
         return {'hard': [], 'medium': [], 'easy': []}
+
+    records.sort(key=lambda row: row['score'], reverse=True)
+    n_records = len(records)
+    n_hard = max(1, int(round(n_records * float(hard_cfg['hard_top_fraction']))))
+    n_medium = max(1, int(round(n_records * float(hard_cfg['medium_top_fraction']))))
+
+    for idx, row in enumerate(records):
+        if idx < n_hard:
+            row['bucket'] = 'hard'
+        elif idx < n_hard + n_medium:
+            row['bucket'] = 'medium'
+        else:
+            row['bucket'] = 'easy'
+
+        if row['score'] <= threshold:
+            row['bucket'] = 'easy'
+        elif row['score'] <= medium_factor * threshold and row['bucket'] == 'hard':
+            row['bucket'] = 'medium'
 
     audit_path = os.path.join(save_dir, "hard_audit_cases.csv")
     write_header = not os.path.exists(audit_path)
@@ -480,13 +501,14 @@ def train_step_adaptive(model, optimizer, cfg, t_prev, t_curr, base_lr, n_iters,
     bs_pde = cfg['training']['batch_size_pde']
     loss_cfg = _get_physics_loss_cfg(cfg)
     early_stop_cfg = _get_early_stop_cfg(cfg)
+    lr_decay_step = int(cfg['time_marching'].get('lr_decay_step', 5000))
+    lr_decay_gamma = float(cfg['time_marching'].get('lr_decay_gamma', 0.85))
     
     # Réinitialisation du LR de départ pour ce pas
     for param_group in optimizer.param_groups:
         param_group['lr'] = base_lr
         
-    # Baisse douce : * 0.85 toutes les 5000 itérations
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5000, gamma=0.85)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=lr_decay_step, gamma=lr_decay_gamma)
     
     rar_active = False
     rar_b, rar_c, rar_p = None, None, None

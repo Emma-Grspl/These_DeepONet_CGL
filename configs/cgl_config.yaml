@@ -63,6 +63,8 @@ training:
     skip_first_step: true
     n_cases: 60
     medium_factor: 1.5
+    hard_top_fraction: 0.2
+    medium_top_fraction: 0.2
     mix_hard: 0.5
     mix_medium: 0.2
     mix_global: 0.3
@@ -81,7 +83,9 @@ training:
 
 time_marching:
   # LR de départ de la Macro-Loop (qui sera divisé par 2 en cas d'échec)
-  learning_rate: 1e-4  
+  learning_rate: 2e-4
+  lr_decay_step: 5000
+  lr_decay_gamma: 0.9
   # Nouvelles zones adaptées pour T_max = 10.0
   zones:
     - t_end: 1.0
