@@ -21,8 +21,9 @@ def _get_benchmark_cfg(cfg):
         "fixed_cases_path": "benchmarks/cgl_benchmark_v1.yaml",
         "seed": 1234,
         "n_cases": 100,
-        "eval_times": [0.1, 0.2, 0.5, 1.0],
-        "publish_threshold": 0.05,
+        "eval_times": [0.1, 0.2, 0.5, 1.0, 5.0],
+        "primary_eval_time": None,
+        "publish_threshold": 0.04,
         "solver_nx_profile": 512,
         "solver_nx_slab": 256,
         "compute_slab_metric": True,
@@ -30,6 +31,8 @@ def _get_benchmark_cfg(cfg):
     }
     merged = defaults.copy()
     merged.update(dict(root))
+    if merged["primary_eval_time"] is None:
+        merged["primary_eval_time"] = float(max(merged["eval_times"]))
     return merged
 
 
@@ -71,6 +74,7 @@ def build_fixed_benchmark_cases(cfg, force_rebuild=False):
         "seed": int(bench_cfg["seed"]),
         "n_cases": len(cases),
         "eval_times": [float(t) for t in bench_cfg["eval_times"]],
+        "primary_eval_time": float(bench_cfg["primary_eval_time"]),
         "publish_threshold": float(bench_cfg["publish_threshold"]),
         "cases": cases,
     }
@@ -245,6 +249,65 @@ def summarize_benchmark_rows(rows, threshold=0.05):
     return summary, overall
 
 
+def summarize_primary_time(summary_rows, primary_eval_time):
+    if not summary_rows:
+        return {}
+    target = float(primary_eval_time)
+    best_row = min(summary_rows, key=lambda row: abs(float(row["t_eval"]) - target))
+    result = dict(best_row)
+    result["primary_eval_time_requested"] = target
+    result["primary_eval_time_used"] = float(best_row["t_eval"])
+    return result
+
+
+def write_benchmark_report(payload, summary, overall, primary, output_dir):
+    report_path = os.path.join(output_dir, "report.md")
+    lines = []
+    lines.append("# CGL Benchmark Report")
+    lines.append("")
+    lines.append(f"- Benchmark: `{payload['name']}`")
+    lines.append(f"- Cases: `{payload['n_cases']}`")
+    lines.append(f"- Eval times: `{payload['eval_times']}`")
+    lines.append(f"- Primary eval time: `{payload['primary_eval_time']}`")
+    lines.append(f"- Publish threshold: `{100.0 * payload['publish_threshold']:.2f}%`")
+    lines.append("")
+    lines.append("## Primary Metric")
+    lines.append("")
+    if primary:
+        lines.append(f"- Time used: `{primary['primary_eval_time_used']}`")
+        lines.append(f"- Mean relative complex L2 on final profile: `{100.0 * primary['l2_profile_complex_mean']:.2f}%`")
+        lines.append(f"- Median relative complex L2 on final profile: `{100.0 * primary['l2_profile_complex_median']:.2f}%`")
+        lines.append(f"- P90 relative complex L2 on final profile: `{100.0 * primary['l2_profile_complex_p90']:.2f}%`")
+        lines.append(f"- Pass rate under threshold: `{100.0 * primary['pass_rate_under_threshold']:.1f}%`")
+        lines.append(f"- Mean amplitude L2: `{100.0 * primary['l2_profile_amplitude_mean']:.2f}%`")
+        lines.append(f"- Mean phase-aligned complex L2: `{100.0 * primary['l2_profile_phase_aligned_mean']:.2f}%`")
+        if "l2_slab_complex_mean" in primary:
+            lines.append(f"- Mean slab complex L2: `{100.0 * primary['l2_slab_complex_mean']:.2f}%`")
+    else:
+        lines.append("- No primary summary available.")
+    lines.append("")
+    lines.append("## Overall Aggregate")
+    lines.append("")
+    if overall:
+        lines.append(f"- Overall mean relative complex L2: `{100.0 * overall.get('l2_profile_complex_mean', float('nan')):.2f}%`")
+        lines.append(f"- Overall median relative complex L2: `{100.0 * overall.get('l2_profile_complex_median', float('nan')):.2f}%`")
+        lines.append(f"- Overall pass rate under threshold: `{100.0 * overall.get('pass_rate_under_threshold', 0.0):.1f}%`")
+    lines.append("")
+    lines.append("## By Time")
+    lines.append("")
+    lines.append("| t | mean L2 | median L2 | p90 | pass rate |")
+    lines.append("| --- | --- | --- | --- | --- |")
+    for row in summary:
+        lines.append(
+            f"| {row['t_eval']:.2f} | {100.0 * row['l2_profile_complex_mean']:.2f}% | "
+            f"{100.0 * row['l2_profile_complex_median']:.2f}% | "
+            f"{100.0 * row['l2_profile_complex_p90']:.2f}% | "
+            f"{100.0 * row['pass_rate_under_threshold']:.1f}% |"
+        )
+    with open(report_path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+
 def write_benchmark_outputs(rows, summary, overall, output_dir):
     os.makedirs(output_dir, exist_ok=True)
 
@@ -265,4 +328,3 @@ def write_benchmark_outputs(rows, summary, overall, output_dir):
     overall_json = os.path.join(output_dir, "summary_overall.json")
     with open(overall_json, "w") as f:
         json.dump(overall, f, indent=2)
-

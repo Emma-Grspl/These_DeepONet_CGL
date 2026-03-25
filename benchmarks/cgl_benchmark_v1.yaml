@@ -6,7 +6,9 @@ eval_times:
 - 0.2
 - 0.5
 - 1.0
-publish_threshold: 0.05
+- 5.0
+primary_eval_time: 5.0
+publish_threshold: 0.04
 cases:
 - alpha: 0.1915194503788923
   beta: 0.12210877103983186

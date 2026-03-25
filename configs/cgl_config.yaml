@@ -32,6 +32,7 @@ model:
   fourier_scales: [1.0, 2.0, 5.0, 10.0, 20.0] 
 
 training:
+  logic_variant: "modern"
   # Gros batchs maintenus pour une exploration robuste de la PDE
   batch_size_ic: 8192    
   batch_size_pde: 8192    
@@ -105,8 +106,9 @@ benchmark:
   fixed_cases_path: "benchmarks/cgl_benchmark_v1.yaml"
   seed: 1234
   n_cases: 100
-  eval_times: [0.1, 0.2, 0.5, 1.0]
-  publish_threshold: 0.05
+  eval_times: [0.1, 0.2, 0.5, 1.0, 5.0]
+  primary_eval_time: 5.0
+  publish_threshold: 0.04
   solver_nx_profile: 512
   solver_nx_slab: 256
   compute_slab_metric: true

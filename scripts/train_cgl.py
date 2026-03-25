@@ -90,10 +90,12 @@ def main():
     # On force la sauvegarde dans le dossier déterminé plus haut
     yaml_data['training']['save_dir'] = ckpt_dir 
     cfg = ConfigObj(yaml_data)
+    logic_variant = cfg['training'].get('logic_variant', 'modern')
 
     # 3. DEVICE
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"📱 Device : {device}")
+    print(f"🧠 Training logic : {logic_variant}")
 
     # 4. MODÈLE
     model = CGL_PI_DeepONet(cfg).to(device)

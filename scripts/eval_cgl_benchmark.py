@@ -13,7 +13,9 @@ from src.utils.cgl_benchmark import (
     _get_benchmark_cfg,
     build_fixed_benchmark_cases,
     evaluate_fixed_benchmark,
+    summarize_primary_time,
     summarize_benchmark_rows,
+    write_benchmark_report,
     write_benchmark_outputs,
 )
 
@@ -66,14 +68,21 @@ def main():
     bench_cfg = _get_benchmark_cfg(cfg)
     summary, overall = summarize_benchmark_rows(rows, threshold=float(bench_cfg["publish_threshold"]))
     write_benchmark_outputs(rows, summary, overall, args.output_dir)
+    primary = summarize_primary_time(summary, float(bench_cfg["primary_eval_time"]))
+    with open(os.path.join(args.output_dir, "summary_primary.json"), "w") as f:
+        import json
+        json.dump(primary, f, indent=2)
+    write_benchmark_report(payload, summary, overall, primary, args.output_dir)
 
     print(f"Benchmark: {payload['name']}")
     print(f"Cases: {payload['n_cases']} | Times: {payload['eval_times']}")
     print(f"Threshold: {100.0 * bench_cfg['publish_threshold']:.2f}%")
+    print(f"Primary time: {primary['primary_eval_time_used']:.2f}")
+    print(f"Primary mean L2(profile): {100.0 * primary['l2_profile_complex_mean']:.2f}%")
+    print(f"Primary median L2(profile): {100.0 * primary['l2_profile_complex_median']:.2f}%")
+    print(f"Primary p90 L2(profile): {100.0 * primary['l2_profile_complex_p90']:.2f}%")
+    print(f"Primary pass rate < threshold: {100.0 * primary['pass_rate_under_threshold']:.1f}%")
     print(f"Overall mean L2(profile): {100.0 * overall['l2_profile_complex_mean']:.2f}%")
-    print(f"Overall median L2(profile): {100.0 * overall['l2_profile_complex_median']:.2f}%")
-    print(f"Overall p90 L2(profile): {100.0 * overall['l2_profile_complex_p90']:.2f}%")
-    print(f"Pass rate < threshold: {100.0 * overall['pass_rate_under_threshold']:.1f}%")
     print(f"Saved outputs to: {args.output_dir}")
 
 
