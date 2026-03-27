@@ -85,6 +85,7 @@ training:
 time_marching:
   # LR de départ de la Macro-Loop (qui sera divisé par 2 en cas d'échec)
   learning_rate: 2e-4
+  dt_min: 0.05
   lr_decay_step: 5000
   lr_decay_gamma: 0.9
   # Nouvelles zones adaptées pour T_max = 10.0

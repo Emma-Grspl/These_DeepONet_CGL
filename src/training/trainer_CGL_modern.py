@@ -790,7 +790,7 @@ def train_navigator(model, cfg, explicit_resume_path=None):
     
     t_prev = 0.0
     dt = float(cfg['time_marching']['zones'][0]['dt']) 
-    dt_min = 0.1 # Plancher de tolérance strict (Garde-fou)
+    dt_min = float(cfg['time_marching'].get('dt_min', dt))
     t_max = cfg['physics']['t_max']
     base_lr = float(cfg['time_marching'].get('learning_rate', 2e-4))
     hard_audit_cfg = _get_hard_audit_cfg(cfg)
