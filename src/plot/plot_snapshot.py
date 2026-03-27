@@ -6,10 +6,13 @@ import os
 # Imports locaux nécessaires
 from src.utils.solver_cgl import get_ground_truth_CGL
 
-def plot_temporal_snapshots(cfg, params_dict, model=None, save_path=None, show=False):
+
+def plot_temporal_snapshots(cfg, params_dict, model=None, save_path=None, show=False, time_ratios=None, x_view=None):
     """
-    Trace des snapshots de la solution à 5 instants différents (0, t/6, t/4, t/2, t_max).
-    Colonnes : Module |u|, Partie Réelle, Partie Imaginaire.
+    Trace des snapshots de la solution sur une seule figure compacte.
+    Par défaut : 3 instants (0, t/2, t_max).
+    Lignes : Module |u|, Partie Réelle, Partie Imaginaire.
+    Chaque ligne superpose les différents temps.
     
     Args:
         cfg: Configuration (pour les bounds, x_domain, etc.)
@@ -17,6 +20,7 @@ def plot_temporal_snapshots(cfg, params_dict, model=None, save_path=None, show=F
         model: (Optionnel) Le modèle DeepONet entraîné.
         save_path: (Optionnel) Chemin de sauvegarde.
         show: (Bool) Afficher l'image.
+        time_ratios: (Optionnel) Liste des fractions de t_max à tracer.
     """
     
     # --- 1. Génération de la Vérité Terrain (Solveur) ---
@@ -63,19 +67,20 @@ def plot_temporal_snapshots(cfg, params_dict, model=None, save_path=None, show=F
         U_pred = u_cplx.reshape(X_grid.shape)
 
     # --- 3. Sélection des Instants ---
-    ratios = [0.0, 1/6, 1/4, 1/2, 1.0]
+    ratios = time_ratios if time_ratios is not None else [0.0, 0.5, 1.0]
     time_indices = []
     for r in ratios:
         target_t = t_max * r
         idx = (np.abs(t - target_t)).argmin()
         time_indices.append(idx)
 
-    # --- 4. Plotting (3 Colonnes maintenant) ---
-    # Taille augmentée en largeur pour accommoder la 3ème colonne
-    fig, axes = plt.subplots(5, 3, figsize=(18, 12), sharex=True)
-    
-    # Ajustement des espaces
-    plt.subplots_adjust(hspace=0.4, wspace=0.25)
+    n_snapshots = len(time_indices)
+
+    # --- 4. Plotting compact sur une seule figure ---
+    colors = plt.cm.RdPu(np.linspace(0.45, 0.9, n_snapshots))
+    view_x_min, view_x_max = x_view if x_view is not None else (x_min, x_max)
+    fig, axes = plt.subplots(3, 1, figsize=(11, 10), sharex=True)
+    plt.subplots_adjust(hspace=0.28)
     
     title_str = (f"CGL Snapshots | $\\alpha$={params_dict['alpha']:.2f}, $\\beta$={params_dict['beta']:.2f}, "
                  f"$\\mu$={params_dict['mu']:.2f}, V={params_dict.get('V',0):.2f}")
@@ -88,46 +93,46 @@ def plot_temporal_snapshots(cfg, params_dict, model=None, save_path=None, show=F
         if U_pred is not None:
             u_pred_t = U_pred[:, t_idx]
         
-        # Labels communs
-        ylabel_str = f"t = {current_t:.2f}s"
+        label = f"t = {current_t:.2f}"
 
-        # --- Colonne 1 : Module |u| ---
-        ax_mod = axes[i, 0]
-        ax_mod.plot(x, np.abs(u_true_t), 'k-', label='Exact' if i==0 else "", linewidth=1.5)
+        # --- Ligne 1 : Module |u| ---
+        ax_mod = axes[0]
+        ax_mod.plot(x, np.abs(u_true_t), "k:", alpha=0.7, linewidth=1.2)
         if U_pred is not None:
-            ax_mod.plot(x, np.abs(u_pred_t), 'r--', label='DeepONet' if i==0 else "", linewidth=1.5)
-            
-        ax_mod.set_ylabel(f"{ylabel_str}\n|u|", fontsize=11, fontweight='bold')
-        if i == 0: ax_mod.set_title("Module |u|", fontsize=13)
-        if i == 4: ax_mod.set_xlabel("x")
+            ax_mod.plot(x, np.abs(u_pred_t), color=colors[i], label=label, linewidth=2.0)
+        ax_mod.set_ylabel("|u|", fontsize=11, fontweight="bold")
+        ax_mod.set_title("Snapshots superposés : module", fontsize=13, fontweight="bold")
         ax_mod.grid(True, alpha=0.3)
 
-        # --- Colonne 2 : Partie Réelle Re(u) ---
-        ax_re = axes[i, 1]
-        ax_re.plot(x, np.real(u_true_t), 'k-', linewidth=1.5)
+        # --- Ligne 2 : Partie Réelle Re(u) ---
+        ax_re = axes[1]
+        ax_re.plot(x, np.real(u_true_t), "k:", alpha=0.7, linewidth=1.2)
         if U_pred is not None:
-            ax_re.plot(x, np.real(u_pred_t), 'r--', linewidth=1.5)
-            
-        if i == 0: ax_re.set_title("Réel Re(u)", fontsize=13)
-        if i == 4: ax_re.set_xlabel("x")
+            ax_re.plot(x, np.real(u_pred_t), color=colors[i], label=label, linewidth=2.0)
+        ax_re.set_ylabel("Re(u)", fontsize=11, fontweight="bold")
+        ax_re.set_title("Snapshots superposés : partie réelle", fontsize=13, fontweight="bold")
         ax_re.grid(True, alpha=0.3)
 
-        # --- Colonne 3 : Partie Imaginaire Im(u) (NOUVEAU) ---
-        ax_im = axes[i, 2]
-        ax_im.plot(x, np.imag(u_true_t), 'k-', linewidth=1.5)
+        # --- Ligne 3 : Partie Imaginaire Im(u) ---
+        ax_im = axes[2]
+        ax_im.plot(x, np.imag(u_true_t), "k:", alpha=0.7, linewidth=1.2)
         if U_pred is not None:
-            ax_im.plot(x, np.imag(u_pred_t), 'r--', linewidth=1.5)
-            
-        if i == 0: ax_im.set_title("Imaginaire Im(u)", fontsize=13)
-        if i == 4: ax_im.set_xlabel("x")
+            ax_im.plot(x, np.imag(u_pred_t), color=colors[i], label=label, linewidth=2.0)
+        ax_im.set_ylabel("Im(u)", fontsize=11, fontweight="bold")
+        ax_im.set_title("Snapshots superposés : partie imaginaire", fontsize=13, fontweight="bold")
         ax_im.grid(True, alpha=0.3)
 
-    # Légende unique
+    axes[-1].set_xlabel("x")
+    for ax in axes:
+        ax.set_xlim(view_x_min, view_x_max)
+
     if U_pred is not None:
-        lines_labels = [ax.get_legend_handles_labels() for ax in fig.axes]
-        lines, labels = [sum(lol, []) for lol in zip(*lines_labels)]
-        unique_labels = dict(zip(labels, lines))
-        fig.legend(unique_labels.values(), unique_labels.keys(), loc='upper right', bbox_to_anchor=(0.98, 0.95), fontsize=12)
+        handles = [plt.Line2D([0], [0], color="k", linestyle=":", linewidth=1.5, label="Solveur classique")]
+        handles += [
+            plt.Line2D([0], [0], color=colors[i], linewidth=2.0, label=f"DeepONet, t = {t[time_indices[i]]:.2f}")
+            for i in range(n_snapshots)
+        ]
+        fig.legend(handles=handles, loc="upper right", bbox_to_anchor=(0.98, 0.96), fontsize=11)
 
     # --- 5. Sauvegarde ---
     if save_path:

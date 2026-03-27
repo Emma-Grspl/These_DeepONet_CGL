@@ -6,7 +6,7 @@ import os
 
 from src.utils.solver_cgl import get_ground_truth_CGL
 
-def animate_cgl_solution(cfg, params_dict, model=None, save_path="results/animation.gif", frames=200):
+def animate_cgl_solution(cfg, params_dict, model=None, save_path="results/animation.gif", frames=200, x_view=None):
     """
     Génère une animation comparant la Vérité Terrain et le Modèle (optionnel).
     3 Panneaux : Module, Réel, Imaginaire.
@@ -78,17 +78,19 @@ def animate_cgl_solution(cfg, params_dict, model=None, save_path="results/animat
         y_max_im  = max(y_max_im, np.max(np.abs(np.imag(U_pred))) * 1.2)
 
     # Init des axes
-    ax_mod.set_xlim(x_min, x_max)
+    view_x_min, view_x_max = x_view if x_view is not None else (x_min, x_max)
+
+    ax_mod.set_xlim(view_x_min, view_x_max)
     ax_mod.set_ylim(-0.1, y_max_abs)
     ax_mod.set_ylabel("|u| (Module)", fontsize=12)
     ax_mod.grid(True, alpha=0.3)
     
-    ax_re.set_xlim(x_min, x_max)
+    ax_re.set_xlim(view_x_min, view_x_max)
     ax_re.set_ylim(-y_max_re, y_max_re)
     ax_re.set_ylabel("Re(u)", fontsize=12)
     ax_re.grid(True, alpha=0.3)
     
-    ax_im.set_xlim(x_min, x_max)
+    ax_im.set_xlim(view_x_min, view_x_max)
     ax_im.set_ylim(-y_max_im, y_max_im)
     ax_im.set_ylabel("Im(u)", fontsize=12)
     ax_im.set_xlabel("x", fontsize=12)

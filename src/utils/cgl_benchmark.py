@@ -38,8 +38,13 @@ def _get_benchmark_cfg(cfg):
 
 def _sample_case(rng, cfg):
     bench_cfg = _get_benchmark_cfg(cfg)
-    bounds = bench_cfg["bounds"]
-    eq_p = bench_cfg["equation_params"]
+    if isinstance(cfg, dict):
+        physics_cfg = cfg["physics"]
+    else:
+        physics_cfg = cfg.physics
+
+    bounds = bench_cfg.get("bounds", physics_cfg["bounds"])
+    eq_p = bench_cfg.get("equation_params", physics_cfg["equation_params"])
     return {
         "alpha": float(rng.uniform(eq_p["alpha"][0], eq_p["alpha"][1])),
         "beta": float(rng.uniform(eq_p["beta"][0], eq_p["beta"][1])),
