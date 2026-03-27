@@ -90,7 +90,7 @@ time_marching:
   # Nouvelles zones adaptées pour T_max = 10.0
   zones:
     - t_end: 1.0
-      dt: 0.1
+      dt: 0.05
       iters: 30000
     - t_end: 2.0
       dt: 0.1
