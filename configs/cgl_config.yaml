@@ -44,7 +44,7 @@ training:
     bc_loss: 1.0
 
   physics_losses:
-    pde_relative_weight: 0.5
+    pde_relative_weight: 0.75
     weak_weight: 0.05
     mass_weight: 0.05
     continuity_weight: 0.1
@@ -58,6 +58,7 @@ training:
     patience_audits: 6
     min_score_improvement: 0.001
     min_loss_improvement_rel: 0.03
+    audit_every: 2000
 
   hard_audit:
     enabled: true

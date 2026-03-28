@@ -501,6 +501,7 @@ def train_step_adaptive(model, optimizer, cfg, t_prev, t_curr, base_lr, n_iters,
     bs_pde = cfg['training']['batch_size_pde']
     loss_cfg = _get_physics_loss_cfg(cfg)
     early_stop_cfg = _get_early_stop_cfg(cfg)
+    audit_every = int(early_stop_cfg.get('audit_every', 1000))
     lr_decay_step = int(cfg['time_marching'].get('lr_decay_step', 5000))
     lr_decay_gamma = float(cfg['time_marching'].get('lr_decay_gamma', 0.85))
     
@@ -638,8 +639,8 @@ def train_step_adaptive(model, optimizer, cfg, t_prev, t_curr, base_lr, n_iters,
                 rar_active = True
                 rar_b, rar_c, rar_p = get_rar_batch(model, cfg, device, t_prev, t_curr)
                 
-        # Audit toutes les 1000 itérations
-        if i % 1000 == 0:
+        # Audit périodique solveur
+        if i % audit_every == 0:
             _, score = run_audit(model, cfg, t_curr, threshold=current_target, verbose=False, historical=is_global)
             king.update(model, score)
 
