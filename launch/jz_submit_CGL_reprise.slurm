@@ -16,6 +16,10 @@
 module purge
 module load pytorch-gpu/py3/2.1.1
 
+# 1bis. Dossier projet
+PROJECT_DIR="$WORK/These_DeepOnet_CGL"
+cd "$PROJECT_DIR" || { echo "❌ Impossible d'accéder à $PROJECT_DIR"; exit 1; }
+
 # 2. (OPTIONNEL) Activation de ton environnement virtuel si tu en as un
 # source $WORK/mon_env/bin/activate  <-- Décommente si besoin
 
@@ -31,6 +35,5 @@ echo "📂 Dossier de travail : $PWD"
 nvidia-smi
 
 # 5. Lancement
-# Note : Python va créer automatiquement results/CGL_run_DATE/
-# Remplace l'ancien nom par le nouveau
-srun python scripts/train_cgl_resume.py --resume CGL_Navigator_Run_20260312-095818 --config configs/cgl_config.yaml
+# Reprise sur le dernier run validé en cours d'exploration
+srun python scripts/train_cgl_resume.py --resume CGL_Navigator_Run_20260328-113517 --config configs/cgl_config.yaml
