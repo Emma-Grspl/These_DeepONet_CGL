@@ -70,6 +70,16 @@ def get_zone_config(t_target, cfg):
     if selected_iters < 100: selected_iters = 5000
     return selected_iters
 
+
+def get_zone_dt(t_target, cfg):
+    zones = cfg['time_marching']['zones']
+    selected_dt = float(zones[-1]['dt'])
+    for zone in zones:
+        if t_target <= zone['t_end']:
+            selected_dt = float(zone['dt'])
+            break
+    return selected_dt
+
 def find_latest_checkpoint(ckpt_dir_or_file):
     """
     Si on donne un dossier, cherche le plus grand ckpt_tXXX.pth.
@@ -822,8 +832,12 @@ def train_navigator(model, cfg, explicit_resume_path=None):
         t_prev = resume_t
         
         if 'dt' in ckpt:
-            dt = max(ckpt['dt'], dt_min)
-            print(f"   (dt restauré à {dt:.4f} [Plancher {dt_min} appliqué])")
+            zone_dt = get_zone_dt(max(t_prev + 1e-12, t_prev), cfg)
+            dt = max(min(float(ckpt['dt']), zone_dt), dt_min)
+            print(
+                f"   (dt restauré à {dt:.4f} "
+                f"[checkpoint={float(ckpt['dt']):.4f}, config={zone_dt:.4f}, plancher={dt_min:.4f}])"
+            )
     # -----------------------------------
         
     easy_win_streak = 0
