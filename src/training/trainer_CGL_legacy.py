@@ -1,12 +1,14 @@
+import copy
+import csv
+import glob
+import os
+import re
+import time
+
+import numpy as np
 import torch
 import torch.optim as optim
-import numpy as np
-import copy
-import os
-import csv
 from tqdm import tqdm
-import glob
-import re
 
 from src.physics.pde_cgl import pde_residual_cgle
 from src.data.generators import (
@@ -20,11 +22,34 @@ from src.data.generators import (
 )
 from src.utils.solver_cgl import get_ground_truth_CGL
 
+def _atomic_torch_save(state, save_path, retries=3, retry_delay=1.0):
+    directory = os.path.dirname(save_path)
+    base_name = os.path.basename(save_path)
+    last_error = None
+
+    for attempt in range(retries):
+        tmp_path = os.path.join(directory, f".{base_name}.tmp-{os.getpid()}-{attempt}")
+        try:
+            torch.save(state, tmp_path)
+            os.replace(tmp_path, save_path)
+            return
+        except Exception as exc:
+            last_error = exc
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except OSError:
+                pass
+            if attempt < retries - 1:
+                time.sleep(retry_delay)
+
+    raise last_error
+
+
 def save_checkpoint_cgl(model, optimizer, t, dt, ckpt_dir, name=None):
-    """ Sauvegarde complète de la physique, des poids et de la dynamique d'entraînement """
+    """Sauvegarde robuste de l'état d'entraînement avec reprise prioritaire sur model_latest."""
     os.makedirs(ckpt_dir, exist_ok=True)
-    
-    # Capture de l'état global
+
     state = {
         'model_state': model.state_dict(),
         't_curr': t,
@@ -32,16 +57,22 @@ def save_checkpoint_cgl(model, optimizer, t, dt, ckpt_dir, name=None):
     }
     if optimizer is not None:
         state['optimizer_state'] = optimizer.state_dict()
-    
-    # 1. Historique : Sauvegarde du fichier spécifique à ce temps t
-    # CORRECTION : On utilise 'name' s'il existe, sinon on prend la valeur par défaut
+
     file_name = name if name is not None else f"model_t_{t:.4f}.pth"
     save_path = os.path.join(ckpt_dir, file_name)
-    torch.save(state, save_path)
-    
-    # 2. Reprise : Mise à jour constante du point de reprise automatique
     latest_path = os.path.join(ckpt_dir, "model_latest.pth")
-    torch.save(state, latest_path)
+
+    history_error = None
+    try:
+        _atomic_torch_save(state, save_path)
+    except Exception as exc:
+        history_error = exc
+        print(f"    ⚠️ Sauvegarde historique impossible ({save_path}): {exc}")
+
+    _atomic_torch_save(state, latest_path)
+
+    if history_error is not None:
+        print("    ↪️ model_latest.pth a bien été mis à jour malgré l'échec du checkpoint historique.")
 
 # ==============================================================================
 # 0. OUTILS
