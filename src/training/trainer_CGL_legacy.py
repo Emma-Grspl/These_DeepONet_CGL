@@ -567,6 +567,7 @@ def train_step_adaptive(model, optimizer, cfg, t_prev, t_curr, base_lr, n_iters,
     # --- Score initial pour le Fail-Fast interne ---
     _, score_in = run_audit(model, cfg, t_curr, threshold=target_strict, verbose=False, historical=is_global)
     tqdm.write(f"    🔍 Score initial : {score_in:.2%}")
+    king.update(model, score_in)
     
     # --- RELOBRALO (EMA) ---
     ema_alpha = 0.999
@@ -660,9 +661,13 @@ def train_step_adaptive(model, optimizer, cfg, t_prev, t_curr, base_lr, n_iters,
         loss = w_pde * l_pde + w_bc * aux_loss
 
         if loss.item() > 10000:
-            raise ValueError(f"Loss gigantesque ({loss.item():.2e} > 10^4).")
+            tqdm.write(f"    💥 Loss gigantesque détectée ({loss.item():.2e} > 10^4). Retour au meilleur état local.")
+            king.restore(model)
+            return False, king.best_score
         if torch.isnan(loss) or torch.isinf(loss):
-            raise ValueError("Loss est devenue NaN ou Inf.")
+            tqdm.write("    💥 Loss NaN/Inf détectée. Retour au meilleur état local.")
+            king.restore(model)
+            return False, king.best_score
             
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
