@@ -46,30 +46,30 @@ training:
   physics_losses:
     pde_relative_weight: 0.75
     weak_weight: 0.05
-    mass_weight: 0.05
-    continuity_weight: 0.1
+    mass_weight: 0.03
+    continuity_weight: 0.2
     mass_n_cases: 16
     mass_n_x: 128
     continuity_batch_size: 2048
 
   early_stop:
     enabled: true
-    min_iters: 10000
-    patience_audits: 6
+    min_iters: 8000
+    patience_audits: 4
     min_score_improvement: 0.001
     min_loss_improvement_rel: 0.03
-    audit_every: 2000
+    audit_every: 1000
 
   hard_audit:
     enabled: true
     skip_first_step: true
-    n_cases: 60
-    medium_factor: 1.5
-    hard_top_fraction: 0.2
-    medium_top_fraction: 0.2
-    mix_hard: 0.5
+    n_cases: 80
+    medium_factor: 1.35
+    hard_top_fraction: 0.3
+    medium_top_fraction: 0.25
+    mix_hard: 0.65
     mix_medium: 0.2
-    mix_global: 0.3
+    mix_global: 0.15
 
   target_schedule:
     early_time_relaxation: []
@@ -81,8 +81,8 @@ time_marching:
   # LR de départ de la Macro-Loop (qui sera divisé par 2 en cas d'échec)
   learning_rate: 2e-4
   dt_min: 0.0125
-  lr_decay_step: 5000
-  lr_decay_gamma: 0.9
+  lr_decay_step: 4000
+  lr_decay_gamma: 0.85
   # Nouvelles zones adaptées pour T_max = 10.0
   zones:
     - t_end: 1.0
