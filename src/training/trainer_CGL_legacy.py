@@ -140,6 +140,13 @@ def find_latest_checkpoint(ckpt_dir_or_file):
     return best_file, max_t
 
 
+def _is_invalid_score(score):
+    try:
+        return not np.isfinite(float(score))
+    except Exception:
+        return True
+
+
 def _get_physics_loss_cfg(cfg):
     defaults = {
         'pde_relative_weight': 0.5,
@@ -896,6 +903,9 @@ def train_navigator(model, cfg, explicit_resume_path=None):
         
         # --- 1. Easy Win ---
         is_easy_win, score = run_audit(model, cfg, t_curr, threshold=step_target if not soft_accept_mode else step_target * 2.0, verbose=True, historical=False)
+        if _is_invalid_score(score):
+            print("    💥 Audit NaN/Inf détecté. Arrêt immédiat de l'entraînement pour éviter de gaspiller du GPU.")
+            return
         step_validated = False
         
         if is_easy_win:
@@ -943,6 +953,9 @@ def train_navigator(model, cfg, explicit_resume_path=None):
                 case_groups=case_groups, group_weights=group_weights
             )
             first_attempt_done = True
+            if _is_invalid_score(final_score):
+                print("    💥 Score NaN/Inf détecté après boucle adaptative. Arrêt immédiat de l'entraînement.")
+                return
 
             if success or soft_accept_mode:
                 if soft_accept_mode and not success:
@@ -958,6 +971,9 @@ def train_navigator(model, cfg, explicit_resume_path=None):
         # --- 4. Validation Historique & Rescue Loop ---
         if step_validated:
             hist_ok, hist_score = run_audit(model, cfg, t_curr, threshold=step_target if not soft_accept_mode else step_target * 2.0, verbose=True, historical=True)
+            if _is_invalid_score(hist_score):
+                print("    💥 Audit historique NaN/Inf détecté. Arrêt immédiat de l'entraînement.")
+                return
             
             if not hist_ok and not soft_accept_mode:
                 print(f"    ⚠️ Oubli catastrophique détecté (Audit Histo: {hist_score:.2%}). Lancement Rescue Loop.")

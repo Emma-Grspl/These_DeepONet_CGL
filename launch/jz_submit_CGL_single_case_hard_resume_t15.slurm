@@ -26,5 +26,5 @@ echo "📂 Dossier de travail : $PWD"
 nvidia-smi
 
 srun python scripts/train_cgl_resume.py \
-  --resume /lustre/fswork/projects/rech/fdb/usv13rn/These_DeepOnet_CGL/results/CGL_Navigator_Run_20260330-152012 \
+  --resume /lustre/fswork/projects/rech/fdb/usv13rn/These_DeepOnet_CGL/results/CGL_Navigator_Run_20260330-152012/checkpoints/ckpt_t0.6500.pth \
   --config configs/cgl_single_case_hard_resume_t15.yaml
