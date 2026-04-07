@@ -81,52 +81,97 @@ def build_sensor_indices(nx, sensor_nx):
     return np.linspace(0, nx - 1, sensor_nx, dtype=np.int64)
 
 
-def build_branch_vector(u_curr, params_vec, dt_local, sensor_idx):
+def compute_state_scale(u_curr, floor=1e-3):
+    rms = np.sqrt(np.mean(np.abs(u_curr) ** 2))
+    return float(max(rms, floor))
+
+
+def build_branch_vector(u_curr, params_vec, dt_local, sensor_idx, scale):
     sensors = u_curr[sensor_idx]
     branch = np.concatenate(
         [
-            sensors.real.astype(np.float32),
-            sensors.imag.astype(np.float32),
+            (sensors.real / scale).astype(np.float32),
+            (sensors.imag / scale).astype(np.float32),
             params_vec.astype(np.float32),
-            np.array([dt_local], dtype=np.float32),
+            np.array([dt_local, np.log10(scale + 1e-12)], dtype=np.float32),
         ],
         axis=0,
     )
     return branch
 
 
-def sample_batch(u_hist, x_grid, params_vec, dt_local, sensor_idx, batch_size, device):
-    nx, nt = u_hist.shape
-    time_idx = np.random.randint(0, nt - 1, size=batch_size)
-    x_idx = np.random.randint(0, nx, size=batch_size)
-
-    branch_np = np.stack(
-        [build_branch_vector(u_hist[:, ti], params_vec, dt_local, sensor_idx) for ti in time_idx],
-        axis=0,
-    )
-    x_np = x_grid[x_idx][:, None].astype(np.float32)
-    target = u_hist[x_idx, time_idx + 1]
-    target_re = target.real.astype(np.float32)[:, None]
-    target_im = target.imag.astype(np.float32)[:, None]
-
-    branch_t = torch.tensor(branch_np, dtype=torch.float32, device=device)
-    x_t = torch.tensor(x_np, dtype=torch.float32, device=device)
-    y_re = torch.tensor(target_re, dtype=torch.float32, device=device)
-    y_im = torch.tensor(target_im, dtype=torch.float32, device=device)
-    return branch_t, x_t, y_re, y_im
-
-
-def rollout_operator(model, u0, x_grid, params_vec, dt_local, sensor_idx, device, chunk_size=512):
+def predict_next_state(model, u_curr, x_grid, params_vec, dt_local, sensor_idx, device, chunk_size=512):
     model.eval()
     nx = len(x_grid)
-    states = [u0.astype(np.complex64).copy()]
+    scale = compute_state_scale(u_curr)
+    branch_np = build_branch_vector(u_curr, params_vec, dt_local, sensor_idx, scale)[None, :]
+    branch_t_full = torch.tensor(branch_np, dtype=torch.float32, device=device).repeat(nx, 1)
     x_t = torch.tensor(x_grid[:, None], dtype=torch.float32, device=device)
 
+    chunks_re = []
+    chunks_im = []
     with torch.no_grad():
-        for _ in range(1, len(states) + 10**9):
-            break
+        for start in range(0, nx, chunk_size):
+            stop = min(start + chunk_size, nx)
+            out_re, out_im = model(branch_t_full[start:stop], x_t[start:stop])
+            chunks_re.append(out_re.cpu().numpy().reshape(-1))
+            chunks_im.append(out_im.cpu().numpy().reshape(-1))
 
-    return states
+    delta = (np.concatenate(chunks_re) + 1j * np.concatenate(chunks_im)) * scale
+    return (u_curr + delta.astype(np.complex64)).astype(np.complex64)
+
+
+def sample_sequence_starts(nt, max_horizon, batch_size):
+    high = nt - max_horizon
+    return np.random.randint(0, high, size=batch_size)
+
+
+def multistep_train_loss(model, u_hist, x_grid, params_vec, dt_local, sensor_idx, horizons, horizon_weights, batch_size, device):
+    nx, nt = u_hist.shape
+    max_horizon = max(horizons)
+    start_idx = sample_sequence_starts(nt, max_horizon, batch_size)
+    x_t = torch.tensor(x_grid[:, None], dtype=torch.float32, device=device)
+    total_loss = torch.tensor(0.0, dtype=torch.float32, device=device)
+    current = np.stack([u_hist[:, ti] for ti in start_idx], axis=0).astype(np.complex64)
+    active_horizons = set(horizons)
+
+    for step_ahead in range(1, max_horizon + 1):
+        scales = np.array([compute_state_scale(curr) for curr in current], dtype=np.float32)
+        branch_np = np.stack(
+            [build_branch_vector(current[i], params_vec, dt_local, sensor_idx, scales[i]) for i in range(batch_size)],
+            axis=0,
+        )
+        branch_t = torch.tensor(branch_np, dtype=torch.float32, device=device)
+        branch_t = branch_t.repeat_interleave(nx, dim=0)
+        x_rep = x_t.repeat(batch_size, 1)
+
+        pred_delta_re, pred_delta_im = model(branch_t, x_rep)
+        pred_delta = (
+            pred_delta_re.view(batch_size, nx).float() + 1j * pred_delta_im.view(batch_size, nx).float()
+        ) * torch.tensor(scales[:, None], dtype=torch.float32, device=device)
+
+        current_t = torch.tensor(current, dtype=torch.complex64, device=device)
+        pred_next = current_t + pred_delta.to(torch.complex64)
+        target_next = torch.tensor(
+            np.stack([u_hist[:, ti + step_ahead] for ti in start_idx], axis=0),
+            dtype=torch.complex64,
+            device=device,
+        )
+
+        if step_ahead in active_horizons:
+            target_delta = (target_next - current_t) / torch.tensor(scales[:, None], dtype=torch.float32, device=device)
+            pred_delta_norm = pred_delta / torch.tensor(scales[:, None], dtype=torch.float32, device=device)
+            loss_re = F.mse_loss(pred_delta_norm.real, target_delta.real)
+            loss_im = F.mse_loss(pred_delta_norm.imag, target_delta.imag)
+            rollout_re = F.mse_loss((pred_next / torch.tensor(scales[:, None], dtype=torch.float32, device=device)).real,
+                                    (target_next / torch.tensor(scales[:, None], dtype=torch.float32, device=device)).real)
+            rollout_im = F.mse_loss((pred_next / torch.tensor(scales[:, None], dtype=torch.float32, device=device)).imag,
+                                    (target_next / torch.tensor(scales[:, None], dtype=torch.float32, device=device)).imag)
+            total_loss = total_loss + horizon_weights[step_ahead] * (loss_re + loss_im + rollout_re + rollout_im)
+
+        current = pred_next.detach().cpu().numpy().astype(np.complex64)
+
+    return total_loss
 
 
 def rollout_full(model, u_hist, x_grid, params_vec, dt_local, sensor_idx, device, chunk_size=512):
@@ -134,22 +179,8 @@ def rollout_full(model, u_hist, x_grid, params_vec, dt_local, sensor_idx, device
     nx, nt = u_hist.shape
     pred = np.zeros_like(u_hist)
     pred[:, 0] = u_hist[:, 0]
-    x_t = torch.tensor(x_grid[:, None], dtype=torch.float32, device=device)
-
-    with torch.no_grad():
-        for ti in range(nt - 1):
-            branch_np = build_branch_vector(pred[:, ti], params_vec, dt_local, sensor_idx)[None, :]
-            branch_t_full = torch.tensor(branch_np, dtype=torch.float32, device=device).repeat(nx, 1)
-
-            chunks_re = []
-            chunks_im = []
-            for start in range(0, nx, chunk_size):
-                stop = min(start + chunk_size, nx)
-                out_re, out_im = model(branch_t_full[start:stop], x_t[start:stop])
-                chunks_re.append(out_re.cpu().numpy().reshape(-1))
-                chunks_im.append(out_im.cpu().numpy().reshape(-1))
-
-            pred[:, ti + 1] = np.concatenate(chunks_re) + 1j * np.concatenate(chunks_im)
+    for ti in range(nt - 1):
+        pred[:, ti + 1] = predict_next_state(model, pred[:, ti], x_grid, params_vec, dt_local, sensor_idx, device, chunk_size)
 
     return pred
 
@@ -221,6 +252,12 @@ def main():
     )
     dt_local = float(cfg["operator"]["dt_local"])
     sensor_idx = build_sensor_indices(len(x_grid), int(cfg["operator"]["sensor_nx"]))
+    horizons = [int(h) for h in cfg["operator"].get("train_horizons", [1, 2, 4, 8])]
+    horizon_weights_cfg = cfg["operator"].get("train_horizon_weights", None)
+    if horizon_weights_cfg is None:
+        horizon_weights = {h: 1.0 / len(horizons) for h in horizons}
+    else:
+        horizon_weights = {int(h): float(w) for h, w in zip(horizons, horizon_weights_cfg)}
 
     model = CGLLocalOperator(cfg).to(device)
     optimizer = torch.optim.Adam(
@@ -248,11 +285,18 @@ def main():
 
     for step in trange(1, steps + 1, desc="CGL local"):
         model.train()
-        branch_t, x_t, y_re, y_im = sample_batch(
-            u_hist, x_grid, params_vec, dt_local, sensor_idx, batch_size, device
+        loss = multistep_train_loss(
+            model,
+            u_hist,
+            x_grid,
+            params_vec,
+            dt_local,
+            sensor_idx,
+            horizons,
+            horizon_weights,
+            batch_size,
+            device,
         )
-        pred_re, pred_im = model(branch_t, x_t)
-        loss = F.mse_loss(pred_re, y_re) + F.mse_loss(pred_im, y_im)
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()

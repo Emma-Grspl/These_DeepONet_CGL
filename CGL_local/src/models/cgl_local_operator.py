@@ -34,7 +34,7 @@ class CGLLocalOperator(nn.Module):
         physics_cfg = cfg["physics"] if isinstance(cfg, dict) else cfg.physics
 
         self.sensor_nx = int(operator_cfg["sensor_nx"])
-        self.branch_input_dim = 2 * self.sensor_nx + 10
+        self.branch_input_dim = 2 * self.sensor_nx + 11
         self.latent_dim = int(model_cfg["latent_dim"])
 
         self.branch_net = MLP(

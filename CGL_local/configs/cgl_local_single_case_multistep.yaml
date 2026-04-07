@@ -1,4 +1,4 @@
-experiment_name: "CGL_Local_Single_Case"
+experiment_name: "CGL_Local_Single_Case_Multistep"
 device: "cuda"
 
 physics:
