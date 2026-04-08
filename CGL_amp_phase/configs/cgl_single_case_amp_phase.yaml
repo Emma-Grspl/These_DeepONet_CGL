@@ -1,0 +1,98 @@
+experiment_name: "CGL_Single_Case_AmpPhase"
+device: "cuda"
+
+physics:
+  x_domain: [-40.0, 40.0]
+  t_max: 3.0
+  initial_conditions: [0]
+  bounds:
+    A: [0.25, 0.25]
+    w0: [1.25, 1.25]
+    x0: [0.0, 0.0]
+    k: [0.0, 0.0]
+  equation_params:
+    alpha: [0.75, 0.75]
+    beta: [0.0, 0.0]
+    mu: [0.0, 0.0]
+    V: [0.0, 0.0]
+
+model:
+  branch_input_dim: 9
+  trunk_input_dim: 2
+  latent_dim: 512
+  branch_layers: [512, 512, 512, 512, 512]
+  trunk_layers: [512, 512, 512, 512]
+  activation: "silu"
+  fourier_dim: 64
+  fourier_scales: [1.0, 2.0, 5.0, 10.0, 20.0]
+
+training:
+  logic_variant: "modern"
+  batch_size_ic: 8192
+  batch_size_pde: 8192
+  max_macro_loops: 1
+
+  weights:
+    bc_loss: 1.0
+
+  physics_losses:
+    pde_relative_weight: 0.75
+    weak_weight: 0.05
+    mass_weight: 0.03
+    continuity_weight: 0.2
+    mass_n_cases: 16
+    mass_n_x: 128
+    continuity_batch_size: 2048
+
+  early_stop:
+    enabled: true
+    min_iters: 8000
+    patience_audits: 4
+    min_score_improvement: 0.001
+    min_loss_improvement_rel: 0.03
+    audit_every: 1000
+
+  hard_audit:
+    enabled: true
+    skip_first_step: true
+    n_cases: 80
+    medium_factor: 1.35
+    hard_top_fraction: 0.3
+    medium_top_fraction: 0.25
+    mix_hard: 0.65
+    mix_medium: 0.2
+    mix_global: 0.15
+
+  target_schedule:
+    early_time_relaxation: []
+
+  target_error_global: 0.055
+  save_dir: "results/CGL_Single_Case_AmpPhase"
+
+time_marching:
+  learning_rate: 2e-4
+  dt_min: 0.0125
+  lr_decay_step: 4000
+  lr_decay_gamma: 0.85
+  zones:
+    - t_end: 1.0
+      dt: 0.025
+      iters: 30000
+    - t_end: 2.0
+      dt: 0.025
+      iters: 40000
+    - t_end: 3.0
+      dt: 0.025
+      iters: 40000
+
+benchmark:
+  fixed_cases_path: "benchmarks/cgl_benchmark_v1.yaml"
+  seed: 1234
+  n_cases: 1
+  eval_times: [0.1, 0.2, 0.5, 1.0, 2.0, 3.0]
+  primary_eval_time: 3.0
+  publish_threshold: 0.04
+  solver_nx_profile: 512
+  solver_nx_slab: 256
+  compute_slab_metric: true
+  prediction_chunk_size: 32768

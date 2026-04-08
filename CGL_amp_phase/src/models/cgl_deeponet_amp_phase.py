@@ -1,0 +1,178 @@
+import numpy as np
+import torch
+import torch.nn as nn
+
+
+class MultiScaleFourierFeatureEncoding(nn.Module):
+    def __init__(self, in_dim, num_features, scales):
+        super().__init__()
+        self.in_dim = in_dim
+        self.num_features = num_features
+        self.scales = torch.tensor(scales).float()
+        B = torch.randn(num_features, in_dim) * self.scales.view(-1, 1).mean()
+        self.register_buffer("B", B)
+        self.out_dim = num_features * 2
+
+    def forward(self, x):
+        proj = 2.0 * np.pi * x @ self.B.t()
+        return torch.cat([torch.sin(proj), torch.cos(proj)], dim=-1)
+
+
+class ModifiedMLP(nn.Module):
+    def __init__(self, input_dim, hidden_layers, output_dim, activation=nn.SiLU()):
+        super().__init__()
+        self.activation = activation
+        self.U_encoder = nn.Linear(input_dim, hidden_layers[0])
+        self.V_encoder = nn.Linear(input_dim, hidden_layers[0])
+
+        self.layers = nn.ModuleList()
+        self.layers.append(nn.Linear(input_dim, hidden_layers[0]))
+        for i in range(len(hidden_layers) - 1):
+            self.layers.append(nn.Linear(hidden_layers[i], hidden_layers[i + 1]))
+        self.output_layer = nn.Linear(hidden_layers[-1], output_dim)
+
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight)
+                nn.init.constant_(m.bias, 0.0)
+        nn.init.normal_(self.output_layer.weight, mean=0.0, std=1e-5)
+        nn.init.constant_(self.output_layer.bias, 0.0)
+
+    def forward(self, x):
+        U = self.activation(self.U_encoder(x))
+        V = self.activation(self.V_encoder(x))
+        H = self.activation(self.layers[0](x))
+        for layer in self.layers[1:]:
+            Z = self.activation(layer(H))
+            H = (1.0 - Z) * U + Z * V
+        return self.output_layer(H)
+
+
+class CGL_PI_DeepONet_AmpPhase(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+
+        if isinstance(cfg, dict):
+            b = cfg["physics"]["bounds"]
+            eq_p = cfg["physics"]["equation_params"]
+            x_domain = cfg["physics"]["x_domain"]
+            t_max = cfg["physics"]["t_max"]
+            latent_dim = cfg["model"]["latent_dim"]
+            branch_arch = cfg["model"].get("branch_layers", [256, 256, 256, 256])
+            trunk_arch = cfg["model"].get("trunk_layers", [256, 256, 256, 256])
+            fourier_dim = cfg["model"].get("fourier_dim", 64)
+            scales = cfg["model"].get("fourier_scales", [1.0, 10.0])
+        else:
+            b = cfg.physics["bounds"]
+            eq_p = cfg.physics["equation_params"]
+            x_domain = cfg.physics["x_domain"]
+            t_max = cfg.physics["t_max"]
+            latent_dim = cfg.model["latent_dim"]
+            branch_arch = cfg.model.get("branch_layers", [256, 256, 256, 256])
+            trunk_arch = cfg.model.get("trunk_layers", [256, 256, 256, 256])
+            fourier_dim = cfg.model.get("fourier_dim", 64)
+            scales = cfg.model.get("fourier_scales", [1.0, 10.0])
+
+        x_min, x_max = x_domain
+
+        self.register_buffer("alpha_min", torch.tensor(eq_p["alpha"][0]))
+        self.register_buffer("alpha_max", torch.tensor(eq_p["alpha"][1]))
+        self.register_buffer("beta_min", torch.tensor(eq_p["beta"][0]))
+        self.register_buffer("beta_max", torch.tensor(eq_p["beta"][1]))
+        self.register_buffer("mu_min", torch.tensor(eq_p["mu"][0]))
+        self.register_buffer("mu_max", torch.tensor(eq_p["mu"][1]))
+        self.register_buffer("V_min", torch.tensor(eq_p["V"][0]))
+        self.register_buffer("V_max", torch.tensor(eq_p["V"][1]))
+
+        self.register_buffer("A_min", torch.tensor(b["A"][0]))
+        self.register_buffer("A_max", torch.tensor(b["A"][1]))
+        self.register_buffer("w0_min", torch.tensor(b["w0"][0]))
+        self.register_buffer("w0_max", torch.tensor(b["w0"][1]))
+        self.register_buffer("x0_min", torch.tensor(b["x0"][0]))
+        self.register_buffer("x0_max", torch.tensor(b["x0"][1]))
+        self.register_buffer("k_min", torch.tensor(b["k"][0]))
+        self.register_buffer("k_max", torch.tensor(b["k"][1]))
+        self.register_buffer("x_min", torch.tensor(x_min))
+        self.register_buffer("x_max", torch.tensor(x_max))
+        self.register_buffer("t_max", torch.tensor(t_max))
+
+        self.branch_net = ModifiedMLP(
+            input_dim=9,
+            hidden_layers=branch_arch,
+            output_dim=2 * latent_dim,
+        )
+        self.trunk_encoding = MultiScaleFourierFeatureEncoding(2, fourier_dim, scales)
+        self.trunk_net = ModifiedMLP(
+            input_dim=self.trunk_encoding.out_dim,
+            hidden_layers=trunk_arch,
+            output_dim=latent_dim,
+        )
+        self.latent_dim = latent_dim
+
+    def normalize_linear(self, x, x_min, x_max):
+        denom = x_max - x_min
+        return 2.0 * (x - x_min) / (denom + 1e-9) - 1.0
+
+    def normalize_log(self, x, x_min, x_max):
+        return self.normalize_linear(
+            torch.log10(torch.abs(x) + 1e-9),
+            torch.log10(torch.abs(x_min) + 1e-9),
+            torch.log10(torch.abs(x_max) + 1e-9),
+        )
+
+    def get_ic_analytical(self, params, coords):
+        A = params[:, 4:5]
+        w0 = params[:, 5:6]
+        x0 = params[:, 6:7]
+        k = params[:, 7:8]
+        x = coords[:, 0:1]
+        amp = A * torch.exp(-((x - x0) ** 2) / (w0 ** 2 + 1e-12))
+        phase = k * (x - x0)
+        return amp, phase
+
+    def forward(self, params, coords):
+        amp0, phase0 = self.get_ic_analytical(params, coords)
+
+        norm_alpha = self.normalize_linear(params[:, 0:1], self.alpha_min, self.alpha_max)
+        norm_beta = self.normalize_linear(params[:, 1:2], self.beta_min, self.beta_max)
+        norm_mu = self.normalize_linear(params[:, 2:3], self.mu_min, self.mu_max)
+        norm_V = self.normalize_linear(params[:, 3:4], self.V_min, self.V_max)
+        norm_A = self.normalize_linear(params[:, 4:5], self.A_min, self.A_max)
+        norm_w0 = self.normalize_log(params[:, 5:6], self.w0_min, self.w0_max)
+        norm_x0 = self.normalize_linear(params[:, 6:7], self.x0_min, self.x0_max)
+        norm_k = self.normalize_linear(params[:, 7:8], self.k_min, self.k_max)
+        norm_type = self.normalize_linear(params[:, 8:9], 0.0, 2.0)
+        params_norm = torch.cat(
+            [norm_alpha, norm_beta, norm_mu, norm_V, norm_A, norm_w0, norm_x0, norm_k, norm_type],
+            dim=1,
+        )
+
+        x_raw = coords[:, 0:1]
+        t_raw = coords[:, 1:2]
+        w0_raw = params[:, 5:6]
+        x0_raw = params[:, 6:7]
+
+        W_t = w0_raw * torch.sqrt(1.0 + (2.0 * t_raw) ** 2)
+        xi = (x_raw - x0_raw) / (W_t + 1e-9)
+        xi_norm = self.normalize_linear(
+            xi,
+            torch.tensor(-4.0, device=xi.device),
+            torch.tensor(4.0, device=xi.device),
+        )
+        t_norm = self.normalize_linear(t_raw, 0.0, self.t_max)
+        coords_norm = torch.cat([xi_norm, t_norm], dim=1)
+
+        B = self.branch_net(params_norm)
+        T = self.trunk_net(self.trunk_encoding(coords_norm))
+        B_amp, B_phase = torch.split(B, self.latent_dim, dim=1)
+        delta_log_amp = torch.sum(B_amp * T, dim=1, keepdim=True)
+        delta_phase = torch.sum(B_phase * T, dim=1, keepdim=True)
+
+        transition = 1.0 - torch.exp(-t_raw / 1.0)
+        amp_floor = 1e-4 * params[:, 4:5] + 1e-8
+        amp = torch.exp(torch.log(amp0 + amp_floor) + transition * delta_log_amp) - amp_floor
+        phase = phase0 + transition * delta_phase
+
+        psi_re = amp * torch.cos(phase)
+        psi_im = amp * torch.sin(phase)
+        return psi_re, psi_im
