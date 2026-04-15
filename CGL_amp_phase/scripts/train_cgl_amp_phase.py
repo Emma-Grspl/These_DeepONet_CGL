@@ -27,12 +27,19 @@ class ConfigObj:
 
 
 def find_latest_run_dir(base_results_dir):
-    search_path = os.path.join(base_results_dir, "CGL_*")
+    search_path = os.path.join(base_results_dir, "run_*")
     all_runs = glob.glob(search_path)
     all_runs = [d for d in all_runs if os.path.isdir(d)]
     if not all_runs:
-        return None
+        return base_results_dir if os.path.isdir(base_results_dir) else None
     return max(all_runs, key=os.path.getmtime)
+
+
+def resolve_output_root(project_root, yaml_data):
+    configured = yaml_data.get("training", {}).get("save_dir", "results/CGL_AmpPhase")
+    if os.path.isabs(configured):
+        return configured
+    return os.path.join(project_root, configured)
 
 
 def main():
@@ -41,33 +48,35 @@ def main():
     parser.add_argument("--resume", nargs='?', const="latest", default=None)
     args = parser.parse_args()
 
-    results_root = os.path.join(project_root, "results")
-    os.makedirs(results_root, exist_ok=True)
+    with open(args.config, "r") as f:
+        yaml_data = yaml.safe_load(f)
+
+    output_root = resolve_output_root(project_root, yaml_data)
+    os.makedirs(output_root, exist_ok=True)
 
     if args.resume:
         if args.resume == "latest":
-            run_dir = find_latest_run_dir(results_root)
+            run_dir = find_latest_run_dir(output_root)
             if not run_dir:
                 raise ValueError("❌ Aucun run précédent trouvé pour --resume latest !")
         else:
             run_dir = args.resume
             if not os.path.exists(run_dir):
-                run_dir = os.path.join(results_root, args.resume)
+                run_dir = os.path.join(project_root, args.resume)
                 if not os.path.exists(run_dir):
                     raise ValueError(f"❌ Dossier introuvable : {args.resume}")
         print(f"🔄 MODE REPRISE ACTIVÉ : {run_dir}")
         print("   (Le script cherchera le dernier checkpoint valide dans ce dossier)")
     else:
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        run_name = f"CGL_AmpPhase_Run_{timestamp}"
-        run_dir = os.path.join(results_root, run_name)
+        job_id = os.environ.get("SLURM_JOB_ID")
+        run_name = f"run_{timestamp}" if not job_id else f"run_{timestamp}_{job_id}"
+        run_dir = os.path.join(output_root, run_name)
         print(f"🚀 NOUVEAU START : {run_dir}")
 
     ckpt_dir = os.path.join(run_dir, "checkpoints")
     os.makedirs(ckpt_dir, exist_ok=True)
 
-    with open(args.config, "r") as f:
-        yaml_data = yaml.safe_load(f)
     yaml_data["training"]["save_dir"] = ckpt_dir
     cfg = ConfigObj(yaml_data)
     logic_variant = cfg["training"].get("logic_variant", "modern")
