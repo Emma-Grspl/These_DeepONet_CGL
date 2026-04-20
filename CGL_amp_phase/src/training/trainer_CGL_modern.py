@@ -46,7 +46,7 @@ def _atomic_torch_save(state, save_path, retries=3, retry_delay=1.0):
     raise last_error
 
 
-def save_checkpoint_cgl(model, optimizer, t, dt, ckpt_dir, name=None):
+def save_checkpoint_cgl(model, optimizer, t, dt, ckpt_dir, name=None, extra_state=None):
     """Sauvegarde robuste de l'état d'entraînement avec reprise prioritaire sur model_latest."""
     os.makedirs(ckpt_dir, exist_ok=True)
 
@@ -57,6 +57,8 @@ def save_checkpoint_cgl(model, optimizer, t, dt, ckpt_dir, name=None):
     }
     if optimizer is not None:
         state['optimizer_state'] = optimizer.state_dict()
+    if extra_state:
+        state.update(extra_state)
 
     file_name = name if name is not None else f"model_t_{t:.4f}.pth"
     save_path = os.path.join(ckpt_dir, file_name)
@@ -130,7 +132,15 @@ def find_latest_checkpoint(ckpt_dir_or_file):
 
     # Si c'est un dossier (comportement classique)
     files = glob.glob(os.path.join(ckpt_dir_or_file, "ckpt_t*.pth"))
-    if not files: return None, 0.0
+    latest_path = os.path.join(ckpt_dir_or_file, "model_latest.pth")
+    if not files:
+        if os.path.isfile(latest_path):
+            try:
+                ckpt = torch.load(latest_path, map_location='cpu')
+                return latest_path, ckpt.get('t_curr', 0.0)
+            except Exception:
+                return None, 0.0
+        return None, 0.0
     max_t = -1.0; best_file = None
     for f in files:
         match = re.search(r"ckpt_t([\d\.]+)\.pth", f)
@@ -206,6 +216,27 @@ def _get_target_cfg(cfg):
     training_cfg = cfg['training'] if isinstance(cfg, dict) else cfg.training
     merged = defaults.copy()
     user_cfg = training_cfg.get('target_schedule', {})
+    merged.update(user_cfg)
+    return merged
+
+
+def _get_training_mode(cfg):
+    training_cfg = cfg['training'] if isinstance(cfg, dict) else cfg.training
+    return training_cfg.get('training_mode', 'navigator')
+
+
+def _get_global_direct_cfg(cfg):
+    defaults = {
+        'total_iters': None,
+        'chunk_iters': 10000,
+        'target_error': None,
+        'allow_relaxation': False,
+        'disable_rar': False,
+        'run_polishing': True,
+    }
+    training_cfg = cfg['training'] if isinstance(cfg, dict) else cfg.training
+    user_cfg = training_cfg.get('global_direct', {})
+    merged = defaults.copy()
     merged.update(user_cfg)
     return merged
 
@@ -831,6 +862,110 @@ def run_polishing_loop(model, optimizer, cfg, t_max):
     
     _, final_score = run_audit(model, cfg, t_max, threshold=target, verbose=True, historical=True)
     return final_score
+
+
+def train_global_direct(model, cfg, explicit_resume_path=None):
+    save_dir = cfg['training'].get('save_dir', "outputs/checkpoints")
+    os.makedirs(save_dir, exist_ok=True)
+
+    t_max = float(cfg['physics']['t_max'])
+    base_lr = float(cfg['time_marching'].get('learning_rate', 2e-4))
+    direct_cfg = _get_global_direct_cfg(cfg)
+    total_iters = direct_cfg['total_iters']
+    if total_iters is None:
+        total_iters = get_zone_config(t_max, cfg)
+    total_iters = int(total_iters)
+    chunk_iters = max(1, int(direct_cfg['chunk_iters']))
+    target_error = direct_cfg['target_error']
+    if target_error is None:
+        target_error = (cfg['training'] if isinstance(cfg, dict) else cfg.training).get('target_error_global', 0.03)
+
+    optimizer = optim.Adam(model.parameters(), lr=base_lr)
+
+    target_path = explicit_resume_path if explicit_resume_path else save_dir
+    latest_ckpt, _ = find_latest_checkpoint(target_path)
+
+    iters_done = 0
+    stage_idx = 0
+    if latest_ckpt:
+        print(f"🔄 REPRISE GLOBAL DIRECT DEPUIS : {latest_ckpt}")
+        ckpt = torch.load(latest_ckpt, map_location='cuda' if torch.cuda.is_available() else 'cpu')
+        if 'model_state' in ckpt:
+            model.load_state_dict(ckpt['model_state'])
+        elif 'model' in ckpt:
+            model.load_state_dict(ckpt['model'])
+        else:
+            model.load_state_dict(ckpt)
+        if 'optimizer_state' in ckpt:
+            optimizer.load_state_dict(ckpt['optimizer_state'])
+        iters_done = int(ckpt.get('global_direct_iters_done', 0))
+        stage_idx = int(ckpt.get('global_direct_stage', 0))
+        print(f"   (progression restaurée : {iters_done}/{total_iters} itérations, stage={stage_idx})")
+
+    print("\n🌐 [Global Direct] Démarrage de l'entraînement direct sur tout l'horizon temporel.")
+
+    while iters_done < total_iters:
+        chunk = min(chunk_iters, total_iters - iters_done)
+        print(
+            f"\n🚀 Stage global direct {stage_idx + 1} | "
+            f"iters {iters_done + 1}-{iters_done + chunk}/{total_iters} | horizon=[0, {t_max:.4f}]"
+        )
+        success, final_score = train_step_adaptive(
+            model,
+            optimizer,
+            cfg,
+            0.0,
+            t_max,
+            base_lr,
+            n_iters=chunk,
+            is_global=True,
+            disable_rar=bool(direct_cfg['disable_rar']),
+            target_error=float(target_error),
+            allow_relaxation=bool(direct_cfg['allow_relaxation']),
+        )
+        iters_done += chunk
+        stage_idx += 1
+        save_checkpoint_cgl(
+            model,
+            optimizer,
+            t_max,
+            t_max,
+            save_dir,
+            name=f"ckpt_global_direct_stage{stage_idx:03d}.pth",
+            extra_state={
+                'global_direct_iters_done': iters_done,
+                'global_direct_stage': stage_idx,
+                'training_mode': 'global_direct',
+            },
+        )
+        if _is_invalid_score(final_score):
+            print("    💥 Score NaN/Inf détecté en global direct. Arrêt immédiat.")
+            return
+        if success:
+            print(f"    ✅ Cible globale atteinte à {final_score:.2%}.")
+            break
+
+    if bool(direct_cfg['run_polishing']):
+        print("\n✨ Global direct terminé. Lancement du polissage final...")
+        final_score = run_polishing_loop(model, optimizer, cfg, t_max)
+        print(f"🏁 Entraînement global direct terminé. Score final : {final_score:.2%}")
+    else:
+        _, final_score = run_audit(model, cfg, t_max, threshold=float(target_error), verbose=True, historical=True)
+        print(f"🏁 Entraînement global direct terminé sans polissage. Score final : {final_score:.2%}")
+
+    save_checkpoint_cgl(
+        model,
+        optimizer,
+        t_max,
+        t_max,
+        save_dir,
+        name="ckpt_FINAL.pth",
+        extra_state={
+            'global_direct_iters_done': iters_done,
+            'global_direct_stage': stage_idx,
+            'training_mode': 'global_direct',
+        },
+    )
 
 # ==============================================================================
 # 5. LE NAVIGATEUR
