@@ -46,6 +46,28 @@ def atomic_torch_save(state, path):
     os.replace(tmp_path, path)
 
 
+def tensor_is_finite(value):
+    return bool(torch.isfinite(torch.real(value)).all().item() and torch.isfinite(torch.imag(value)).all().item())
+
+
+def scalar_is_finite(value):
+    if isinstance(value, torch.Tensor):
+        return bool(torch.isfinite(value).all().item())
+    return bool(np.isfinite(float(value)))
+
+
+def write_failure_summary(run_dir, epoch, reason, metrics=None):
+    os.makedirs(os.path.join(run_dir, "audits"), exist_ok=True)
+    path = os.path.join(run_dir, "audits", "failure_summary.txt")
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(f"epoch={int(epoch)}\n")
+        handle.write(f"reason={reason}\n")
+        if metrics:
+            for key, value in metrics.items():
+                handle.write(f"{key}={value}\n")
+    print(f"🛑 Stop non-fini epoch={epoch}: {reason} | summary={path}")
+
+
 def save_checkpoint(model, optimizer, epoch, best_score, run_dir, name="model_latest.pth"):
     ckpt_dir = os.path.join(run_dir, "checkpoints")
     os.makedirs(ckpt_dir, exist_ok=True)
@@ -197,6 +219,8 @@ def compute_multistep_rollout_loss(model, trajectory, cfg_dict, pair_indices, de
                 dt_norm,
                 periodic,
             )
+            if not tensor_is_finite(current_sensor):
+                return torch.full((), float("nan"), dtype=torch.float32, device=device), per_horizon
             if step in per_horizon:
                 target_sensor = torch.tensor(
                     trajectory["u_sensor"][:, start_idx + step],
@@ -209,10 +233,25 @@ def compute_multistep_rollout_loss(model, trajectory, cfg_dict, pair_indices, de
                 rel_l2 = rel_num / rel_den
                 amp_loss = torch.mean((torch.abs(current_sensor) - torch.abs(target_sensor)) ** 2)
                 combined = rel_l2 + 0.25 * amp_loss
+                if not scalar_is_finite(combined):
+                    return torch.full((), float("nan"), dtype=torch.float32, device=device), per_horizon
                 per_horizon[step].append(rel_l2.detach().item())
                 loss_terms.append(float(horizon_weights[horizons.index(step)]) * combined)
 
     return torch.stack(loss_terms).mean(), per_horizon
+
+
+def rollout_weight_multiplier(epoch, cfg_dict):
+    schedule = cfg_dict["training"].get("rollout_schedule", {})
+    if not schedule or not bool(schedule.get("enabled", False)):
+        return 1.0
+    start_epoch = int(schedule.get("start_epoch", 1))
+    ramp_epochs = max(1, int(schedule.get("ramp_epochs", 1)))
+    max_multiplier = float(schedule.get("max_multiplier", 1.0))
+    if epoch < start_epoch:
+        return 0.0
+    progress = min(1.0, float(epoch - start_epoch + 1) / float(ramp_epochs))
+    return max_multiplier * progress
 
 
 def make_audit_starts(total_pairs, max_horizon, audit_start_count):
@@ -451,23 +490,48 @@ def main():
         )
         optimizer.zero_grad(set_to_none=True)
         loss_complex, loss_amp, loss_delta = compute_one_step_losses(model, batch, amp_floor)
-        loss_rollout, rollout_per_horizon = compute_multistep_rollout_loss(
-            model,
-            trajectory,
-            cfg_dict,
-            pair_indices=train_idx,
-            device=device,
-            params_norm=params_norm,
-        )
+        rollout_mult = rollout_weight_multiplier(epoch, cfg_dict)
+        if rollout_mult > 0.0:
+            loss_rollout, rollout_per_horizon = compute_multistep_rollout_loss(
+                model,
+                trajectory,
+                cfg_dict,
+                pair_indices=train_idx,
+                device=device,
+                params_norm=params_norm,
+            )
+        else:
+            loss_rollout = torch.zeros((), dtype=torch.float32, device=device)
+            rollout_per_horizon = {int(v): [] for v in cfg_dict["training"]["rollout_horizons_steps"]}
         loss = (
             float(weights["complex"]) * loss_complex
             + float(weights["amplitude"]) * loss_amp
             + float(weights["delta"]) * loss_delta
-            + float(weights["rollout"]) * loss_rollout
+            + rollout_mult * float(weights["rollout"]) * loss_rollout
         )
+        if not scalar_is_finite(loss):
+            write_failure_summary(
+                run_dir,
+                epoch,
+                "non_finite_training_loss",
+                {
+                    "loss_complex": float(loss_complex.detach().cpu()) if scalar_is_finite(loss_complex) else "nan",
+                    "loss_amp": float(loss_amp.detach().cpu()) if scalar_is_finite(loss_amp) else "nan",
+                    "loss_delta": float(loss_delta.detach().cpu()) if scalar_is_finite(loss_delta) else "nan",
+                    "loss_rollout": float(loss_rollout.detach().cpu()) if scalar_is_finite(loss_rollout) else "nan",
+                    "rollout_multiplier": rollout_mult,
+                },
+            )
+            save_checkpoint(model, optimizer, epoch, best_score, run_dir, name="model_failed.pth")
+            return
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
+        for name, param in model.named_parameters():
+            if not torch.isfinite(param).all().item():
+                write_failure_summary(run_dir, epoch, f"non_finite_parameter:{name}")
+                save_checkpoint(model, optimizer, epoch, best_score, run_dir, name="model_failed.pth")
+                return
 
         if epoch % log_every == 0 or epoch == 1:
             rollout_msg = " | ".join(
@@ -479,6 +543,7 @@ def main():
                 f" | amp={loss_amp.item():.3e}"
                 f" | delta={loss_delta.item():.3e}"
                 f" | rollout={loss_rollout.item():.3e}"
+                f" | rollout_mult={rollout_mult:.3e}"
                 f" | {rollout_msg}"
             )
 
@@ -492,6 +557,27 @@ def main():
             max_l2 = float(np.max(rollout["rel_l2"]))
             first_t_gt = rollout_first_t_over_threshold(rollout, l2_threshold)
             selection_score = final_l2 + 0.5 * short_metrics["closed_h8_mean_rel_l2"]
+            if not np.isfinite(selection_score):
+                row = {
+                    "epoch": float(epoch),
+                    "train_total_loss": float(loss.item()) if scalar_is_finite(loss) else np.nan,
+                    "train_one_step_complex": float(loss_complex.item()) if scalar_is_finite(loss_complex) else np.nan,
+                    "train_one_step_amp": float(loss_amp.item()) if scalar_is_finite(loss_amp) else np.nan,
+                    "train_one_step_delta": float(loss_delta.item()) if scalar_is_finite(loss_delta) else np.nan,
+                    "train_rollout_loss": float(loss_rollout.item()) if scalar_is_finite(loss_rollout) else np.nan,
+                    "rollout_weight_multiplier": float(rollout_mult),
+                    "rollout_final_rel_l2": final_l2,
+                    "rollout_max_rel_l2": max_l2,
+                    "rollout_first_t_gt_threshold": float(first_t_gt) if not np.isnan(first_t_gt) else np.nan,
+                    "selection_score": np.nan,
+                    "l2_threshold": float(l2_threshold),
+                }
+                row.update(short_metrics)
+                audit_rows.append(row)
+                write_audit_csv(audit_rows, audit_csv_path)
+                write_failure_summary(run_dir, epoch, "non_finite_audit_or_rollout", row)
+                save_checkpoint(model, optimizer, epoch, best_score, run_dir, name="model_failed.pth")
+                return
 
             row = {
                 "epoch": float(epoch),
@@ -500,6 +586,7 @@ def main():
                 "train_one_step_amp": float(loss_amp.item()),
                 "train_one_step_delta": float(loss_delta.item()),
                 "train_rollout_loss": float(loss_rollout.item()),
+                "rollout_weight_multiplier": float(rollout_mult),
                 "rollout_final_rel_l2": final_l2,
                 "rollout_max_rel_l2": max_l2,
                 "rollout_first_t_gt_threshold": float(first_t_gt) if not np.isnan(first_t_gt) else np.nan,
