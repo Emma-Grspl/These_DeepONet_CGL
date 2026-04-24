@@ -30,6 +30,15 @@ model_local:
   trunk_layers: [256, 256, 256]
   fourier_dim: 64
   fourier_scales: [1.0, 2.0, 5.0, 10.0, 20.0]
+  local_residual_ansatz:
+    enabled: true
+    delta_log_amp_rate_bound: 12.0
+    delta_phase_rate_bound: 20.0
+  local_phase_gate:
+    enabled: true
+    relative_floor: 0.05
+    absolute_floor: 1.0e-6
+    exponent: 1.0
 
 training:
   save_dir: "results/CGL_LocalDirect_AmpPhase_alpha075_beta05_mu0_t5"

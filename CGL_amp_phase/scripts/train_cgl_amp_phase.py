@@ -4,6 +4,7 @@ import argparse
 import yaml
 import torch
 import glob
+import time
 from datetime import datetime
 
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -42,6 +43,19 @@ def resolve_output_root(project_root, yaml_data):
     return os.path.join(project_root, configured)
 
 
+def write_timing_summary(run_dir, start_iso, start_perf, status):
+    end_dt = datetime.now()
+    elapsed_seconds = max(0.0, time.perf_counter() - start_perf)
+    path = os.path.join(run_dir, "timing_summary.txt")
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(f"status={status}\n")
+        handle.write(f"start_time={start_iso}\n")
+        handle.write(f"end_time={end_dt.isoformat(timespec='seconds')}\n")
+        handle.write(f"total_wall_seconds={elapsed_seconds:.6f}\n")
+        handle.write(f"total_wall_hours={elapsed_seconds / 3600.0:.6f}\n")
+    print(f"⏱️ Timing summary : {path}")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="configs/cgl_single_case_amp_phase.yaml")
@@ -76,6 +90,8 @@ def main():
 
     ckpt_dir = os.path.join(run_dir, "checkpoints")
     os.makedirs(ckpt_dir, exist_ok=True)
+    start_dt = datetime.now()
+    start_perf = time.perf_counter()
 
     yaml_data["training"]["save_dir"] = ckpt_dir
     cfg = ConfigObj(yaml_data)
@@ -90,8 +106,10 @@ def main():
     try:
         train_navigator(model, cfg, explicit_resume_path=None)
         torch.save(model.state_dict(), os.path.join(run_dir, "model_final_cgl_amp_phase.pth"))
+        write_timing_summary(run_dir, start_dt.isoformat(timespec="seconds"), start_perf, "completed")
         print("\n✅ Terminé avec succès !")
     except Exception as e:
+        write_timing_summary(run_dir, start_dt.isoformat(timespec="seconds"), start_perf, "failed")
         print(f"\n❌ Erreur Critique : {e}")
         raise e
 

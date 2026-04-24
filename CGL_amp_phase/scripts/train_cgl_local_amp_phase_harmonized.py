@@ -2,6 +2,7 @@ import argparse
 import csv
 import os
 import sys
+import time
 from datetime import datetime
 
 import matplotlib.pyplot as plt
@@ -14,6 +15,8 @@ PROJECT_DIR = os.path.dirname(SCRIPT_DIR)
 sys.path.insert(0, PROJECT_DIR)
 
 from src.data.local_operator_amp_phase import (
+    apply_phase_gate_numpy,
+    apply_phase_gate_torch,
     build_single_case_params,
     interp_complex_field,
     normalize_linear,
@@ -66,6 +69,23 @@ def write_failure_summary(run_dir, epoch, reason, metrics=None):
             for key, value in metrics.items():
                 handle.write(f"{key}={value}\n")
     print(f"🛑 Stop non-fini epoch={epoch}: {reason} | summary={path}")
+
+
+def write_timing_summary(run_dir, start_iso, start_perf, status, final_epoch, extra=None):
+    end_dt = datetime.now()
+    elapsed_seconds = max(0.0, time.perf_counter() - start_perf)
+    path = os.path.join(run_dir, "timing_summary.txt")
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(f"status={status}\n")
+        handle.write(f"start_time={start_iso}\n")
+        handle.write(f"end_time={end_dt.isoformat(timespec='seconds')}\n")
+        handle.write(f"total_wall_seconds={elapsed_seconds:.6f}\n")
+        handle.write(f"total_wall_hours={elapsed_seconds / 3600.0:.6f}\n")
+        handle.write(f"final_epoch={int(final_epoch)}\n")
+        if extra:
+            for key, value in extra.items():
+                handle.write(f"{key}={value}\n")
+    print(f"⏱️ Timing summary : {path}")
 
 
 def save_checkpoint(model, optimizer, epoch, best_score, run_dir, name="model_latest.pth"):
@@ -127,6 +147,23 @@ def build_params_norm(cfg_dict):
     return np.asarray(values, dtype=np.float32)
 
 
+def get_train_dt_values(cfg_dict):
+    values = cfg_dict["training"].get("train_dt_values")
+    if not values:
+        return [float(cfg_dict["local_operator"]["train_dt"])]
+    return [float(v) for v in values]
+
+
+def get_eval_dt_value(cfg_dict):
+    return float(cfg_dict["evaluation"].get("rollout_eval_dt", cfg_dict["local_operator"]["train_dt"]))
+
+
+def choose_training_dt(train_dt_values):
+    if len(train_dt_values) == 1:
+        return float(train_dt_values[0])
+    return float(np.random.choice(np.asarray(train_dt_values, dtype=np.float32)))
+
+
 def build_branch_features_torch(sensor_state, params_norm, amp_floor, dt_norm):
     log_amp, cos_phase, sin_phase = complex_to_feature_parts_torch(sensor_state, amp_floor)
     return torch.cat([log_amp, cos_phase, sin_phase, params_norm, dt_norm], dim=0)
@@ -155,7 +192,7 @@ def interp_complex_field_torch(x_src, u_src, x_dst, periodic):
     return torch.complex(re, im)
 
 
-def predict_next_state(model, sensor_state, x_coords, x_sensor, params_norm, amp_floor, dt_norm, periodic):
+def predict_next_state(model, sensor_state, x_coords, x_sensor, params_norm, amp_floor, dt_norm, periodic, cfg_dict):
     branch_features = build_branch_features_torch(sensor_state, params_norm, amp_floor, dt_norm)
     branch = branch_features.unsqueeze(0).repeat(x_coords.shape[0], 1)
     delta_log_amp, delta_phase = model(branch, x_coords.unsqueeze(1))
@@ -163,12 +200,14 @@ def predict_next_state(model, sensor_state, x_coords, x_sensor, params_norm, amp
     current_amp = torch.abs(current_state).unsqueeze(1)
     current_phase = torch.angle(current_state).unsqueeze(1)
     next_amp = torch.exp(torch.log(current_amp + amp_floor) + delta_log_amp) - amp_floor
+    delta_phase = apply_phase_gate_torch(cfg_dict, current_amp, delta_phase)
     next_phase = current_phase + delta_phase
     return next_amp[:, 0] * torch.exp(1j * next_phase[:, 0])
 
 
-def compute_one_step_losses(model, batch, amp_floor):
+def compute_one_step_losses(model, batch, amp_floor, cfg_dict):
     delta_log_amp, delta_phase = model(batch["branch"], batch["x_query"])
+    delta_phase = apply_phase_gate_torch(cfg_dict, batch["current_amp"], delta_phase)
     next_amp = torch.exp(torch.log(batch["current_amp"] + amp_floor) + delta_log_amp) - amp_floor
     next_phase = batch["current_phase"] + delta_phase
     pred_re = next_amp * torch.cos(next_phase)
@@ -177,12 +216,13 @@ def compute_one_step_losses(model, batch, amp_floor):
     loss_complex = torch.mean((pred_re - batch["target_u_re"]) ** 2 + (pred_im - batch["target_u_im"]) ** 2)
     loss_amp = torch.mean((next_amp - batch["target_amp"]) ** 2)
     loss_delta = torch.mean(
-        (delta_log_amp - batch["target_delta_log_amp"]) ** 2 + (delta_phase - batch["target_delta_phase"]) ** 2
+        (delta_log_amp - batch["target_delta_log_amp"]) ** 2
+        + (delta_phase - apply_phase_gate_torch(cfg_dict, batch["current_amp"], batch["target_delta_phase"])) ** 2
     )
     return loss_complex, loss_amp, loss_delta
 
 
-def compute_multistep_rollout_loss(model, trajectory, cfg_dict, pair_indices, device, params_norm):
+def compute_multistep_rollout_loss(model, trajectory, cfg_dict, pair_indices, device, params_norm, scheduled_sampling_prob=0.0):
     train_cfg = cfg_dict["training"]
     amp_floor = float(cfg_dict["local_operator"]["amp_floor"])
     horizons = [int(v) for v in train_cfg["rollout_horizons_steps"]]
@@ -218,6 +258,7 @@ def compute_multistep_rollout_loss(model, trajectory, cfg_dict, pair_indices, de
                 amp_floor,
                 dt_norm,
                 periodic,
+                cfg_dict,
             )
             if not tensor_is_finite(current_sensor):
                 return torch.full((), float("nan"), dtype=torch.float32, device=device), per_horizon
@@ -238,6 +279,15 @@ def compute_multistep_rollout_loss(model, trajectory, cfg_dict, pair_indices, de
                 per_horizon[step].append(rel_l2.detach().item())
                 loss_terms.append(float(horizon_weights[horizons.index(step)]) * combined)
 
+            if step < max_h and scheduled_sampling_prob > 0.0:
+                true_next_sensor = torch.tensor(
+                    trajectory["u_sensor"][:, start_idx + step],
+                    dtype=torch.complex64,
+                    device=device,
+                )
+                if np.random.rand() >= float(scheduled_sampling_prob):
+                    current_sensor = true_next_sensor
+
     return torch.stack(loss_terms).mean(), per_horizon
 
 
@@ -252,6 +302,19 @@ def rollout_weight_multiplier(epoch, cfg_dict):
         return 0.0
     progress = min(1.0, float(epoch - start_epoch + 1) / float(ramp_epochs))
     return max_multiplier * progress
+
+
+def scheduled_sampling_probability(epoch, cfg_dict):
+    schedule = cfg_dict["training"].get("scheduled_sampling", {})
+    if not schedule or not bool(schedule.get("enabled", False)):
+        return 0.0
+    start_epoch = int(schedule.get("start_epoch", 1))
+    ramp_epochs = max(1, int(schedule.get("ramp_epochs", 1)))
+    max_probability = float(schedule.get("max_probability", 0.0))
+    if epoch < start_epoch:
+        return 0.0
+    progress = min(1.0, float(epoch - start_epoch + 1) / float(ramp_epochs))
+    return max_probability * progress
 
 
 def make_audit_starts(total_pairs, max_horizon, audit_start_count):
@@ -310,7 +373,12 @@ def run_short_horizon_audit(model, trajectory, cfg_dict, device, params_norm):
             current_amp = np.abs(current_solver)
             current_phase = np.angle(current_solver)
             next_amp = np.exp(np.log(current_amp + amp_floor) + delta_log_amp.cpu().numpy().reshape(-1)) - amp_floor
-            next_phase = current_phase + delta_phase.cpu().numpy().reshape(-1)
+            gated_delta_phase = apply_phase_gate_numpy(
+                cfg_dict,
+                current_amp,
+                delta_phase.cpu().numpy().reshape(-1),
+            )
+            next_phase = current_phase + gated_delta_phase
             pred_next = next_amp * np.exp(1j * next_phase)
             target_next = trajectory["u_solver"][:, start_idx + 1]
             one_step_rel = np.linalg.norm(pred_next - target_next) / (np.linalg.norm(target_next) + 1.0e-12)
@@ -339,7 +407,12 @@ def run_short_horizon_audit(model, trajectory, cfg_dict, device, params_norm):
                 next_amp_sensor = (
                     np.exp(np.log(curr_amp_sensor + amp_floor) + delta_log_amp_sensor.cpu().numpy().reshape(-1)) - amp_floor
                 )
-                next_phase_sensor = curr_phase_sensor + delta_phase_sensor.cpu().numpy().reshape(-1)
+                gated_delta_phase_sensor = apply_phase_gate_numpy(
+                    cfg_dict,
+                    curr_amp_sensor,
+                    delta_phase_sensor.cpu().numpy().reshape(-1),
+                )
+                next_phase_sensor = curr_phase_sensor + gated_delta_phase_sensor
                 pred_sensor = next_amp_sensor * np.exp(1j * next_phase_sensor)
 
                 if step in closed_errors:
@@ -439,11 +512,22 @@ def main():
 
     cfg = ConfigObj(cfg_dict)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    start_dt = datetime.now()
+    start_perf = time.perf_counter()
     print(f"📱 Device : {device}")
     print(f"📂 Run dir : {run_dir}")
 
-    trajectory = prepare_single_case_trajectory(cfg_dict)
-    train_idx, _ = split_pair_indices(trajectory, float(cfg_dict["training"]["train_split"]))
+    train_dt_values = get_train_dt_values(cfg_dict)
+    eval_dt = get_eval_dt_value(cfg_dict)
+    train_trajectories = {}
+    train_pair_indices = {}
+    for dt_value in train_dt_values:
+        dt_key = f"{dt_value:.8f}"
+        traj = prepare_single_case_trajectory(cfg_dict, dt_override=dt_value)
+        train_idx, _ = split_pair_indices(traj, float(cfg_dict["training"]["train_split"]))
+        train_trajectories[dt_key] = traj
+        train_pair_indices[dt_key] = train_idx
+    trajectory_eval = prepare_single_case_trajectory(cfg_dict, dt_override=eval_dt)
     params_norm = torch.tensor(build_params_norm(cfg_dict), dtype=torch.float32, device=device)
 
     model = CGL_LocalDirect_DeepONet_AmpPhase(cfg_dict).to(device)
@@ -480,6 +564,10 @@ def main():
 
     for epoch in range(start_epoch + 1, num_epochs + 1):
         model.train()
+        current_dt = choose_training_dt(train_dt_values)
+        current_key = f"{current_dt:.8f}"
+        trajectory = train_trajectories[current_key]
+        train_idx = train_pair_indices[current_key]
         batch = sample_training_batch(
             trajectory,
             cfg_dict,
@@ -489,8 +577,9 @@ def main():
             device=device,
         )
         optimizer.zero_grad(set_to_none=True)
-        loss_complex, loss_amp, loss_delta = compute_one_step_losses(model, batch, amp_floor)
+        loss_complex, loss_amp, loss_delta = compute_one_step_losses(model, batch, amp_floor, cfg_dict)
         rollout_mult = rollout_weight_multiplier(epoch, cfg_dict)
+        sched_sampling_prob = scheduled_sampling_probability(epoch, cfg_dict)
         if rollout_mult > 0.0:
             loss_rollout, rollout_per_horizon = compute_multistep_rollout_loss(
                 model,
@@ -499,6 +588,7 @@ def main():
                 pair_indices=train_idx,
                 device=device,
                 params_norm=params_norm,
+                scheduled_sampling_prob=sched_sampling_prob,
             )
         else:
             loss_rollout = torch.zeros((), dtype=torch.float32, device=device)
@@ -520,9 +610,18 @@ def main():
                     "loss_delta": float(loss_delta.detach().cpu()) if scalar_is_finite(loss_delta) else "nan",
                     "loss_rollout": float(loss_rollout.detach().cpu()) if scalar_is_finite(loss_rollout) else "nan",
                     "rollout_multiplier": rollout_mult,
+                    "train_dt": current_dt,
+                    "scheduled_sampling_prob": sched_sampling_prob,
                 },
             )
             save_checkpoint(model, optimizer, epoch, best_score, run_dir, name="model_failed.pth")
+            write_timing_summary(
+                run_dir,
+                start_dt.isoformat(timespec="seconds"),
+                start_perf,
+                "failed_non_finite_training_loss",
+                epoch,
+            )
             return
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
@@ -531,6 +630,14 @@ def main():
             if not torch.isfinite(param).all().item():
                 write_failure_summary(run_dir, epoch, f"non_finite_parameter:{name}")
                 save_checkpoint(model, optimizer, epoch, best_score, run_dir, name="model_failed.pth")
+                write_timing_summary(
+                    run_dir,
+                    start_dt.isoformat(timespec="seconds"),
+                    start_perf,
+                    "failed_non_finite_parameter",
+                    epoch,
+                    extra={"parameter_name": name},
+                )
                 return
 
         if epoch % log_every == 0 or epoch == 1:
@@ -544,12 +651,14 @@ def main():
                 f" | delta={loss_delta.item():.3e}"
                 f" | rollout={loss_rollout.item():.3e}"
                 f" | rollout_mult={rollout_mult:.3e}"
+                f" | sched_prob={sched_sampling_prob:.3e}"
+                f" | train_dt={current_dt:.3f}"
                 f" | {rollout_msg}"
             )
 
         if epoch % audit_every == 0 or epoch == num_epochs:
-            short_metrics = run_short_horizon_audit(model, trajectory, cfg_dict, device, params_norm)
-            rollout = rollout_local_model(model, trajectory, cfg_dict, device)
+            short_metrics = run_short_horizon_audit(model, trajectory_eval, cfg_dict, device, params_norm)
+            rollout = rollout_local_model(model, trajectory_eval, cfg_dict, device)
             csv_path = save_rollout_metrics(os.path.join(run_dir, "rollout"), rollout)
             plot_rollout_curve(rollout, os.path.join(run_dir, "rollout", "rollout_rel_l2.png"))
 
@@ -566,6 +675,9 @@ def main():
                     "train_one_step_delta": float(loss_delta.item()) if scalar_is_finite(loss_delta) else np.nan,
                     "train_rollout_loss": float(loss_rollout.item()) if scalar_is_finite(loss_rollout) else np.nan,
                     "rollout_weight_multiplier": float(rollout_mult),
+                    "scheduled_sampling_prob": float(sched_sampling_prob),
+                    "train_dt": float(current_dt),
+                    "eval_dt": float(eval_dt),
                     "rollout_final_rel_l2": final_l2,
                     "rollout_max_rel_l2": max_l2,
                     "rollout_first_t_gt_threshold": float(first_t_gt) if not np.isnan(first_t_gt) else np.nan,
@@ -577,6 +689,13 @@ def main():
                 write_audit_csv(audit_rows, audit_csv_path)
                 write_failure_summary(run_dir, epoch, "non_finite_audit_or_rollout", row)
                 save_checkpoint(model, optimizer, epoch, best_score, run_dir, name="model_failed.pth")
+                write_timing_summary(
+                    run_dir,
+                    start_dt.isoformat(timespec="seconds"),
+                    start_perf,
+                    "failed_non_finite_audit_or_rollout",
+                    epoch,
+                )
                 return
 
             row = {
@@ -587,6 +706,9 @@ def main():
                 "train_one_step_delta": float(loss_delta.item()),
                 "train_rollout_loss": float(loss_rollout.item()),
                 "rollout_weight_multiplier": float(rollout_mult),
+                "scheduled_sampling_prob": float(sched_sampling_prob),
+                "train_dt": float(current_dt),
+                "eval_dt": float(eval_dt),
                 "rollout_final_rel_l2": final_l2,
                 "rollout_max_rel_l2": max_l2,
                 "rollout_first_t_gt_threshold": float(first_t_gt) if not np.isnan(first_t_gt) else np.nan,
@@ -622,6 +744,14 @@ def main():
             save_checkpoint(model, optimizer, epoch, best_score, run_dir, name=f"ckpt_epoch_{epoch:06d}.pth")
 
     save_checkpoint(model, optimizer, num_epochs, best_score, run_dir, name="model_final.pth")
+    write_timing_summary(
+        run_dir,
+        start_dt.isoformat(timespec="seconds"),
+        start_perf,
+        "completed",
+        num_epochs,
+        extra={"best_score": f"{best_score:.10e}"},
+    )
     print(f"🏁 Entraînement terminé | best_score={best_score:.6e}")
 
 

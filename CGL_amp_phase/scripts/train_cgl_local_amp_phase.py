@@ -1,6 +1,7 @@
 import argparse
 import os
 import sys
+import time
 from datetime import datetime
 
 import matplotlib.pyplot as plt
@@ -13,6 +14,7 @@ PROJECT_DIR = os.path.dirname(SCRIPT_DIR)
 sys.path.insert(0, PROJECT_DIR)
 
 from src.data.local_operator_amp_phase import (
+    apply_phase_gate_torch,
     prepare_single_case_trajectory,
     rollout_local_model,
     sample_training_batch,
@@ -75,8 +77,24 @@ def build_run_dir(project_root, cfg_dict, resume_dir=None):
     return os.path.join(output_root, run_name)
 
 
-def compute_losses(model, batch, amp_floor):
+def write_timing_summary(run_dir, start_iso, start_perf, status, final_epoch, best_rollout_l2):
+    end_dt = datetime.now()
+    elapsed_seconds = max(0.0, time.perf_counter() - start_perf)
+    path = os.path.join(run_dir, "timing_summary.txt")
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(f"status={status}\n")
+        handle.write(f"start_time={start_iso}\n")
+        handle.write(f"end_time={end_dt.isoformat(timespec='seconds')}\n")
+        handle.write(f"total_wall_seconds={elapsed_seconds:.6f}\n")
+        handle.write(f"total_wall_hours={elapsed_seconds / 3600.0:.6f}\n")
+        handle.write(f"final_epoch={int(final_epoch)}\n")
+        handle.write(f"best_rollout_l2={float(best_rollout_l2):.10e}\n")
+    print(f"⏱️ Timing summary : {path}")
+
+
+def compute_losses(model, batch, amp_floor, cfg_dict):
     delta_log_amp, delta_phase = model(batch["branch"], batch["x_query"])
+    delta_phase = apply_phase_gate_torch(cfg_dict, batch["current_amp"], delta_phase)
     next_amp = torch.exp(torch.log(batch["current_amp"] + amp_floor) + delta_log_amp) - amp_floor
     next_phase = batch["current_phase"] + delta_phase
     pred_re = next_amp * torch.cos(next_phase)
@@ -84,7 +102,8 @@ def compute_losses(model, batch, amp_floor):
 
     loss_complex = torch.mean((pred_re - batch["target_u_re"]) ** 2 + (pred_im - batch["target_u_im"]) ** 2)
     loss_amp = torch.mean((next_amp - batch["target_amp"]) ** 2)
-    loss_delta = torch.mean((delta_log_amp - batch["target_delta_log_amp"]) ** 2 + (delta_phase - batch["target_delta_phase"]) ** 2)
+    gated_target_delta_phase = apply_phase_gate_torch(cfg_dict, batch["current_amp"], batch["target_delta_phase"])
+    loss_delta = torch.mean((delta_log_amp - batch["target_delta_log_amp"]) ** 2 + (delta_phase - gated_target_delta_phase) ** 2)
     return loss_complex, loss_amp, loss_delta
 
 
@@ -117,6 +136,8 @@ def main():
 
     cfg = ConfigObj(cfg_dict)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    start_dt = datetime.now()
+    start_perf = time.perf_counter()
     print(f"📱 Device : {device}")
     print(f"📂 Run dir : {run_dir}")
 
@@ -151,12 +172,24 @@ def main():
             device=device,
         )
         optimizer.zero_grad(set_to_none=True)
-        loss_complex, loss_amp, loss_delta = compute_losses(model, batch, amp_floor)
+        loss_complex, loss_amp, loss_delta = compute_losses(model, batch, amp_floor, cfg_dict)
         loss = (
             float(weights["complex"]) * loss_complex
             + float(weights["amplitude"]) * loss_amp
             + float(weights["delta"]) * loss_delta
         )
+        if not torch.isfinite(loss).all().item():
+            save_checkpoint(model, optimizer, epoch, best_rollout_l2, run_dir, name="model_failed.pth")
+            write_timing_summary(
+                run_dir,
+                start_dt.isoformat(timespec="seconds"),
+                start_perf,
+                "failed_non_finite_training_loss",
+                epoch,
+                best_rollout_l2,
+            )
+            print("🛑 Arret : loss non-finie.")
+            return
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
@@ -185,6 +218,14 @@ def main():
             save_checkpoint(model, optimizer, epoch, best_rollout_l2, run_dir, name=f"ckpt_epoch_{epoch:06d}.pth")
 
     save_checkpoint(model, optimizer, num_epochs, best_rollout_l2, run_dir, name="model_final.pth")
+    write_timing_summary(
+        run_dir,
+        start_dt.isoformat(timespec="seconds"),
+        start_perf,
+        "completed",
+        num_epochs,
+        best_rollout_l2,
+    )
     print(f"🏁 Entraînement terminé | best_rollout_l2={best_rollout_l2:.4%}")
 
 

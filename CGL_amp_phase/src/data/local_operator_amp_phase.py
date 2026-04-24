@@ -111,6 +111,39 @@ def build_branch_features(cfg, u_sensor, dt_value, params_dict):
     return np.concatenate([state_features, params_norm, dt_norm], axis=0).astype(np.float32)
 
 
+def _phase_gate_cfg(cfg):
+    model_cfg = _cfg_get(cfg, "model_local") if isinstance(cfg, dict) else cfg["model_local"]
+    return model_cfg.get("local_phase_gate", {})
+
+
+def apply_phase_gate_numpy(cfg, current_amp, delta_phase):
+    gate_cfg = _phase_gate_cfg(cfg)
+    if not gate_cfg or not bool(gate_cfg.get("enabled", False)):
+        return delta_phase
+    current_amp = np.asarray(current_amp, dtype=np.float32)
+    delta_phase = np.asarray(delta_phase, dtype=np.float32)
+    ref_amp = float(np.max(current_amp))
+    relative_floor = float(gate_cfg.get("relative_floor", 0.05))
+    absolute_floor = float(gate_cfg.get("absolute_floor", 1.0e-6))
+    exponent = float(gate_cfg.get("exponent", 1.0))
+    floor = relative_floor * ref_amp + absolute_floor
+    gate = np.power(current_amp / (current_amp + floor + 1.0e-12), exponent)
+    return delta_phase * gate
+
+
+def apply_phase_gate_torch(cfg, current_amp, delta_phase):
+    gate_cfg = _phase_gate_cfg(cfg)
+    if not gate_cfg or not bool(gate_cfg.get("enabled", False)):
+        return delta_phase
+    ref_amp = torch.amax(current_amp.detach())
+    relative_floor = float(gate_cfg.get("relative_floor", 0.05))
+    absolute_floor = float(gate_cfg.get("absolute_floor", 1.0e-6))
+    exponent = float(gate_cfg.get("exponent", 1.0))
+    floor = relative_floor * ref_amp + absolute_floor
+    gate = torch.pow(current_amp / (current_amp + floor + 1.0e-12), exponent)
+    return delta_phase * gate
+
+
 def prepare_single_case_trajectory(cfg, t_max_override=None, dt_override=None):
     params = build_single_case_params(cfg)
     x_min, x_max = _cfg_get(cfg, "physics", "x_domain")
@@ -247,7 +280,8 @@ def rollout_local_model(model, trajectory, cfg, device):
                 np.log(current_amp_sensor + float(_cfg_get(cfg, "local_operator", "amp_floor")))
                 + delta_log_amp_sensor.cpu().numpy().reshape(-1)
             ) - float(_cfg_get(cfg, "local_operator", "amp_floor"))
-            next_phase_sensor = current_phase_sensor + delta_phase_sensor.cpu().numpy().reshape(-1)
+            gated_delta_phase = apply_phase_gate_numpy(cfg, current_amp_sensor, delta_phase_sensor.cpu().numpy().reshape(-1))
+            next_phase_sensor = current_phase_sensor + gated_delta_phase
             pred_sensor[:, step + 1] = next_amp_sensor * np.exp(1j * next_phase_sensor)
 
             pred_solver[:, step + 1] = interp_complex_field(x_sensor, pred_sensor[:, step + 1], x_solver, periodic)
