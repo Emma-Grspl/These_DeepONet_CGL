@@ -1,0 +1,54 @@
+experiment_name: "CGL_GlobalMultistage_AmpPhase_alpha075_beta0_mu0_t5_cpu_smoke"
+device: "cpu"
+
+physics:
+  x_domain: [-40.0, 40.0]
+  t_max: 5.0
+  initial_conditions: [0]
+  bounds:
+    A: [0.25, 0.25]
+    w0: [1.25, 1.25]
+    x0: [0.0, 0.0]
+    k: [0.0, 0.0]
+  equation_params:
+    alpha: [0.75, 0.75]
+    beta: [0.0, 0.0]
+    mu: [0.0, 0.0]
+    V: [0.0, 0.0]
+
+model:
+  branch_input_dim: 9
+  trunk_input_dim: 2
+  latent_dim: 128
+  branch_layers: [128, 128]
+  trunk_layers: [128, 128]
+  activation: "silu"
+  fourier_dim: 16
+  fourier_scales: [1.0, 2.0, 5.0]
+
+multistage:
+  time_blocks:
+    - [0.0, 1.0]
+    - [1.0, 2.0]
+    - [2.0, 3.0]
+    - [3.0, 4.0]
+    - [4.0, 5.0]
+
+data:
+  solver_nx: 128
+  train_queries: 512
+  valid_queries: 256
+
+training:
+  save_dir: "results/CGL_GlobalMultistage_AmpPhase_alpha075_beta0_mu0_t5_cpu_smoke"
+  stage_num_epochs: 20
+  learning_rate: 2.0e-4
+  weight_decay: 1.0e-6
+  grad_clip: 1.0
+  log_every: 5
+  eval_every: 10
+  snapshot_every: 20
+
+evaluation:
+  rollout_tmax: 5.0
+  snapshot_times: [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]

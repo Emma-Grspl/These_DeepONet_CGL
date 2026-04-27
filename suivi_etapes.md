@@ -84,12 +84,16 @@ Fait :
   - code disponible
   - test fait sur `alpha075_beta0_mu0`
   - conclusion : mauvais en rollout
-  - statut global : a faire
+  - protocole retenu :
+    - d'abord smoke test local sur `alpha075_beta0_mu0`
+    - si pipeline propre mais rollout toujours mauvais : correction avant extension
+    - si correction validee : lancement Jean Zay sur les 4 cas
+  - statut global : en phase de cadrage local
   - detail par cas :
-    - cas 1 `alpha075_beta0_mu0` : termine, a refaire pour le temps
-    - cas 2 `alpha075_beta0_mu1` : a faire
-    - cas 3 `alpha075_beta05_mu0` : a faire
-    - cas 4 `alpha075_beta05_mu1` : a faire
+    - cas 1 `alpha075_beta0_mu0` : smoke test local a faire / reprendre proprement pour le temps
+    - cas 2 `alpha075_beta0_mu1` : a faire apres validation locale
+    - cas 3 `alpha075_beta05_mu0` : a faire apres validation locale
+    - cas 4 `alpha075_beta05_mu1` : a faire apres validation locale
 
 - `multireseau / global`
   - code disponible
@@ -97,12 +101,16 @@ Fait :
   - analyses faites
   - heatmaps et snapshots generes
   - conclusion : meilleur compromis actuel
-  - statut global : termine, a refaire pour le temps
+  - protocole retenu :
+    - d'abord smoke test local sur `alpha075_beta0_mu0`
+    - verification des timings et du pipeline de post-traitement
+    - puis rerun Jean Zay sur les 4 cas pour avoir une base propre avec le temps d'entrainement
+  - statut global : a refaire pour le temps, avec validation locale prealable
   - detail par cas :
-    - cas 1 `alpha075_beta0_mu0` : termine, a refaire pour le temps
-    - cas 2 `alpha075_beta0_mu1` : termine, a refaire pour le temps
-    - cas 3 `alpha075_beta05_mu0` : termine, a refaire pour le temps
-    - cas 4 `alpha075_beta05_mu1` : termine, a refaire pour le temps
+    - cas 1 `alpha075_beta0_mu0` : smoke test local a faire, puis a refaire pour le temps
+    - cas 2 `alpha075_beta0_mu1` : a refaire pour le temps apres validation locale
+    - cas 3 `alpha075_beta05_mu0` : a refaire pour le temps apres validation locale
+    - cas 4 `alpha075_beta05_mu1` : a refaire pour le temps apres validation locale
 
 ### 4. Analyses produites
 
@@ -144,6 +152,18 @@ Objectif :
 
 permettent d'eviter les `NaN` et d'ameliorer le rollout ferme.
 
+### 3. Cadrer le protocole multireseau
+
+En cours :
+- definir un protocole unique pour `multireseau / local` et `multireseau / global`
+- imposer les memes sorties d'analyse que pour le monoreseau
+- imposer la mesure du temps total d'entrainement
+
+Ordre retenu :
+- smoke test local sur un seul cas :
+  - `alpha075_beta0_mu0`
+- puis extension Jean Zay sur les 4 cas si le pipeline est valide
+
 
 ## Etapes a venir
 
@@ -165,6 +185,7 @@ A faire :
 - confirmer ou invalider `multireseau / global` comme meilleure famille finale
 - conclure apres comparaison complete avec `global_curriculum`
 - conclure apres test de la variante locale stabilisee
+- conclure apres reruns multireseau avec temps d'entrainement homogenes
 
 ### 3. Passage au cas parametrique
 
@@ -198,6 +219,7 @@ A faire :
 Ordre de travail recommande :
 - 1. finir les runs `global_curriculum`
 - 2. tester `local_direct_residual_multistep`
-- 3. figer le tableau comparatif single-case
-- 4. confirmer la meilleure famille
-- 5. passer au cas parametrique
+- 3. valider localement le protocole `multireseau / local` et `multireseau / global`
+- 4. figer le tableau comparatif single-case
+- 5. confirmer la meilleure famille
+- 6. passer au cas parametrique

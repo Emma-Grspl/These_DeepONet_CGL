@@ -190,6 +190,32 @@ Conclusion actuelle :
 - non retenu en l'etat
 - eventuellement utile comme objet de diagnostic, pas comme meilleur candidat actuel
 
+Protocole de validation a appliquer ensuite :
+- phase 1 : smoke test local sur `alpha075_beta0_mu0`
+- objectif phase 1 :
+  - verifier l'absence de `NaN`
+  - verifier l'ecriture de `timing_summary.txt`
+  - verifier la reconstruction complete des sorties d'analyse
+- sorties minimales obligatoires :
+  - `rollout_metrics.csv`
+  - `summary.txt`
+  - `timing_summary.txt`
+  - `error_heatmap.png`
+  - `snapshots.png`
+  - `comparison_animation.gif`
+  - `inference_timing.txt`
+  - `inference_timing.png`
+- critere de passage a Jean Zay :
+  - pas de divergence numerique
+  - pipeline d'analyse complet
+  - comportement du rollout interpretable
+- phase 2 : lancement Jean Zay sur les 4 cas
+- phase 3 : comparaison finale avec les autres familles sur :
+  - precision
+  - stabilite
+  - temps total d'entrainement
+  - cout en reprises si necessaire
+
 #### 6. Multireseau / global
 
 Correspondance pratique :
@@ -209,6 +235,33 @@ Conclusion actuelle :
 - meilleur compromis actuel
 - configuration actuellement retenue comme meilleure candidate single-case
 
+Protocole de validation a appliquer ensuite :
+- phase 1 : smoke test local sur `alpha075_beta0_mu0`
+- objectif phase 1 :
+  - verifier l'absence de `NaN`
+  - verifier l'ecriture de `timing_summary.txt` et `timing_stages.csv`
+  - verifier la reconstruction complete des sorties d'analyse
+- sorties minimales obligatoires :
+  - `rollout_metrics.csv`
+  - `summary.txt`
+  - `timing_summary.txt`
+  - `timing_stages.csv`
+  - `error_heatmap.png`
+  - `snapshots.png`
+  - `comparison_animation.gif`
+  - `inference_timing.txt`
+  - `inference_timing.png`
+- critere de passage a Jean Zay :
+  - pas de divergence numerique
+  - pipeline d'analyse complet
+  - qualite du rollout confirmee sur le cas local
+- phase 2 : lancement Jean Zay sur les 4 cas
+- phase 3 : consolidation finale de la famille sur :
+  - precision
+  - stabilite
+  - temps total d'entrainement
+  - temps par stage si pertinent
+
 ### Decision intermediaire actuelle
 
 Configuration actuellement favorite :
@@ -218,6 +271,35 @@ Raison :
 - meilleure precision
 - stabilite sur les 4 single cases
 - respecte le critere `L2 < 5%` sur tout l'horizon observe
+
+### Protocole de reprise multireseau
+
+Ordre retenu :
+- 1. verifier localement `multireseau / local` sur `alpha075_beta0_mu0`
+- 2. verifier localement `multireseau / global` sur `alpha075_beta0_mu0`
+- 3. si les deux pipelines sont propres, lancer Jean Zay sur les 4 cas
+
+Regles communes pour `multireseau / local` et `multireseau / global` :
+- utiliser les memes 4 single cases que pour le monoreseau
+- conserver les memes temps de snapshot : `t = 0, 1, 2, 3, 4, 5`
+- conserver les memes metriques :
+  - `final_rel_l2`
+  - `max_rel_l2`
+  - `mean_rel_l2`
+  - `first_t_gt_5pct`
+  - temps total d'entrainement
+  - temps d'inference
+- produire les memes artefacts visuels :
+  - `L2(t)`
+  - heatmap erreur absolue
+  - snapshots
+  - GIF
+
+Decision de validation avant passage Jean Zay :
+- `multireseau / local` :
+  - si le smoke test local reste structurellement mauvais en rollout, ne pas etendre aux 4 cas sans correction
+- `multireseau / global` :
+  - si le smoke test local confirme la qualite du pipeline et des timings, etendre directement aux 4 cas
 
 
 ## Etape 4. Passer du single-case au cas parametrique
