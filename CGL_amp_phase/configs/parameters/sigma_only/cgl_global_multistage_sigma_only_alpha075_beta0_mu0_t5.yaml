@@ -1,0 +1,77 @@
+experiment_name: "CGL_GlobalMultistage_Parametric_sigma_only_alpha075_beta0_mu0_t5"
+device: "cuda"
+
+physics:
+  x_domain: [-40.0, 40.0]
+  t_max: 5.0
+  initial_conditions: [0]
+  bounds:
+    A: [0.1, 0.1]
+    w0: [0.4, 0.8]
+    x0: [0.0, 0.0]
+    k: [0.0, 0.0]
+  equation_params:
+    alpha: [0.75, 0.75]
+    beta: [0.0, 0.0]
+    mu: [0.0, 0.0]
+    V: [0.0, 0.0]
+
+model:
+  branch_input_dim: 9
+  trunk_input_dim: 2
+  latent_dim: 512
+  branch_layers: [512, 512, 512, 512, 512]
+  trunk_layers: [512, 512, 512, 512]
+  activation: "silu"
+  fourier_dim: 64
+  fourier_scales: [1.0, 2.0, 5.0, 10.0, 20.0]
+
+multistage:
+  time_blocks:
+    - [0.0, 1.0]
+    - [1.0, 2.0]
+    - [2.0, 3.0]
+    - [3.0, 4.0]
+    - [4.0, 5.0]
+
+data:
+  solver_nx: 256
+  solver_dt: 0.025
+  train_queries: 8192
+  valid_queries: 4096
+
+parametric_dataset:
+  train_cases: 24
+  valid_cases: 8
+  seed: 1234
+
+training:
+  save_dir: "results/CGL_GlobalMultistage_Parametric_sigma_only_alpha075_beta0_mu0_t5"
+  stage_num_epochs: 15000
+  learning_rate: 2.0e-4
+  weight_decay: 1.0e-6
+  grad_clip: 1.0
+  log_every: 200
+  eval_every: 1000
+  snapshot_every: 5000
+
+evaluation:
+  cases:
+    - label: "sigma_min"
+      A: 0.1
+      w0: 0.4
+      alpha: 0.75
+      beta: 0.0
+      mu: 0.0
+    - label: "sigma_mid"
+      A: 0.1
+      w0: 0.6
+      alpha: 0.75
+      beta: 0.0
+      mu: 0.0
+    - label: "sigma_max"
+      A: 0.1
+      w0: 0.8
+      alpha: 0.75
+      beta: 0.0
+      mu: 0.0
