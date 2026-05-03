@@ -41,13 +41,13 @@ data:
   valid_queries: 4096
 
 parametric_dataset:
-  train_cases: 24
-  valid_cases: 8
+  train_cases: 96
+  valid_cases: 24
   seed: 1242
 
 training:
   save_dir: "results/CGL_GlobalMultistage_Parametric_mu_only_base_t5"
-  stage_num_epochs: 15000
+  stage_num_epochs: 30000
   learning_rate: 2.0e-4
   weight_decay: 1.0e-6
   grad_clip: 1.0
