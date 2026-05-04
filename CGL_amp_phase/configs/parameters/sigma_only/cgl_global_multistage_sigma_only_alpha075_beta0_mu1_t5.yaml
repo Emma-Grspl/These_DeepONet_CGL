@@ -45,6 +45,16 @@ parametric_dataset:
   valid_cases: 24
   seed: 1235
 
+hard_case_sampling:
+  enabled: true
+  audit_cases: 50
+  audit_seed_offset: 2000
+  warmup_epochs: 5000
+  refresh_every: 2000
+  hard_fraction: 0.4
+  mix_hard_ratio: 0.7
+  success_threshold: 0.05
+
 training:
   save_dir: "results/CGL_GlobalMultistage_Parametric_sigma_only_alpha075_beta0_mu1_t5"
   stage_num_epochs: 30000

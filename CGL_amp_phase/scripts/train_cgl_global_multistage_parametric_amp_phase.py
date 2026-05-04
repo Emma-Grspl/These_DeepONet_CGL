@@ -157,8 +157,11 @@ def save_case_pool_csv(path, pool):
             writer.writerow(row)
 
 
-def sample_block_batch(case_pool, t_start, t_end, n_queries, device):
-    case_ids = np.random.randint(0, len(case_pool), size=int(n_queries))
+def sample_block_batch(case_pool, t_start, t_end, n_queries, device, case_ids=None):
+    if case_ids is None:
+        case_ids = np.random.randint(0, len(case_pool), size=int(n_queries))
+    else:
+        case_ids = np.asarray(case_ids, dtype=np.int64)
     coords = np.zeros((int(n_queries), 2), dtype=np.float32)
     target_re = np.zeros((int(n_queries), 1), dtype=np.float32)
     target_im = np.zeros((int(n_queries), 1), dtype=np.float32)
@@ -190,6 +193,110 @@ def sample_block_batch(case_pool, t_start, t_end, n_queries, device):
 def compute_supervised_loss(model, batch):
     pred_re, pred_im = model(batch["branch"], batch["coords"])
     return torch.mean((pred_re - batch["target_re"]) ** 2 + (pred_im - batch["target_im"]) ** 2)
+
+
+def hard_case_cfg(cfg_dict):
+    return cfg_dict.get("hard_case_sampling", {})
+
+
+def hard_case_enabled(cfg_dict):
+    return bool(hard_case_cfg(cfg_dict).get("enabled", False))
+
+
+def sample_case_ids_for_training(case_pool_size, n_queries, sampler_state):
+    if sampler_state is None:
+        return np.random.randint(0, case_pool_size, size=int(n_queries))
+
+    hard_ratio = float(sampler_state["mix_hard_ratio"])
+    hard_ids = sampler_state["hard_case_ids"]
+    easy_ids = sampler_state["easy_case_ids"]
+
+    if len(hard_ids) == 0 and len(easy_ids) == 0:
+        return np.random.randint(0, case_pool_size, size=int(n_queries))
+    if len(hard_ids) == 0:
+        return np.random.choice(easy_ids, size=int(n_queries), replace=True)
+    if len(easy_ids) == 0:
+        return np.random.choice(hard_ids, size=int(n_queries), replace=True)
+
+    n_hard = int(round(int(n_queries) * hard_ratio))
+    n_hard = max(0, min(int(n_queries), n_hard))
+    n_easy = int(n_queries) - n_hard
+    picked_hard = np.random.choice(hard_ids, size=n_hard, replace=True)
+    picked_easy = np.random.choice(easy_ids, size=n_easy, replace=True)
+    merged = np.concatenate([picked_hard, picked_easy], axis=0)
+    np.random.shuffle(merged)
+    return merged
+
+
+def block_case_rel_l2(model, case, t_start, t_end, device):
+    x = case["x"]
+    t_values = case["t_values"]
+    u = case["u"]
+    branch_vec = case["branch_vec"]
+    valid_t_idx = np.nonzero((t_values >= t_start - 1e-10) & (t_values <= t_end + 1e-10))[0]
+    t_block = t_values[valid_t_idx]
+    u_block = u[:, valid_t_idx]
+    xx = np.tile(x, len(t_block))
+    tt = np.repeat(t_block, len(x))
+    coords = torch.tensor(np.stack([xx, tt], axis=1), dtype=torch.float32, device=device)
+    branch = torch.tensor(np.repeat(branch_vec[None, :], len(coords), axis=0), dtype=torch.float32, device=device)
+    with torch.no_grad():
+        pred_re, pred_im = model(branch, coords)
+    pred = (pred_re + 1j * pred_im).cpu().numpy().reshape(len(t_block), len(x)).T
+    denom = np.linalg.norm(u_block) + 1e-12
+    return float(np.linalg.norm(pred - u_block) / denom)
+
+
+def refresh_hard_case_sampler(model, audit_pool, cfg_dict, t_start, t_end, device, stage_dir, epoch):
+    hc_cfg = hard_case_cfg(cfg_dict)
+    threshold = float(hc_cfg.get("success_threshold", 0.05))
+    hard_fraction = float(hc_cfg.get("hard_fraction", 0.4))
+    mix_hard_ratio = float(hc_cfg.get("mix_hard_ratio", 0.7))
+
+    model.eval()
+    scores = []
+    for case_idx, case in enumerate(audit_pool):
+        score = block_case_rel_l2(model, case, t_start, t_end, device)
+        scores.append({"case_idx": case_idx, "block_rel_l2": score})
+    scores.sort(key=lambda item: item["block_rel_l2"], reverse=True)
+
+    n_hard = max(1, int(round(len(scores) * hard_fraction)))
+    hard_ids = np.array([row["case_idx"] for row in scores[:n_hard]], dtype=np.int64)
+    easy_ids = np.array([row["case_idx"] for row in scores if row["block_rel_l2"] < threshold], dtype=np.int64)
+
+    audit_dir = os.path.join(stage_dir, "hard_case_sampling")
+    os.makedirs(audit_dir, exist_ok=True)
+    audit_csv = os.path.join(audit_dir, f"audit_epoch_{int(epoch):06d}.csv")
+    with open(audit_csv, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["case_idx", "block_rel_l2"])
+        writer.writeheader()
+        writer.writerows(scores)
+
+    summary_path = os.path.join(audit_dir, "latest_summary.txt")
+    with open(summary_path, "w", encoding="utf-8") as handle:
+        handle.write(f"epoch={int(epoch)}\n")
+        handle.write(f"threshold={threshold:.6f}\n")
+        handle.write(f"hard_fraction={hard_fraction:.6f}\n")
+        handle.write(f"mix_hard_ratio={mix_hard_ratio:.6f}\n")
+        handle.write(f"audit_cases={len(scores)}\n")
+        handle.write(f"n_validated={len(easy_ids)}\n")
+        handle.write(f"n_hard={len(hard_ids)}\n")
+        handle.write(f"best_case_rel_l2={scores[-1]['block_rel_l2']:.10f}\n")
+        handle.write(f"worst_case_rel_l2={scores[0]['block_rel_l2']:.10f}\n")
+        handle.write(f"mean_case_rel_l2={float(np.mean([row['block_rel_l2'] for row in scores])):.10f}\n")
+        handle.write(f"audit_csv={audit_csv}\n")
+
+    print(
+        "    🎯 hard-case audit "
+        f"(epoch {epoch}) | validated<{threshold:.2%}: {len(easy_ids)}/{len(scores)} | "
+        f"hard set: {len(hard_ids)} | worst={scores[0]['block_rel_l2']:.3e} | "
+        f"best={scores[-1]['block_rel_l2']:.3e}"
+    )
+    return {
+        "hard_case_ids": hard_ids,
+        "easy_case_ids": easy_ids,
+        "mix_hard_ratio": mix_hard_ratio,
+    }
 
 
 def save_stage_checkpoint(model, optimizer, epoch, best_valid_loss, stage_dir, name):
@@ -263,7 +370,7 @@ def rollout_multistage_models(models, time_blocks, case_ref, device):
     return {"t_values": t_values, "rel_l2": rel_l2}
 
 
-def train_one_stage(model, optimizer, train_pool, valid_pool, cfg_dict, t_start, t_end, stage_dir, device):
+def train_one_stage(model, optimizer, train_pool, valid_pool, audit_pool, cfg_dict, t_start, t_end, stage_dir, device):
     num_epochs = int(cfg_dict["training"]["stage_num_epochs"])
     log_every = int(cfg_dict["training"]["log_every"])
     eval_every = int(cfg_dict["training"]["eval_every"])
@@ -271,14 +378,28 @@ def train_one_stage(model, optimizer, train_pool, valid_pool, cfg_dict, t_start,
     grad_clip = float(cfg_dict["training"]["grad_clip"])
     n_queries = int(cfg_dict["data"]["train_queries"])
     n_valid_queries = int(cfg_dict["data"]["valid_queries"])
+    hc_cfg = hard_case_cfg(cfg_dict)
+    use_hard_cases = hard_case_enabled(cfg_dict) and len(audit_pool) > 0
+    warmup_epochs = int(hc_cfg.get("warmup_epochs", 5000))
+    refresh_every = int(hc_cfg.get("refresh_every", eval_every))
 
     start_epoch, best_valid_loss = load_stage_checkpoint_if_available(model, optimizer, stage_dir, device)
     print(f"🔁 Reprise stage={os.path.basename(stage_dir)} epoch={start_epoch} best_valid={best_valid_loss:.6e}")
     stage_start_perf = time.perf_counter()
+    sampler_state = None
 
     for epoch in range(start_epoch + 1, num_epochs + 1):
         model.train()
-        batch = sample_block_batch(train_pool, t_start, t_end, n_queries, device)
+        if use_hard_cases and epoch > warmup_epochs and ((epoch - warmup_epochs - 1) % max(1, refresh_every) == 0):
+            sampler_state = refresh_hard_case_sampler(model, audit_pool, cfg_dict, t_start, t_end, device, stage_dir, epoch)
+
+        case_ids = sample_case_ids_for_training(
+            len(audit_pool) if (use_hard_cases and sampler_state is not None) else len(train_pool),
+            n_queries,
+            sampler_state,
+        )
+        active_pool = audit_pool if (use_hard_cases and sampler_state is not None) else train_pool
+        batch = sample_block_batch(active_pool, t_start, t_end, n_queries, device, case_ids=case_ids)
         optimizer.zero_grad(set_to_none=True)
         loss = compute_supervised_loss(model, batch)
         loss.backward()
@@ -381,8 +502,13 @@ def main():
     ds_cfg = cfg_dict["parametric_dataset"]
     train_pool = build_case_pool(cfg_dict, int(ds_cfg["train_cases"]), int(ds_cfg["seed"]))
     valid_pool = build_case_pool(cfg_dict, int(ds_cfg["valid_cases"]), int(ds_cfg["seed"]) + 1000)
+    audit_cases = int(hard_case_cfg(cfg_dict).get("audit_cases", 0))
+    audit_seed_offset = int(hard_case_cfg(cfg_dict).get("audit_seed_offset", 2000))
+    audit_pool = build_case_pool(cfg_dict, audit_cases, int(ds_cfg["seed"]) + audit_seed_offset) if hard_case_enabled(cfg_dict) and audit_cases > 0 else []
     save_case_pool_csv(os.path.join(run_dir, "train_cases.csv"), train_pool)
     save_case_pool_csv(os.path.join(run_dir, "valid_cases.csv"), valid_pool)
+    if audit_pool:
+        save_case_pool_csv(os.path.join(run_dir, "audit_cases.csv"), audit_pool)
 
     time_blocks = [tuple(map(float, block)) for block in cfg_dict["multistage"]["time_blocks"]]
     stage_rows = []
@@ -396,7 +522,7 @@ def main():
             weight_decay=float(cfg_dict["training"]["weight_decay"]),
         )
         print(f"\n🚧 Stage {stage_idx + 1}/{len(time_blocks)} | bloc=[{t_start}, {t_end}]")
-        stage_metrics = train_one_stage(model, optimizer, train_pool, valid_pool, cfg_dict, t_start, t_end, stage_dir, device)
+        stage_metrics = train_one_stage(model, optimizer, train_pool, valid_pool, audit_pool, cfg_dict, t_start, t_end, stage_dir, device)
         stage_rows.append(
             {
                 "stage_idx": stage_idx,
