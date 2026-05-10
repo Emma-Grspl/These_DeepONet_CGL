@@ -54,6 +54,25 @@ hard_case_sampling:
   hard_fraction: 0.4
   mix_hard_ratio: 0.7
   success_threshold: 0.05
+  activation_mean_threshold: 0.05
+  activation_bad_fraction_threshold: 0.2
+  activation_max_threshold: 0.10
+
+parametric_curriculum:
+  enabled: true
+  phases:
+    - end_epoch: 10000
+      physics:
+        equation_params:
+          alpha: [0.5, 1.0]
+    - end_epoch: 20000
+      physics:
+        equation_params:
+          alpha: [0.5, 1.25]
+    - end_epoch: 30000
+      physics:
+        equation_params:
+          alpha: [0.5, 1.5]
 
 training:
   save_dir: "results/CGL_GlobalMultistage_Parametric_alpha_only_base_t5"

@@ -3,6 +3,7 @@ import csv
 import os
 import sys
 import time
+import copy
 from datetime import datetime
 
 import numpy as np
@@ -106,6 +107,56 @@ def sample_case_params(cfg_dict, rng):
         "type": int(physics["initial_conditions"][0]),
     }
     return params
+
+
+def curriculum_cfg(cfg_dict):
+    return cfg_dict.get("parametric_curriculum", {})
+
+
+def curriculum_enabled(cfg_dict):
+    return bool(curriculum_cfg(cfg_dict).get("enabled", False))
+
+
+def apply_param_overrides(cfg_dict, phase_params):
+    cfg_copy = copy.deepcopy(cfg_dict)
+    physics = cfg_copy["physics"]
+    for family_name in ("equation_params", "bounds"):
+        overrides = phase_params.get(family_name, {})
+        target = physics[family_name]
+        for key, value in overrides.items():
+            if key not in target:
+                raise KeyError(f"Parametre de curriculum inconnu: {family_name}.{key}")
+            if not isinstance(value, (list, tuple)) or len(value) != 2:
+                raise ValueError(f"Chaque override de curriculum doit etre une paire [min, max] pour {family_name}.{key}")
+            target[key] = [float(value[0]), float(value[1])]
+    return cfg_copy
+
+
+def build_curriculum_train_pools(cfg_dict):
+    ds_cfg = cfg_dict["parametric_dataset"]
+    base_seed = int(ds_cfg["seed"])
+    n_cases = int(ds_cfg["train_cases"])
+    cur_cfg = curriculum_cfg(cfg_dict)
+    phases = cur_cfg.get("phases", [])
+    if not curriculum_enabled(cfg_dict) or not phases:
+        base_pool = build_case_pool(cfg_dict, n_cases, base_seed)
+        return [{"end_epoch": int(cfg_dict["training"]["stage_num_epochs"]), "pool": base_pool, "phase_idx": 0}]
+
+    built = []
+    for phase_idx, phase in enumerate(phases):
+        end_epoch = int(phase["end_epoch"])
+        phase_params = phase.get("physics", {})
+        phase_cfg = apply_param_overrides(cfg_dict, phase_params)
+        phase_pool = build_case_pool(phase_cfg, n_cases, base_seed + 100 * phase_idx)
+        built.append({"end_epoch": end_epoch, "pool": phase_pool, "phase_idx": phase_idx})
+    return built
+
+
+def active_curriculum_pool(curriculum_pools, epoch):
+    for phase in curriculum_pools:
+        if int(epoch) <= int(phase["end_epoch"]):
+            return phase
+    return curriculum_pools[-1]
 
 
 def make_branch_vector(params):
@@ -250,6 +301,9 @@ def block_case_rel_l2(model, case, t_start, t_end, device):
 def refresh_hard_case_sampler(model, audit_pool, cfg_dict, t_start, t_end, device, stage_dir, epoch):
     hc_cfg = hard_case_cfg(cfg_dict)
     threshold = float(hc_cfg.get("success_threshold", 0.05))
+    activation_mean_threshold = float(hc_cfg.get("activation_mean_threshold", 0.05))
+    activation_bad_fraction_threshold = float(hc_cfg.get("activation_bad_fraction_threshold", 0.20))
+    activation_max_threshold = float(hc_cfg.get("activation_max_threshold", 0.10))
     hard_fraction = float(hc_cfg.get("hard_fraction", 0.4))
     mix_hard_ratio = float(hc_cfg.get("mix_hard_ratio", 0.7))
 
@@ -259,6 +313,14 @@ def refresh_hard_case_sampler(model, audit_pool, cfg_dict, t_start, t_end, devic
         score = block_case_rel_l2(model, case, t_start, t_end, device)
         scores.append({"case_idx": case_idx, "block_rel_l2": score})
     scores.sort(key=lambda item: item["block_rel_l2"], reverse=True)
+    mean_case_rel_l2 = float(np.mean([row["block_rel_l2"] for row in scores]))
+    bad_fraction = float(np.mean([row["block_rel_l2"] > threshold for row in scores]))
+    max_case_rel_l2 = float(scores[0]["block_rel_l2"])
+    hard_sampling_active = bool(
+        (mean_case_rel_l2 > activation_mean_threshold)
+        or (bad_fraction > activation_bad_fraction_threshold)
+        or (max_case_rel_l2 > activation_max_threshold)
+    )
 
     n_hard = max(1, int(round(len(scores) * hard_fraction)))
     hard_ids = np.array([row["case_idx"] for row in scores[:n_hard]], dtype=np.int64)
@@ -276,26 +338,38 @@ def refresh_hard_case_sampler(model, audit_pool, cfg_dict, t_start, t_end, devic
     with open(summary_path, "w", encoding="utf-8") as handle:
         handle.write(f"epoch={int(epoch)}\n")
         handle.write(f"threshold={threshold:.6f}\n")
+        handle.write(f"activation_mean_threshold={activation_mean_threshold:.6f}\n")
+        handle.write(f"activation_bad_fraction_threshold={activation_bad_fraction_threshold:.6f}\n")
+        handle.write(f"activation_max_threshold={activation_max_threshold:.6f}\n")
         handle.write(f"hard_fraction={hard_fraction:.6f}\n")
         handle.write(f"mix_hard_ratio={mix_hard_ratio:.6f}\n")
         handle.write(f"audit_cases={len(scores)}\n")
+        handle.write(f"hard_sampling_active={int(hard_sampling_active)}\n")
         handle.write(f"n_validated={len(easy_ids)}\n")
         handle.write(f"n_hard={len(hard_ids)}\n")
         handle.write(f"best_case_rel_l2={scores[-1]['block_rel_l2']:.10f}\n")
         handle.write(f"worst_case_rel_l2={scores[0]['block_rel_l2']:.10f}\n")
-        handle.write(f"mean_case_rel_l2={float(np.mean([row['block_rel_l2'] for row in scores])):.10f}\n")
+        handle.write(f"mean_case_rel_l2={mean_case_rel_l2:.10f}\n")
+        handle.write(f"bad_case_fraction={bad_fraction:.10f}\n")
+        handle.write(f"max_case_rel_l2={max_case_rel_l2:.10f}\n")
         handle.write(f"audit_csv={audit_csv}\n")
 
     print(
         "    🎯 hard-case audit "
-        f"(epoch {epoch}) | validated<{threshold:.2%}: {len(easy_ids)}/{len(scores)} | "
+        f"(epoch {epoch}) | mean={mean_case_rel_l2:.2%} | bad_frac={bad_fraction:.2%} | "
+        f"max={max_case_rel_l2:.2%} | active={hard_sampling_active} | "
+        f"validated<{threshold:.2%}: {len(easy_ids)}/{len(scores)} | "
         f"hard set: {len(hard_ids)} | worst={scores[0]['block_rel_l2']:.3e} | "
         f"best={scores[-1]['block_rel_l2']:.3e}"
     )
     return {
-        "hard_case_ids": hard_ids,
-        "easy_case_ids": easy_ids,
-        "mix_hard_ratio": mix_hard_ratio,
+        "active": hard_sampling_active,
+        "hard_case_ids": hard_ids if hard_sampling_active else np.array([], dtype=np.int64),
+        "easy_case_ids": easy_ids if hard_sampling_active else np.array([], dtype=np.int64),
+        "mix_hard_ratio": mix_hard_ratio if hard_sampling_active else 0.0,
+        "mean_case_rel_l2": mean_case_rel_l2,
+        "bad_case_fraction": bad_fraction,
+        "max_case_rel_l2": max_case_rel_l2,
     }
 
 
@@ -370,7 +444,7 @@ def rollout_multistage_models(models, time_blocks, case_ref, device):
     return {"t_values": t_values, "rel_l2": rel_l2}
 
 
-def train_one_stage(model, optimizer, train_pool, valid_pool, audit_pool, cfg_dict, t_start, t_end, stage_dir, device):
+def train_one_stage(model, optimizer, train_curriculum_pools, valid_pool, audit_pool, cfg_dict, t_start, t_end, stage_dir, device):
     num_epochs = int(cfg_dict["training"]["stage_num_epochs"])
     log_every = int(cfg_dict["training"]["log_every"])
     eval_every = int(cfg_dict["training"]["eval_every"])
@@ -387,18 +461,28 @@ def train_one_stage(model, optimizer, train_pool, valid_pool, audit_pool, cfg_di
     print(f"🔁 Reprise stage={os.path.basename(stage_dir)} epoch={start_epoch} best_valid={best_valid_loss:.6e}")
     stage_start_perf = time.perf_counter()
     sampler_state = None
+    current_phase_idx = None
 
     for epoch in range(start_epoch + 1, num_epochs + 1):
         model.train()
+        curriculum_phase = active_curriculum_pool(train_curriculum_pools, epoch)
+        current_train_pool = curriculum_phase["pool"]
+        if current_phase_idx != curriculum_phase["phase_idx"]:
+            current_phase_idx = curriculum_phase["phase_idx"]
+            print(
+                f"    📚 curriculum phase={current_phase_idx + 1}/{len(train_curriculum_pools)} "
+                f"(end_epoch={curriculum_phase['end_epoch']})"
+            )
         if use_hard_cases and epoch > warmup_epochs and ((epoch - warmup_epochs - 1) % max(1, refresh_every) == 0):
             sampler_state = refresh_hard_case_sampler(model, audit_pool, cfg_dict, t_start, t_end, device, stage_dir, epoch)
 
+        use_audit_pool = bool(use_hard_cases and sampler_state is not None and sampler_state.get("active", False))
         case_ids = sample_case_ids_for_training(
-            len(audit_pool) if (use_hard_cases and sampler_state is not None) else len(train_pool),
+            len(audit_pool) if use_audit_pool else len(current_train_pool),
             n_queries,
             sampler_state,
         )
-        active_pool = audit_pool if (use_hard_cases and sampler_state is not None) else train_pool
+        active_pool = audit_pool if use_audit_pool else current_train_pool
         batch = sample_block_batch(active_pool, t_start, t_end, n_queries, device, case_ids=case_ids)
         optimizer.zero_grad(set_to_none=True)
         loss = compute_supervised_loss(model, batch)
@@ -500,12 +584,17 @@ def main():
     print(f"📂 Run dir : {run_dir}")
 
     ds_cfg = cfg_dict["parametric_dataset"]
-    train_pool = build_case_pool(cfg_dict, int(ds_cfg["train_cases"]), int(ds_cfg["seed"]))
+    train_curriculum_pools = build_curriculum_train_pools(cfg_dict)
+    train_pool = train_curriculum_pools[-1]["pool"]
     valid_pool = build_case_pool(cfg_dict, int(ds_cfg["valid_cases"]), int(ds_cfg["seed"]) + 1000)
     audit_cases = int(hard_case_cfg(cfg_dict).get("audit_cases", 0))
     audit_seed_offset = int(hard_case_cfg(cfg_dict).get("audit_seed_offset", 2000))
     audit_pool = build_case_pool(cfg_dict, audit_cases, int(ds_cfg["seed"]) + audit_seed_offset) if hard_case_enabled(cfg_dict) and audit_cases > 0 else []
     save_case_pool_csv(os.path.join(run_dir, "train_cases.csv"), train_pool)
+    if len(train_curriculum_pools) > 1:
+        for phase in train_curriculum_pools:
+            phase_idx = int(phase["phase_idx"]) + 1
+            save_case_pool_csv(os.path.join(run_dir, f"train_cases_phase_{phase_idx:02d}.csv"), phase["pool"])
     save_case_pool_csv(os.path.join(run_dir, "valid_cases.csv"), valid_pool)
     if audit_pool:
         save_case_pool_csv(os.path.join(run_dir, "audit_cases.csv"), audit_pool)
@@ -522,7 +611,7 @@ def main():
             weight_decay=float(cfg_dict["training"]["weight_decay"]),
         )
         print(f"\n🚧 Stage {stage_idx + 1}/{len(time_blocks)} | bloc=[{t_start}, {t_end}]")
-        stage_metrics = train_one_stage(model, optimizer, train_pool, valid_pool, audit_pool, cfg_dict, t_start, t_end, stage_dir, device)
+        stage_metrics = train_one_stage(model, optimizer, train_curriculum_pools, valid_pool, audit_pool, cfg_dict, t_start, t_end, stage_dir, device)
         stage_rows.append(
             {
                 "stage_idx": stage_idx,

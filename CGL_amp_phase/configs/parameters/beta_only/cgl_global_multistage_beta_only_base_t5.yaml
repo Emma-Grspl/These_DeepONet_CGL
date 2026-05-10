@@ -54,6 +54,9 @@ hard_case_sampling:
   hard_fraction: 0.4
   mix_hard_ratio: 0.7
   success_threshold: 0.05
+  activation_mean_threshold: 0.05
+  activation_bad_fraction_threshold: 0.2
+  activation_max_threshold: 0.10
 
 training:
   save_dir: "results/CGL_GlobalMultistage_Parametric_beta_only_base_t5"
