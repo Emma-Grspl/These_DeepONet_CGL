@@ -254,6 +254,93 @@ def hard_case_enabled(cfg_dict):
     return bool(hard_case_cfg(cfg_dict).get("enabled", False))
 
 
+def focus_sampling_cfg(cfg_dict):
+    return cfg_dict.get("parametric_focus_sampling", {})
+
+
+def focus_sampling_enabled(cfg_dict):
+    cfg = focus_sampling_cfg(cfg_dict)
+    return bool(cfg.get("enabled", False) and cfg.get("physics"))
+
+
+def build_focus_pool(cfg_dict):
+    if not focus_sampling_enabled(cfg_dict):
+        return []
+    fs_cfg = focus_sampling_cfg(cfg_dict)
+    ds_cfg = cfg_dict["parametric_dataset"]
+    n_cases = int(fs_cfg.get("focus_cases", max(16, int(ds_cfg["train_cases"]) // 2)))
+    seed = int(ds_cfg["seed"]) + int(fs_cfg.get("focus_seed_offset", 3000))
+    focus_cfg_dict = apply_param_overrides(cfg_dict, fs_cfg["physics"])
+    return build_case_pool(focus_cfg_dict, n_cases, seed)
+
+
+def _concat_batches(batches):
+    valid_batches = [batch for batch in batches if batch is not None]
+    if not valid_batches:
+        return None
+    merged = {
+        key: torch.cat([batch[key] for batch in valid_batches], dim=0)
+        for key in valid_batches[0].keys()
+    }
+    perm = torch.randperm(merged["branch"].shape[0], device=merged["branch"].device)
+    return {key: value[perm] for key, value in merged.items()}
+
+
+def _sample_pool_batch(case_pool, t_start, t_end, n_queries, device, case_ids=None):
+    if int(n_queries) <= 0:
+        return None
+    return sample_block_batch(case_pool, t_start, t_end, n_queries, device, case_ids=case_ids)
+
+
+def sample_training_batch(train_pool, focus_pool, audit_pool, sampler_state, cfg_dict, t_start, t_end, n_queries, device):
+    if not focus_pool:
+        use_audit_pool = bool(sampler_state is not None and sampler_state.get("active", False))
+        case_ids = sample_case_ids_for_training(
+            len(audit_pool) if use_audit_pool else len(train_pool),
+            n_queries,
+            sampler_state,
+        )
+        active_pool = audit_pool if use_audit_pool else train_pool
+        return sample_block_batch(active_pool, t_start, t_end, n_queries, device, case_ids=case_ids)
+
+    fs_cfg = focus_sampling_cfg(cfg_dict)
+    focus_fraction = float(fs_cfg.get("focus_fraction", 0.3))
+    active_hard_fraction = float(fs_cfg.get("active_hard_fraction", 0.2))
+
+    use_hard = bool(
+        sampler_state is not None
+        and sampler_state.get("active", False)
+        and len(sampler_state.get("hard_case_ids", [])) > 0
+    )
+    hard_fraction = active_hard_fraction if use_hard else 0.0
+    focus_fraction = max(0.0, min(1.0, focus_fraction))
+    hard_fraction = max(0.0, min(1.0, hard_fraction))
+    if focus_fraction + hard_fraction > 1.0:
+        scale = 1.0 / (focus_fraction + hard_fraction)
+        focus_fraction *= scale
+        hard_fraction *= scale
+
+    n_focus = int(round(int(n_queries) * focus_fraction))
+    n_hard = int(round(int(n_queries) * hard_fraction))
+    n_uniform = int(n_queries) - n_focus - n_hard
+    if n_uniform < 0:
+        overflow = -n_uniform
+        take_from_focus = min(overflow, n_focus)
+        n_focus -= take_from_focus
+        overflow -= take_from_focus
+        if overflow > 0:
+            n_hard = max(0, n_hard - overflow)
+        n_uniform = int(n_queries) - n_focus - n_hard
+
+    batches = []
+    batches.append(_sample_pool_batch(train_pool, t_start, t_end, n_uniform, device))
+    batches.append(_sample_pool_batch(focus_pool, t_start, t_end, n_focus, device))
+    if use_hard and n_hard > 0:
+        hard_ids = np.random.choice(sampler_state["hard_case_ids"], size=n_hard, replace=True)
+        batches.append(_sample_pool_batch(audit_pool, t_start, t_end, n_hard, device, case_ids=hard_ids))
+    return _concat_batches(batches)
+
+
 def sample_case_ids_for_training(case_pool_size, n_queries, sampler_state):
     if sampler_state is None:
         return np.random.randint(0, case_pool_size, size=int(n_queries))
@@ -444,7 +531,7 @@ def rollout_multistage_models(models, time_blocks, case_ref, device):
     return {"t_values": t_values, "rel_l2": rel_l2}
 
 
-def train_one_stage(model, optimizer, train_curriculum_pools, valid_pool, audit_pool, cfg_dict, t_start, t_end, stage_dir, device):
+def train_one_stage(model, optimizer, train_pool, focus_pool, valid_pool, audit_pool, cfg_dict, t_start, t_end, stage_dir, device):
     num_epochs = int(cfg_dict["training"]["stage_num_epochs"])
     log_every = int(cfg_dict["training"]["log_every"])
     eval_every = int(cfg_dict["training"]["eval_every"])
@@ -461,29 +548,13 @@ def train_one_stage(model, optimizer, train_curriculum_pools, valid_pool, audit_
     print(f"🔁 Reprise stage={os.path.basename(stage_dir)} epoch={start_epoch} best_valid={best_valid_loss:.6e}")
     stage_start_perf = time.perf_counter()
     sampler_state = None
-    current_phase_idx = None
 
     for epoch in range(start_epoch + 1, num_epochs + 1):
         model.train()
-        curriculum_phase = active_curriculum_pool(train_curriculum_pools, epoch)
-        current_train_pool = curriculum_phase["pool"]
-        if current_phase_idx != curriculum_phase["phase_idx"]:
-            current_phase_idx = curriculum_phase["phase_idx"]
-            print(
-                f"    📚 curriculum phase={current_phase_idx + 1}/{len(train_curriculum_pools)} "
-                f"(end_epoch={curriculum_phase['end_epoch']})"
-            )
         if use_hard_cases and epoch > warmup_epochs and ((epoch - warmup_epochs - 1) % max(1, refresh_every) == 0):
             sampler_state = refresh_hard_case_sampler(model, audit_pool, cfg_dict, t_start, t_end, device, stage_dir, epoch)
 
-        use_audit_pool = bool(use_hard_cases and sampler_state is not None and sampler_state.get("active", False))
-        case_ids = sample_case_ids_for_training(
-            len(audit_pool) if use_audit_pool else len(current_train_pool),
-            n_queries,
-            sampler_state,
-        )
-        active_pool = audit_pool if use_audit_pool else current_train_pool
-        batch = sample_block_batch(active_pool, t_start, t_end, n_queries, device, case_ids=case_ids)
+        batch = sample_training_batch(train_pool, focus_pool, audit_pool, sampler_state, cfg_dict, t_start, t_end, n_queries, device)
         optimizer.zero_grad(set_to_none=True)
         loss = compute_supervised_loss(model, batch)
         loss.backward()
@@ -584,17 +655,15 @@ def main():
     print(f"📂 Run dir : {run_dir}")
 
     ds_cfg = cfg_dict["parametric_dataset"]
-    train_curriculum_pools = build_curriculum_train_pools(cfg_dict)
-    train_pool = train_curriculum_pools[-1]["pool"]
+    train_pool = build_case_pool(cfg_dict, int(ds_cfg["train_cases"]), int(ds_cfg["seed"]))
+    focus_pool = build_focus_pool(cfg_dict)
     valid_pool = build_case_pool(cfg_dict, int(ds_cfg["valid_cases"]), int(ds_cfg["seed"]) + 1000)
     audit_cases = int(hard_case_cfg(cfg_dict).get("audit_cases", 0))
     audit_seed_offset = int(hard_case_cfg(cfg_dict).get("audit_seed_offset", 2000))
     audit_pool = build_case_pool(cfg_dict, audit_cases, int(ds_cfg["seed"]) + audit_seed_offset) if hard_case_enabled(cfg_dict) and audit_cases > 0 else []
     save_case_pool_csv(os.path.join(run_dir, "train_cases.csv"), train_pool)
-    if len(train_curriculum_pools) > 1:
-        for phase in train_curriculum_pools:
-            phase_idx = int(phase["phase_idx"]) + 1
-            save_case_pool_csv(os.path.join(run_dir, f"train_cases_phase_{phase_idx:02d}.csv"), phase["pool"])
+    if focus_pool:
+        save_case_pool_csv(os.path.join(run_dir, "focus_cases.csv"), focus_pool)
     save_case_pool_csv(os.path.join(run_dir, "valid_cases.csv"), valid_pool)
     if audit_pool:
         save_case_pool_csv(os.path.join(run_dir, "audit_cases.csv"), audit_pool)
@@ -611,7 +680,7 @@ def main():
             weight_decay=float(cfg_dict["training"]["weight_decay"]),
         )
         print(f"\n🚧 Stage {stage_idx + 1}/{len(time_blocks)} | bloc=[{t_start}, {t_end}]")
-        stage_metrics = train_one_stage(model, optimizer, train_curriculum_pools, valid_pool, audit_pool, cfg_dict, t_start, t_end, stage_dir, device)
+        stage_metrics = train_one_stage(model, optimizer, train_pool, focus_pool, valid_pool, audit_pool, cfg_dict, t_start, t_end, stage_dir, device)
         stage_rows.append(
             {
                 "stage_idx": stage_idx,

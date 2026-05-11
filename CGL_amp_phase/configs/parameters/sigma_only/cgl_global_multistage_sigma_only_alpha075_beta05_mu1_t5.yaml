@@ -58,21 +58,15 @@ hard_case_sampling:
   activation_bad_fraction_threshold: 0.2
   activation_max_threshold: 0.10
 
-parametric_curriculum:
+parametric_focus_sampling:
   enabled: true
-  phases:
-    - end_epoch: 10000
-      physics:
-        bounds:
-          w0: [0.7, 0.8]
-    - end_epoch: 20000
-      physics:
-        bounds:
-          w0: [0.65, 0.8]
-    - end_epoch: 30000
-      physics:
-        bounds:
-          w0: [0.6, 0.8]
+  focus_cases: 48
+  focus_seed_offset: 3000
+  focus_fraction: 0.3
+  active_hard_fraction: 0.2
+  physics:
+    bounds:
+      w0: [0.6, 0.65]
 
 training:
   save_dir: "results/CGL_GlobalMultistage_Parametric_sigma_only_alpha075_beta05_mu1_t5"
