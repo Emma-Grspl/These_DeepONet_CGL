@@ -284,6 +284,14 @@ def hard_case_enabled(cfg_dict):
     return bool(hard_case_cfg(cfg_dict).get("enabled", False))
 
 
+def adaptive_refinement_cfg(cfg_dict):
+    return cfg_dict.get("adaptive_stage_refinement", {})
+
+
+def adaptive_refinement_enabled(cfg_dict):
+    return bool(adaptive_refinement_cfg(cfg_dict).get("enabled", False))
+
+
 def focus_sampling_cfg(cfg_dict):
     return cfg_dict.get("parametric_focus_sampling", {})
 
@@ -491,6 +499,38 @@ def refresh_hard_case_sampler(model, audit_pool, cfg_dict, t_start, t_end, devic
     }
 
 
+def refinement_should_trigger(cfg_dict, sampler_state):
+    if sampler_state is None:
+        return False
+    ref_cfg = adaptive_refinement_cfg(cfg_dict)
+    hc_cfg = hard_case_cfg(cfg_dict)
+    mean_threshold = float(ref_cfg.get("trigger_mean_threshold", hc_cfg.get("activation_mean_threshold", 0.05)))
+    bad_fraction_threshold = float(
+        ref_cfg.get("trigger_bad_fraction_threshold", hc_cfg.get("activation_bad_fraction_threshold", 0.20))
+    )
+    max_threshold = float(ref_cfg.get("trigger_max_threshold", hc_cfg.get("activation_max_threshold", 0.10)))
+    return bool(
+        (float(sampler_state.get("mean_case_rel_l2", 0.0)) > mean_threshold)
+        or (float(sampler_state.get("bad_case_fraction", 0.0)) > bad_fraction_threshold)
+        or (float(sampler_state.get("max_case_rel_l2", 0.0)) > max_threshold)
+    )
+
+
+def save_refinement_summary(stage_dir, rounds, used_extra_epochs, last_sampler_state):
+    out_dir = os.path.join(stage_dir, "adaptive_refinement")
+    os.makedirs(out_dir, exist_ok=True)
+    summary_path = os.path.join(out_dir, "latest_summary.txt")
+    with open(summary_path, "w", encoding="utf-8") as handle:
+        handle.write(f"rounds={int(rounds)}\n")
+        handle.write(f"used_extra_epochs={int(used_extra_epochs)}\n")
+        if last_sampler_state is not None:
+            handle.write(f"mean_case_rel_l2={float(last_sampler_state.get('mean_case_rel_l2', 0.0)):.10f}\n")
+            handle.write(f"bad_case_fraction={float(last_sampler_state.get('bad_case_fraction', 0.0)):.10f}\n")
+            handle.write(f"max_case_rel_l2={float(last_sampler_state.get('max_case_rel_l2', 0.0)):.10f}\n")
+            handle.write(f"hard_case_count={len(last_sampler_state.get('hard_case_ids', []))}\n")
+            handle.write(f"easy_case_count={len(last_sampler_state.get('easy_case_ids', []))}\n")
+
+
 def save_stage_checkpoint(model, optimizer, epoch, best_valid_loss, stage_dir, name):
     ckpt_dir = os.path.join(stage_dir, "checkpoints")
     os.makedirs(ckpt_dir, exist_ok=True)
@@ -574,11 +614,32 @@ def train_one_stage(model, optimizer, train_pool, focus_pool, valid_pool, audit_
     use_hard_cases = hard_case_enabled(cfg_dict) and len(audit_pool) > 0
     warmup_epochs = int(hc_cfg.get("warmup_epochs", 5000))
     refresh_every = int(hc_cfg.get("refresh_every", eval_every))
+    use_refinement = adaptive_refinement_enabled(cfg_dict) and use_hard_cases
+    ref_cfg = adaptive_refinement_cfg(cfg_dict)
+    refinement_extra_epochs = int(ref_cfg.get("extra_epochs", 10000))
+    refinement_rounds = int(ref_cfg.get("max_refinement_rounds", 1))
+    refinement_mix_ratio = float(ref_cfg.get("hard_mix_ratio", hc_cfg.get("mix_hard_ratio", 0.7)))
+    refinement_refresh_every = int(ref_cfg.get("refresh_every", refresh_every))
 
     start_epoch, best_valid_loss = load_stage_checkpoint_if_available(model, optimizer, stage_dir, device)
     print(f"🔁 Reprise stage={os.path.basename(stage_dir)} epoch={start_epoch} best_valid={best_valid_loss:.6e}")
     stage_start_perf = time.perf_counter()
     sampler_state = None
+    current_epoch = start_epoch
+    refinement_used_epochs = 0
+    refinement_used_rounds = 0
+
+    def maybe_run_eval(epoch, force=False):
+        nonlocal best_valid_loss
+        if not force and epoch % eval_every != 0:
+            return
+        valid_loss = eval_block_valid_loss(model, valid_pool, t_start, t_end, n_valid_queries, device)
+        print(f"    📏 valid_loss={valid_loss:.3e}")
+        save_stage_checkpoint(model, optimizer, epoch, best_valid_loss, stage_dir, name="model_latest.pth")
+        if valid_loss < best_valid_loss:
+            best_valid_loss = valid_loss
+            save_stage_checkpoint(model, optimizer, epoch, best_valid_loss, stage_dir, name="model_best.pth")
+            print(f"    ✅ Nouveau meilleur valid_loss : {best_valid_loss:.3e}")
 
     for epoch in range(start_epoch + 1, num_epochs + 1):
         model.train()
@@ -596,18 +657,93 @@ def train_one_stage(model, optimizer, train_pool, focus_pool, valid_pool, audit_
             print(f"[{os.path.basename(stage_dir)} | Epoch {epoch}] loss={loss.item():.3e}")
 
         if epoch % eval_every == 0 or epoch == num_epochs:
-            valid_loss = eval_block_valid_loss(model, valid_pool, t_start, t_end, n_valid_queries, device)
-            print(f"    📏 valid_loss={valid_loss:.3e}")
-            save_stage_checkpoint(model, optimizer, epoch, best_valid_loss, stage_dir, name="model_latest.pth")
-            if valid_loss < best_valid_loss:
-                best_valid_loss = valid_loss
-                save_stage_checkpoint(model, optimizer, epoch, best_valid_loss, stage_dir, name="model_best.pth")
-                print(f"    ✅ Nouveau meilleur valid_loss : {best_valid_loss:.3e}")
+            maybe_run_eval(epoch, force=True)
 
         if epoch % snapshot_every == 0:
             save_stage_checkpoint(model, optimizer, epoch, best_valid_loss, stage_dir, name=f"ckpt_epoch_{epoch:06d}.pth")
+        current_epoch = epoch
 
-    save_stage_checkpoint(model, optimizer, num_epochs, best_valid_loss, stage_dir, name="model_final.pth")
+    if use_refinement:
+        sampler_state = refresh_hard_case_sampler(
+            model,
+            audit_pool,
+            cfg_dict,
+            t_start,
+            t_end,
+            device,
+            stage_dir,
+            max(1, current_epoch),
+        )
+        for round_idx in range(refinement_rounds):
+            if not refinement_should_trigger(cfg_dict, sampler_state):
+                break
+            if len(sampler_state.get("hard_case_ids", [])) == 0:
+                break
+            refinement_used_rounds += 1
+            print(
+                f"    🔧 Raffinement adaptatif round {round_idx + 1}/{refinement_rounds} "
+                f"| mean={sampler_state['mean_case_rel_l2']:.2%} "
+                f"| bad_frac={sampler_state['bad_case_fraction']:.2%} "
+                f"| max={sampler_state['max_case_rel_l2']:.2%}"
+            )
+            refinement_state = {
+                "active": True,
+                "hard_case_ids": sampler_state["hard_case_ids"],
+                "easy_case_ids": sampler_state["easy_case_ids"],
+                "mix_hard_ratio": refinement_mix_ratio,
+                "mean_case_rel_l2": sampler_state["mean_case_rel_l2"],
+                "bad_case_fraction": sampler_state["bad_case_fraction"],
+                "max_case_rel_l2": sampler_state["max_case_rel_l2"],
+            }
+            round_start_epoch = current_epoch
+            for epoch in range(round_start_epoch + 1, round_start_epoch + refinement_extra_epochs + 1):
+                model.train()
+                if (epoch - round_start_epoch - 1) % max(1, refinement_refresh_every) == 0:
+                    sampler_state = refresh_hard_case_sampler(
+                        model, audit_pool, cfg_dict, t_start, t_end, device, stage_dir, epoch
+                    )
+                    if len(sampler_state.get("hard_case_ids", [])) > 0:
+                        refinement_state["hard_case_ids"] = sampler_state["hard_case_ids"]
+                        refinement_state["easy_case_ids"] = sampler_state["easy_case_ids"]
+                        refinement_state["mean_case_rel_l2"] = sampler_state["mean_case_rel_l2"]
+                        refinement_state["bad_case_fraction"] = sampler_state["bad_case_fraction"]
+                        refinement_state["max_case_rel_l2"] = sampler_state["max_case_rel_l2"]
+
+                batch = sample_training_batch(
+                    train_pool,
+                    focus_pool,
+                    audit_pool,
+                    refinement_state,
+                    cfg_dict,
+                    t_start,
+                    t_end,
+                    n_queries,
+                    device,
+                )
+                optimizer.zero_grad(set_to_none=True)
+                loss = compute_supervised_loss(model, batch)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                optimizer.step()
+
+                if epoch % log_every == 0 or epoch == round_start_epoch + 1:
+                    print(f"[{os.path.basename(stage_dir)} | Refinement Epoch {epoch}] loss={loss.item():.3e}")
+
+                if epoch % eval_every == 0 or epoch == round_start_epoch + refinement_extra_epochs:
+                    maybe_run_eval(epoch, force=True)
+
+                if epoch % snapshot_every == 0:
+                    save_stage_checkpoint(model, optimizer, epoch, best_valid_loss, stage_dir, name=f"ckpt_epoch_{epoch:06d}.pth")
+                current_epoch = epoch
+
+            refinement_used_epochs += refinement_extra_epochs
+            sampler_state = refresh_hard_case_sampler(
+                model, audit_pool, cfg_dict, t_start, t_end, device, stage_dir, max(1, current_epoch)
+            )
+
+    save_refinement_summary(stage_dir, refinement_used_rounds, refinement_used_epochs, sampler_state)
+
+    save_stage_checkpoint(model, optimizer, current_epoch, best_valid_loss, stage_dir, name="model_final.pth")
     return {
         "wall_seconds": max(0.0, time.perf_counter() - stage_start_perf),
         "best_valid_loss": float(best_valid_loss),

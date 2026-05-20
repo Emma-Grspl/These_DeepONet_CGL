@@ -63,15 +63,15 @@ spatial_focus_sampling:
   center_window: [-10.0, 10.0]
   center_fraction: 0.8
 
-parametric_focus_sampling:
+adaptive_stage_refinement:
   enabled: true
-  focus_cases: 48
-  focus_seed_offset: 3000
-  focus_fraction: 0.3
-  active_hard_fraction: 0.2
-  physics:
-    equation_params:
-      alpha: [1.2, 1.5]
+  extra_epochs: 10000
+  max_refinement_rounds: 1
+  trigger_mean_threshold: 0.05
+  trigger_bad_fraction_threshold: 0.2
+  trigger_max_threshold: 0.10
+  hard_mix_ratio: 0.7
+  refresh_every: 1000
 
 training:
   save_dir: "results/CGL_GlobalMultistage_Parametric_alpha_only_base_t5"
