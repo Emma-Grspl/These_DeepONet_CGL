@@ -63,6 +63,16 @@ spatial_focus_sampling:
   center_window: [-10.0, 10.0]
   center_fraction: 0.8
 
+adaptive_stage_refinement:
+  enabled: true
+  extra_epochs: 5000
+  max_refinement_rounds: 1
+  trigger_mean_threshold: 0.03
+  trigger_bad_fraction_threshold: 0.10
+  trigger_max_threshold: 0.08
+  hard_mix_ratio: 0.7
+  refresh_every: 1000
+
 parametric_focus_sampling:
   enabled: true
   focus_cases: 48
