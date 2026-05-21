@@ -28,7 +28,8 @@ model:
 
 multistage:
   time_blocks:
-    - [0.0, 1.0]
+    - [0.0, 0.5]
+    - [0.5, 1.0]
     - [1.0, 2.0]
     - [2.0, 3.0]
     - [3.0, 4.0]
@@ -64,7 +65,7 @@ spatial_focus_sampling:
   center_fraction: 0.8
 
 adaptive_stage_refinement:
-  enabled: true
+  enabled: false
   extra_epochs: 10000
   max_refinement_rounds: 1
   trigger_mean_threshold: 0.05
