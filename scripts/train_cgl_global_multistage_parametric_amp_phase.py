@@ -217,6 +217,15 @@ def spatial_focus_enabled(cfg_dict):
     return bool(cfg.get("enabled", False))
 
 
+def temporal_focus_cfg(cfg_dict):
+    return cfg_dict.get("temporal_focus_sampling", {})
+
+
+def temporal_focus_enabled(cfg_dict):
+    cfg = temporal_focus_cfg(cfg_dict)
+    return bool(cfg.get("enabled", False))
+
+
 def sample_spatial_index(x, spatial_cfg=None):
     if not spatial_cfg or not spatial_cfg.get("enabled", False):
         return int(np.random.randint(0, len(x)))
@@ -238,7 +247,28 @@ def sample_spatial_index(x, spatial_cfg=None):
     return int(np.random.choice(tail_ids))
 
 
-def sample_block_batch(case_pool, t_start, t_end, n_queries, device, case_ids=None, spatial_cfg=None):
+def sample_time_index(valid_t_idx, temporal_cfg=None):
+    if len(valid_t_idx) == 0:
+        raise ValueError("valid_t_idx ne doit pas etre vide")
+    if not temporal_cfg or not temporal_cfg.get("enabled", False) or len(valid_t_idx) == 1:
+        return int(np.random.choice(valid_t_idx))
+
+    start_fraction = float(temporal_cfg.get("start_fraction", 0.7))
+    start_fraction = max(0.0, min(1.0, start_fraction))
+    window_fraction = float(temporal_cfg.get("start_window_fraction", 0.25))
+    window_fraction = max(0.0, min(1.0, window_fraction))
+
+    n_early = max(1, int(np.ceil(len(valid_t_idx) * window_fraction)))
+    early_ids = valid_t_idx[:n_early]
+    late_ids = valid_t_idx[n_early:]
+    if len(late_ids) == 0:
+        return int(np.random.choice(early_ids))
+    if float(np.random.random()) < start_fraction:
+        return int(np.random.choice(early_ids))
+    return int(np.random.choice(late_ids))
+
+
+def sample_block_batch(case_pool, t_start, t_end, n_queries, device, case_ids=None, spatial_cfg=None, temporal_cfg=None):
     if case_ids is None:
         case_ids = np.random.randint(0, len(case_pool), size=int(n_queries))
     else:
@@ -254,7 +284,7 @@ def sample_block_batch(case_pool, t_start, t_end, n_queries, device, case_ids=No
         x = case["x"]
         U = case["u"]
         valid_t_idx = np.nonzero((t_values >= t_start - 1e-10) & (t_values <= t_end + 1e-10))[0]
-        tidx = int(np.random.choice(valid_t_idx))
+        tidx = sample_time_index(valid_t_idx, temporal_cfg=temporal_cfg)
         xidx = sample_spatial_index(x, spatial_cfg=spatial_cfg)
         coords[i, 0] = x[xidx]
         coords[i, 1] = t_values[tidx]
@@ -324,14 +354,24 @@ def _concat_batches(batches):
     return {key: value[perm] for key, value in merged.items()}
 
 
-def _sample_pool_batch(case_pool, t_start, t_end, n_queries, device, case_ids=None, spatial_cfg=None):
+def _sample_pool_batch(case_pool, t_start, t_end, n_queries, device, case_ids=None, spatial_cfg=None, temporal_cfg=None):
     if int(n_queries) <= 0:
         return None
-    return sample_block_batch(case_pool, t_start, t_end, n_queries, device, case_ids=case_ids, spatial_cfg=spatial_cfg)
+    return sample_block_batch(
+        case_pool,
+        t_start,
+        t_end,
+        n_queries,
+        device,
+        case_ids=case_ids,
+        spatial_cfg=spatial_cfg,
+        temporal_cfg=temporal_cfg,
+    )
 
 
 def sample_training_batch(train_pool, focus_pool, audit_pool, sampler_state, cfg_dict, t_start, t_end, n_queries, device):
     train_spatial_cfg = spatial_focus_cfg(cfg_dict) if spatial_focus_enabled(cfg_dict) else None
+    train_temporal_cfg = temporal_focus_cfg(cfg_dict) if temporal_focus_enabled(cfg_dict) else None
     if not focus_pool:
         use_audit_pool = bool(sampler_state is not None and sampler_state.get("active", False))
         case_ids = sample_case_ids_for_training(
@@ -340,7 +380,16 @@ def sample_training_batch(train_pool, focus_pool, audit_pool, sampler_state, cfg
             sampler_state,
         )
         active_pool = audit_pool if use_audit_pool else train_pool
-        return sample_block_batch(active_pool, t_start, t_end, n_queries, device, case_ids=case_ids, spatial_cfg=train_spatial_cfg)
+        return sample_block_batch(
+            active_pool,
+            t_start,
+            t_end,
+            n_queries,
+            device,
+            case_ids=case_ids,
+            spatial_cfg=train_spatial_cfg,
+            temporal_cfg=train_temporal_cfg,
+        )
 
     fs_cfg = focus_sampling_cfg(cfg_dict)
     focus_fraction = float(fs_cfg.get("focus_fraction", 0.3))
@@ -372,11 +421,22 @@ def sample_training_batch(train_pool, focus_pool, audit_pool, sampler_state, cfg
         n_uniform = int(n_queries) - n_focus - n_hard
 
     batches = []
-    batches.append(_sample_pool_batch(train_pool, t_start, t_end, n_uniform, device, spatial_cfg=train_spatial_cfg))
-    batches.append(_sample_pool_batch(focus_pool, t_start, t_end, n_focus, device, spatial_cfg=train_spatial_cfg))
+    batches.append(_sample_pool_batch(train_pool, t_start, t_end, n_uniform, device, spatial_cfg=train_spatial_cfg, temporal_cfg=train_temporal_cfg))
+    batches.append(_sample_pool_batch(focus_pool, t_start, t_end, n_focus, device, spatial_cfg=train_spatial_cfg, temporal_cfg=train_temporal_cfg))
     if use_hard and n_hard > 0:
         hard_ids = np.random.choice(sampler_state["hard_case_ids"], size=n_hard, replace=True)
-        batches.append(_sample_pool_batch(audit_pool, t_start, t_end, n_hard, device, case_ids=hard_ids, spatial_cfg=train_spatial_cfg))
+        batches.append(
+            _sample_pool_batch(
+                audit_pool,
+                t_start,
+                t_end,
+                n_hard,
+                device,
+                case_ids=hard_ids,
+                spatial_cfg=train_spatial_cfg,
+                temporal_cfg=train_temporal_cfg,
+            )
+        )
     return _concat_batches(batches)
 
 
