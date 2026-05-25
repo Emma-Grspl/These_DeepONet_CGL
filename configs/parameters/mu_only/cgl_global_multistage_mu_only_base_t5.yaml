@@ -68,7 +68,7 @@ spatial_focus_sampling:
 
 temporal_focus_sampling:
   enabled: true
-  start_fraction: 0.7
+  start_fraction: 0.6
   start_window_fraction: 0.25
 
 adaptive_stage_refinement:
