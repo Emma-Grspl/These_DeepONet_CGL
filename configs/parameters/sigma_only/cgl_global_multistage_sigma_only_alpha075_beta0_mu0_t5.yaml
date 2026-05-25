@@ -66,6 +66,11 @@ spatial_focus_sampling:
   center_window: [-10.0, 10.0]
   center_fraction: 0.8
 
+temporal_focus_sampling:
+  enabled: true
+  start_fraction: 0.7
+  start_window_fraction: 0.25
+
 adaptive_stage_refinement:
   enabled: true
   extra_epochs: 5000
