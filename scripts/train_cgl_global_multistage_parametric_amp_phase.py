@@ -36,6 +36,108 @@ def build_run_dir(project_root, cfg_dict, resume_dir=None):
     return os.path.join(output_root, run_name)
 
 
+def auto_resume_cfg(cfg_dict):
+    return cfg_dict.get("auto_resume", {})
+
+
+def auto_resume_enabled(cfg_dict):
+    return bool(auto_resume_cfg(cfg_dict).get("enabled", False))
+
+
+def continuity_loss_cfg(cfg_dict):
+    return cfg_dict.get("continuity_loss", {})
+
+
+def continuity_loss_enabled(cfg_dict):
+    return bool(continuity_loss_cfg(cfg_dict).get("enabled", False))
+
+
+def warm_start_cfg(cfg_dict):
+    return cfg_dict.get("warm_start_interstage", {})
+
+
+def warm_start_enabled(cfg_dict):
+    return bool(warm_start_cfg(cfg_dict).get("enabled", False))
+
+
+def stage_checkpoint_path(stage_dir, checkpoint_name):
+    return os.path.join(stage_dir, "checkpoints", checkpoint_name)
+
+
+def stage_is_complete(stage_dir):
+    return os.path.exists(stage_checkpoint_path(stage_dir, "model_final.pth"))
+
+
+def load_stage_checkpoint_state(stage_dir, device, checkpoint_names=None):
+    names = checkpoint_names or ("model_best.pth", "model_final.pth", "model_latest.pth")
+    for name in names:
+        ckpt_path = stage_checkpoint_path(stage_dir, name)
+        if os.path.exists(ckpt_path):
+            return torch.load(ckpt_path, map_location=device), ckpt_path
+    return None, None
+
+
+def extract_stage_best_valid_loss(stage_dir, device):
+    ckpt, _ = load_stage_checkpoint_state(stage_dir, device)
+    if ckpt is None:
+        return float("inf")
+    return float(ckpt.get("best_valid_loss", float("inf")))
+
+
+def run_is_complete(run_dir, time_blocks):
+    timing_path = os.path.join(run_dir, "timing_summary.txt")
+    eval_summary = os.path.join(run_dir, "evaluation", "summary.csv")
+    all_stage_models = all(
+        stage_is_complete(os.path.join(run_dir, stage_name(stage_idx, t_start, t_end)))
+        for stage_idx, (t_start, t_end) in enumerate(time_blocks)
+    )
+    if not (os.path.exists(timing_path) and os.path.exists(eval_summary) and all_stage_models):
+        return False
+    with open(timing_path, "r", encoding="utf-8") as handle:
+        content = handle.read()
+    return "status=completed" in content
+
+
+def run_has_progress(run_dir, time_blocks):
+    if not os.path.isdir(run_dir):
+        return False
+    if os.path.exists(os.path.join(run_dir, "evaluation", "summary.csv")):
+        return True
+    for stage_idx, (t_start, t_end) in enumerate(time_blocks):
+        stage_dir = os.path.join(run_dir, stage_name(stage_idx, t_start, t_end))
+        if os.path.exists(stage_dir):
+            return True
+    return False
+
+
+def resolve_resume_dir(project_root, cfg_dict, resume_arg):
+    if resume_arg is not None and str(resume_arg).strip().lower() != "auto":
+        return resume_arg if os.path.isabs(resume_arg) else os.path.join(project_root, resume_arg)
+
+    if not (auto_resume_enabled(cfg_dict) or str(resume_arg).strip().lower() == "auto"):
+        return None
+
+    configured = cfg_dict["training"]["save_dir"]
+    output_root = configured if os.path.isabs(configured) else os.path.join(project_root, configured)
+    if not os.path.isdir(output_root):
+        return None
+
+    time_blocks = [tuple(map(float, block)) for block in cfg_dict["multistage"]["time_blocks"]]
+    run_dirs = sorted(
+        [
+            os.path.join(output_root, name)
+            for name in os.listdir(output_root)
+            if name.startswith("run_") and os.path.isdir(os.path.join(output_root, name))
+        ]
+    )
+    for run_dir in reversed(run_dirs):
+        if run_is_complete(run_dir, time_blocks):
+            continue
+        if run_has_progress(run_dir, time_blocks):
+            return run_dir
+    return None
+
+
 def write_timing_summary(run_dir, start_iso, start_perf, status, stage_rows):
     end_dt = datetime.now()
     elapsed_seconds = max(0.0, time.perf_counter() - start_perf)
@@ -624,14 +726,46 @@ def eval_block_valid_loss(model, case_pool, t_start, t_end, n_queries, device):
 
 
 def load_best_stage_model(cfg_dict, stage_dir, device):
-    ckpt_path = os.path.join(stage_dir, "checkpoints", "model_best.pth")
-    if not os.path.exists(ckpt_path):
-        ckpt_path = os.path.join(stage_dir, "checkpoints", "model_latest.pth")
-    ckpt = torch.load(ckpt_path, map_location=device)
+    ckpt, ckpt_path = load_stage_checkpoint_state(stage_dir, device)
+    if ckpt is None:
+        raise FileNotFoundError(f"Aucun checkpoint trouve pour {stage_dir}")
     model = CGL_PI_DeepONet_AmpPhase(cfg_dict).to(device)
     model.load_state_dict(ckpt["model_state"], strict=True)
     model.eval()
     return model
+
+
+def maybe_warm_start_stage(model, cfg_dict, prev_stage_dir, device):
+    if not warm_start_enabled(cfg_dict) or prev_stage_dir is None:
+        return False
+    ckpt, ckpt_path = load_stage_checkpoint_state(prev_stage_dir, device)
+    if ckpt is None:
+        return False
+    model.load_state_dict(ckpt["model_state"], strict=True)
+    print(f"    ♻️ Warm-start depuis {ckpt_path}")
+    return True
+
+
+def build_prev_stage_model(cfg_dict, prev_stage_dir, device):
+    if prev_stage_dir is None or not continuity_loss_enabled(cfg_dict):
+        return None
+    ckpt, ckpt_path = load_stage_checkpoint_state(prev_stage_dir, device)
+    if ckpt is None:
+        return None
+    model = CGL_PI_DeepONet_AmpPhase(cfg_dict).to(device)
+    model.load_state_dict(ckpt["model_state"], strict=True)
+    model.eval()
+    for param in model.parameters():
+        param.requires_grad_(False)
+    print(f"    🔗 Continuité chargée depuis {ckpt_path}")
+    return model
+
+
+def compute_continuity_loss(model, prev_stage_model, batch):
+    pred_re, pred_im = model(batch["branch"], batch["coords"])
+    with torch.no_grad():
+        prev_re, prev_im = prev_stage_model(batch["branch"], batch["coords"])
+    return torch.mean((pred_re - prev_re) ** 2 + (pred_im - prev_im) ** 2)
 
 
 def select_stage_model(models, time_blocks, t_current):
@@ -662,7 +796,20 @@ def rollout_multistage_models(models, time_blocks, case_ref, device):
     return {"t_values": t_values, "rel_l2": rel_l2}
 
 
-def train_one_stage(model, optimizer, train_pool, focus_pool, valid_pool, audit_pool, cfg_dict, t_start, t_end, stage_dir, device):
+def train_one_stage(
+    model,
+    optimizer,
+    train_pool,
+    focus_pool,
+    valid_pool,
+    audit_pool,
+    cfg_dict,
+    t_start,
+    t_end,
+    stage_dir,
+    device,
+    prev_stage_dir=None,
+):
     num_epochs = int(cfg_dict["training"]["stage_num_epochs"])
     log_every = int(cfg_dict["training"]["log_every"])
     eval_every = int(cfg_dict["training"]["eval_every"])
@@ -680,8 +827,15 @@ def train_one_stage(model, optimizer, train_pool, focus_pool, valid_pool, audit_
     refinement_rounds = int(ref_cfg.get("max_refinement_rounds", 1))
     refinement_mix_ratio = float(ref_cfg.get("hard_mix_ratio", hc_cfg.get("mix_hard_ratio", 0.7)))
     refinement_refresh_every = int(ref_cfg.get("refresh_every", refresh_every))
+    cont_cfg = continuity_loss_cfg(cfg_dict)
+    use_continuity = bool(prev_stage_dir is not None and continuity_loss_enabled(cfg_dict))
+    continuity_weight = float(cont_cfg.get("weight", 0.2))
+    continuity_queries = int(cont_cfg.get("queries", max(1024, n_queries // 4)))
 
     start_epoch, best_valid_loss = load_stage_checkpoint_if_available(model, optimizer, stage_dir, device)
+    if start_epoch == 0:
+        maybe_warm_start_stage(model, cfg_dict, prev_stage_dir, device)
+    prev_stage_model = build_prev_stage_model(cfg_dict, prev_stage_dir, device) if use_continuity else None
     print(f"🔁 Reprise stage={os.path.basename(stage_dir)} epoch={start_epoch} best_valid={best_valid_loss:.6e}")
     stage_start_perf = time.perf_counter()
     sampler_state = None
@@ -708,13 +862,35 @@ def train_one_stage(model, optimizer, train_pool, focus_pool, valid_pool, audit_
 
         batch = sample_training_batch(train_pool, focus_pool, audit_pool, sampler_state, cfg_dict, t_start, t_end, n_queries, device)
         optimizer.zero_grad(set_to_none=True)
-        loss = compute_supervised_loss(model, batch)
+        supervised_loss = compute_supervised_loss(model, batch)
+        continuity_loss = None
+        loss = supervised_loss
+        if prev_stage_model is not None:
+            interface_batch = sample_training_batch(
+                train_pool,
+                focus_pool,
+                audit_pool,
+                sampler_state,
+                cfg_dict,
+                t_start,
+                t_start,
+                continuity_queries,
+                device,
+            )
+            continuity_loss = compute_continuity_loss(model, prev_stage_model, interface_batch)
+            loss = loss + continuity_weight * continuity_loss
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
 
         if epoch % log_every == 0 or epoch == 1:
-            print(f"[{os.path.basename(stage_dir)} | Epoch {epoch}] loss={loss.item():.3e}")
+            msg = f"[{os.path.basename(stage_dir)} | Epoch {epoch}] loss={loss.item():.3e}"
+            if continuity_loss is not None:
+                msg += (
+                    f" | supervised={supervised_loss.item():.3e}"
+                    f" | continuity={continuity_loss.item():.3e}"
+                )
+            print(msg)
 
         if epoch % eval_every == 0 or epoch == num_epochs:
             maybe_run_eval(epoch, force=True)
@@ -781,13 +957,35 @@ def train_one_stage(model, optimizer, train_pool, focus_pool, valid_pool, audit_
                     device,
                 )
                 optimizer.zero_grad(set_to_none=True)
-                loss = compute_supervised_loss(model, batch)
+                supervised_loss = compute_supervised_loss(model, batch)
+                continuity_loss = None
+                loss = supervised_loss
+                if prev_stage_model is not None:
+                    interface_batch = sample_training_batch(
+                        train_pool,
+                        focus_pool,
+                        audit_pool,
+                        refinement_state,
+                        cfg_dict,
+                        t_start,
+                        t_start,
+                        continuity_queries,
+                        device,
+                    )
+                    continuity_loss = compute_continuity_loss(model, prev_stage_model, interface_batch)
+                    loss = loss + continuity_weight * continuity_loss
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                 optimizer.step()
 
                 if epoch % log_every == 0 or epoch == round_start_epoch + 1:
-                    print(f"[{os.path.basename(stage_dir)} | Refinement Epoch {epoch}] loss={loss.item():.3e}")
+                    msg = f"[{os.path.basename(stage_dir)} | Refinement Epoch {epoch}] loss={loss.item():.3e}"
+                    if continuity_loss is not None:
+                        msg += (
+                            f" | supervised={supervised_loss.item():.3e}"
+                            f" | continuity={continuity_loss.item():.3e}"
+                        )
+                    print(msg)
 
                 if epoch % eval_every == 0 or epoch == round_start_epoch + refinement_extra_epochs:
                     maybe_run_eval(epoch, force=True)
@@ -873,13 +1071,16 @@ def main():
     with open(args.config, "r", encoding="utf-8") as handle:
         cfg_dict = yaml.safe_load(handle)
 
-    run_dir = build_run_dir(PROJECT_DIR, cfg_dict, resume_dir=args.resume)
+    resolved_resume_dir = resolve_resume_dir(PROJECT_DIR, cfg_dict, args.resume)
+    run_dir = build_run_dir(PROJECT_DIR, cfg_dict, resume_dir=resolved_resume_dir)
     os.makedirs(run_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     start_dt = datetime.now()
     start_perf = time.perf_counter()
     print(f"📱 Device : {device}")
     print(f"📂 Run dir : {run_dir}")
+    if resolved_resume_dir is not None:
+        print(f"🔄 Resume dir detecte : {resolved_resume_dir}")
 
     ds_cfg = cfg_dict["parametric_dataset"]
     train_pool = build_case_pool(cfg_dict, int(ds_cfg["train_cases"]), int(ds_cfg["seed"]))
@@ -900,14 +1101,42 @@ def main():
     for stage_idx, (t_start, t_end) in enumerate(time_blocks):
         stage_dir = os.path.join(run_dir, stage_name(stage_idx, t_start, t_end))
         os.makedirs(os.path.join(stage_dir, "checkpoints"), exist_ok=True)
+        if stage_is_complete(stage_dir):
+            print(f"\n⏭️ Stage {stage_idx + 1}/{len(time_blocks)} deja termine | bloc=[{t_start}, {t_end}]")
+            stage_rows.append(
+                {
+                    "stage_idx": stage_idx,
+                    "stage_label": f"{t_start:.1f}_{t_end:.1f}",
+                    "wall_seconds": 0.0,
+                    "best_valid_loss": extract_stage_best_valid_loss(stage_dir, device),
+                }
+            )
+            continue
+
         model = CGL_PI_DeepONet_AmpPhase(cfg_dict).to(device)
         optimizer = torch.optim.AdamW(
             model.parameters(),
             lr=float(cfg_dict["training"]["learning_rate"]),
             weight_decay=float(cfg_dict["training"]["weight_decay"]),
         )
+        prev_stage_dir = None
+        if stage_idx > 0:
+            prev_stage_dir = os.path.join(run_dir, stage_name(stage_idx - 1, *time_blocks[stage_idx - 1]))
         print(f"\n🚧 Stage {stage_idx + 1}/{len(time_blocks)} | bloc=[{t_start}, {t_end}]")
-        stage_metrics = train_one_stage(model, optimizer, train_pool, focus_pool, valid_pool, audit_pool, cfg_dict, t_start, t_end, stage_dir, device)
+        stage_metrics = train_one_stage(
+            model,
+            optimizer,
+            train_pool,
+            focus_pool,
+            valid_pool,
+            audit_pool,
+            cfg_dict,
+            t_start,
+            t_end,
+            stage_dir,
+            device,
+            prev_stage_dir=prev_stage_dir,
+        )
         stage_rows.append(
             {
                 "stage_idx": stage_idx,

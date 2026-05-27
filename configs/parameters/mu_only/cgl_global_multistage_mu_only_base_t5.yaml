@@ -71,6 +71,14 @@ temporal_focus_sampling:
   start_fraction: 0.6
   start_window_fraction: 0.25
 
+warm_start_interstage:
+  enabled: true
+
+continuity_loss:
+  enabled: true
+  weight: 0.2
+  queries: 2048
+
 adaptive_stage_refinement:
   enabled: false
   extra_epochs: 5000
