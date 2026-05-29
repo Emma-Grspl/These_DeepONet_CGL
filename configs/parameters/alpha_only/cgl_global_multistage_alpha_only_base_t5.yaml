@@ -79,6 +79,16 @@ continuity_loss:
   weight: 0.2
   queries: 2048
 
+parametric_focus_sampling:
+  enabled: true
+  focus_cases: 128
+  focus_seed_offset: 3000
+  focus_fraction: 0.5
+  active_hard_fraction: 0.2
+  physics:
+    equation_params:
+      alpha: [1.3, 1.5]
+
 adaptive_stage_refinement:
   enabled: false
   extra_epochs: 10000

@@ -102,6 +102,7 @@ parametric_focus_sampling:
 training:
   save_dir: "results/CGL_GlobalMultistage_Parametric_sigma_only_alpha075_beta0_mu1_t5"
   stage_num_epochs: 30000
+  stage_epoch_overrides: [40000, 40000, 40000, 40000, 30000, 30000, 30000, 30000]
   learning_rate: 2.0e-4
   weight_decay: 1.0e-6
   grad_clip: 1.0

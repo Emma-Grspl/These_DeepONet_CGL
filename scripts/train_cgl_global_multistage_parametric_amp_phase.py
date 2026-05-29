@@ -808,9 +808,16 @@ def train_one_stage(
     t_end,
     stage_dir,
     device,
+    stage_idx,
     prev_stage_dir=None,
 ):
-    num_epochs = int(cfg_dict["training"]["stage_num_epochs"])
+    training_cfg = cfg_dict["training"]
+    stage_epoch_overrides = training_cfg.get("stage_epoch_overrides", [])
+    num_epochs = int(
+        stage_epoch_overrides[stage_idx]
+        if stage_idx < len(stage_epoch_overrides)
+        else training_cfg["stage_num_epochs"]
+    )
     log_every = int(cfg_dict["training"]["log_every"])
     eval_every = int(cfg_dict["training"]["eval_every"])
     snapshot_every = int(cfg_dict["training"]["snapshot_every"])
@@ -1135,6 +1142,7 @@ def main():
             t_end,
             stage_dir,
             device,
+            stage_idx=stage_idx,
             prev_stage_dir=prev_stage_dir,
         )
         stage_rows.append(
