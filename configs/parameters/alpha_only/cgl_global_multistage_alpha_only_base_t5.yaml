@@ -19,7 +19,7 @@ physics:
 model:
   branch_input_dim: 9
   trunk_input_dim: 2
-  latent_dim: 768
+  latent_dim: 512
   branch_layers: [512, 512, 512, 512, 512]
   trunk_layers: [512, 512, 512, 512]
   activation: "silu"
@@ -44,8 +44,8 @@ data:
   valid_queries: 4096
 
 parametric_dataset:
-  train_cases: 256
-  valid_cases: 64
+  train_cases: 96
+  valid_cases: 24
   seed: 1240
 
 hard_case_sampling:
@@ -80,7 +80,7 @@ continuity_loss:
   queries: 2048
 
 parametric_focus_sampling:
-  enabled: true
+  enabled: false
   focus_cases: 128
   focus_seed_offset: 3000
   focus_fraction: 0.5
