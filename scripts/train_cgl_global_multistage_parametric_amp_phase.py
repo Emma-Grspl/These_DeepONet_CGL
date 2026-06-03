@@ -60,6 +60,11 @@ def warm_start_enabled(cfg_dict):
     return bool(warm_start_cfg(cfg_dict).get("enabled", False))
 
 
+def force_retrain_stage_indices(cfg_dict):
+    values = cfg_dict.get("training", {}).get("force_retrain_stage_indices", [])
+    return {int(value) for value in values}
+
+
 def stage_checkpoint_path(stage_dir, checkpoint_name):
     return os.path.join(stage_dir, "checkpoints", checkpoint_name)
 
@@ -706,10 +711,13 @@ def save_stage_checkpoint(model, optimizer, epoch, best_valid_loss, stage_dir, n
 
 
 def load_stage_checkpoint_if_available(model, optimizer, stage_dir, device):
-    ckpt_path = os.path.join(stage_dir, "checkpoints", "model_latest.pth")
-    if not os.path.exists(ckpt_path):
+    ckpt, ckpt_path = load_stage_checkpoint_state(
+        stage_dir,
+        device,
+        checkpoint_names=("model_latest.pth", "model_final.pth", "model_best.pth"),
+    )
+    if ckpt is None:
         return 0, float("inf")
-    ckpt = torch.load(ckpt_path, map_location=device)
     model.load_state_dict(ckpt["model_state"])
     optimizer.load_state_dict(ckpt["optimizer_state"])
     return int(ckpt.get("epoch", 0)), float(ckpt.get("best_valid_loss", float("inf")))
@@ -1104,11 +1112,13 @@ def main():
         save_case_pool_csv(os.path.join(run_dir, "audit_cases.csv"), audit_pool)
 
     time_blocks = [tuple(map(float, block)) for block in cfg_dict["multistage"]["time_blocks"]]
+    forced_stage_indices = force_retrain_stage_indices(cfg_dict)
     stage_rows = []
     for stage_idx, (t_start, t_end) in enumerate(time_blocks):
         stage_dir = os.path.join(run_dir, stage_name(stage_idx, t_start, t_end))
         os.makedirs(os.path.join(stage_dir, "checkpoints"), exist_ok=True)
-        if stage_is_complete(stage_dir):
+        force_retrain = stage_idx in forced_stage_indices
+        if stage_is_complete(stage_dir) and not force_retrain:
             print(f"\n⏭️ Stage {stage_idx + 1}/{len(time_blocks)} deja termine | bloc=[{t_start}, {t_end}]")
             stage_rows.append(
                 {
@@ -1119,6 +1129,11 @@ def main():
                 }
             )
             continue
+        if stage_is_complete(stage_dir) and force_retrain:
+            print(
+                f"\n🔁 Stage {stage_idx + 1}/{len(time_blocks)} force_retrain "
+                f"| bloc=[{t_start}, {t_end}]"
+            )
 
         model = CGL_PI_DeepONet_AmpPhase(cfg_dict).to(device)
         optimizer = torch.optim.AdamW(
