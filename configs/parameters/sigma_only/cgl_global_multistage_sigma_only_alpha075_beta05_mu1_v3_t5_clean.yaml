@@ -1,0 +1,137 @@
+experiment_name: "CGL_GlobalMultistage_Parametric_sigma_only_alpha075_beta05_mu1_v3_t5_clean"
+device: "cuda"
+
+physics:
+  x_domain: [-40.0, 40.0]
+  t_max: 5.0
+  initial_conditions: [0]
+  bounds:
+    A: [0.1, 0.1]
+    w0: [0.6, 0.8]
+    x0: [0.0, 0.0]
+    k: [0.0, 0.0]
+  equation_params:
+    alpha: [0.75, 0.75]
+    beta: [0.5, 0.5]
+    mu: [1.0, 1.0]
+    V: [0.0, 0.0]
+
+model:
+  branch_input_dim: 9
+  trunk_input_dim: 2
+  latent_dim: 768
+  branch_layers: [512, 512, 512, 512, 512]
+  trunk_layers: [512, 512, 512, 512]
+  activation: "silu"
+  fourier_dim: 64
+  fourier_scales: [1.0, 2.0, 5.0, 10.0, 20.0]
+
+multistage:
+  time_blocks:
+    - [0.0, 0.2]
+    - [0.2, 0.5]
+    - [0.5, 0.6]
+    - [0.6, 0.7]
+    - [0.7, 0.8]
+    - [0.8, 1.0]
+    - [1.0, 1.5]
+    - [1.5, 2.0]
+    - [2.0, 3.0]
+    - [3.0, 3.5]
+    - [3.5, 4.0]
+    - [4.0, 4.5]
+    - [4.5, 5.0]
+
+data:
+  solver_nx: 256
+  solver_dt: 0.025
+  train_queries: 8192
+  valid_queries: 4096
+
+parametric_dataset:
+  train_cases: 256
+  valid_cases: 64
+  seed: 6237
+
+hard_case_sampling:
+  enabled: true
+  audit_cases: 64
+  audit_seed_offset: 2000
+  warmup_epochs: 3000
+  refresh_every: 1000
+  hard_fraction: 0.5
+  mix_hard_ratio: 0.8
+  success_threshold: 0.04
+  activation_mean_threshold: 0.04
+  activation_bad_fraction_threshold: 0.10
+  activation_max_threshold: 0.08
+
+spatial_focus_sampling:
+  enabled: true
+  center_window: [-10.0, 10.0]
+  center_fraction: 0.8
+
+temporal_focus_sampling:
+  enabled: true
+  start_fraction: 0.55
+  start_window_fraction: 0.20
+
+warm_start_interstage:
+  enabled: true
+
+continuity_loss:
+  enabled: true
+  weight: 0.5
+  queries: 2048
+
+adaptive_stage_refinement:
+  enabled: true
+  extra_epochs: 10000
+  max_refinement_rounds: 1
+  trigger_mean_threshold: 0.025
+  trigger_bad_fraction_threshold: 0.05
+  trigger_max_threshold: 0.06
+  hard_mix_ratio: 0.8
+  refresh_every: 1000
+
+parametric_focus_sampling:
+  enabled: true
+  focus_cases: 128
+  focus_seed_offset: 3000
+  focus_fraction: 0.45
+  active_hard_fraction: 0.35
+  physics:
+    bounds:
+      w0: [0.6, 0.625]
+
+training:
+  save_dir: "results/CGL_GlobalMultistage_Parametric_sigma_only_alpha075_beta05_mu1_v3_t5_clean"
+  stage_num_epochs: 30000
+  stage_epoch_overrides: [50000, 45000, 40000, 40000, 40000, 30000, 30000, 30000, 30000, 30000, 30000, 30000, 30000]
+  learning_rate: 2.0e-4
+  weight_decay: 1.0e-6
+  grad_clip: 1.0
+  log_every: 200
+  eval_every: 1000
+  snapshot_every: 5000
+
+evaluation:
+  cases:
+    - label: "sigma_min"
+      A: 0.1
+      w0: 0.6
+      alpha: 0.75
+      beta: 0.5
+      mu: 1.0
+    - label: "sigma_mid"
+      A: 0.1
+      w0: 0.7
+      alpha: 0.75
+      beta: 0.5
+      mu: 1.0
+    - label: "sigma_max"
+      A: 0.1
+      w0: 0.8
+      alpha: 0.75
+      beta: 0.5
+      mu: 1.0
