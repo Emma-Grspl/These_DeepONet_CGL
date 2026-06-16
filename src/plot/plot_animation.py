@@ -1,12 +1,21 @@
-import matplotlib.pyplot as plt
 import matplotlib.animation as animation
+import matplotlib.pyplot as plt
 import numpy as np
-import torch
 import os
+import torch
 
 from src.utils.solver_cgl import get_ground_truth_CGL
 
-def animate_cgl_solution(cfg, params_dict, model=None, save_path="results/animation.gif", frames=200, x_view=None):
+def animate_cgl_solution(
+    cfg,
+    params_dict,
+    model=None,
+    save_path="results/animation.gif",
+    frames=200,
+    x_view=None,
+    classical_color="black",
+    model_color="deeppink",
+):
     """
     Génère une animation comparant la Vérité Terrain et le Modèle (optionnel).
     3 Panneaux : Module, Réel, Imaginaire.
@@ -61,8 +70,11 @@ def animate_cgl_solution(cfg, params_dict, model=None, save_path="results/animat
     
     # Construction du titre statique (Paramètres)
     # C'est ici que l'erreur se produisait, on le fait proprement :
-    param_str = (f"$\\alpha$={params_dict['alpha']:.2f}, $\\beta$={params_dict['beta']:.2f}, "
-                 f"$\\mu$={params_dict['mu']:.2f}, V={params_dict.get('V', 0.0):.2f}")
+    param_str = (
+        f"$\\alpha$={params_dict['alpha']:.3f}, "
+        f"$\\mu$={params_dict['mu']:.3f}, "
+        f"$\\beta$={params_dict['beta']:.3f}"
+    )
     
     # Titre initial
     title = fig.suptitle(f"{param_str}\nt = 0.00s", fontsize=14)
@@ -93,23 +105,23 @@ def animate_cgl_solution(cfg, params_dict, model=None, save_path="results/animat
     ax_im.set_xlim(view_x_min, view_x_max)
     ax_im.set_ylim(-y_max_im, y_max_im)
     ax_im.set_ylabel("Im(u)", fontsize=12)
-    ax_im.set_xlabel("x", fontsize=12)
+    ax_im.set_xlabel("Position x", fontsize=12)
     ax_im.grid(True, alpha=0.3)
 
     # Lignes
-    line_true_mod, = ax_mod.plot([], [], 'k-', lw=2, label='Exact')
-    line_pred_mod, = ax_mod.plot([], [], 'r--', lw=2, label='DeepONet')
-    
-    line_true_re, = ax_re.plot([], [], 'k-', lw=1.5)
-    line_pred_re, = ax_re.plot([], [], 'r--', lw=1.5)
-    
-    line_true_im, = ax_im.plot([], [], 'k-', lw=1.5)
-    line_pred_im, = ax_im.plot([], [], 'r--', lw=1.5)
+    line_true_mod, = ax_mod.plot([], [], color=classical_color, lw=2, label='Solveur classique')
+    line_pred_mod, = ax_mod.plot([], [], color=model_color, linestyle='--', lw=2, label='DeepONet amp/phase')
+
+    line_true_re, = ax_re.plot([], [], color=classical_color, lw=1.5)
+    line_pred_re, = ax_re.plot([], [], color=model_color, linestyle='--', lw=1.5)
+
+    line_true_im, = ax_im.plot([], [], color=classical_color, lw=1.5)
+    line_pred_im, = ax_im.plot([], [], color=model_color, linestyle='--', lw=1.5)
 
     if U_pred is not None:
         ax_mod.legend(loc='upper right')
     else:
-        line_true_mod.set_label('Exact')
+        line_true_mod.set_label('Solveur classique')
         ax_mod.legend(loc='upper right')
 
     # --- 3. Fonction d'Animation ---

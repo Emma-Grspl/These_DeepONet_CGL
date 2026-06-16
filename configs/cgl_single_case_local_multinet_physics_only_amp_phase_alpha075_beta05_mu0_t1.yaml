@@ -1,0 +1,88 @@
+experiment_name: "CGL_LocalMultinet_PhysicsOnly_AmpPhase_alpha075_beta05_mu0_t1"
+device: "cuda"
+
+physics:
+  x_domain: [-40.0, 40.0]
+  t_max: 1.0
+  initial_conditions: [0]
+  bounds:
+    A: [0.25, 0.25]
+    w0: [1.25, 1.25]
+    x0: [0.0, 0.0]
+    k: [0.0, 0.0]
+  equation_params:
+    alpha: [0.75, 0.75]
+    beta: [0.5, 0.5]
+    mu: [0.0, 0.0]
+    V: [0.0, 0.0]
+
+local_physics:
+  sensor_nx: 256
+  solver_nx: 256
+  window_dt: 0.1
+  amp_floor: 1.0e-6
+  tau_epsilon: 1.0e-4
+  focus_mix: 0.8
+
+model_local:
+  latent_dim: 256
+  branch_layers: [512, 512, 512]
+  trunk_layers: [256, 256, 256]
+  fourier_dim: 64
+  fourier_scales: [1.0, 2.0, 5.0, 10.0]
+  delta_bounds:
+    log_amp: 4.0
+    phase: 10.0
+  phase_gate:
+    enabled: true
+    relative_floor: 0.05
+    absolute_floor: 1.0e-6
+    exponent: 1.0
+
+multinet:
+  warm_start_interstage: true
+  max_passes: 2
+  time_blocks:
+    - [0.0, 0.4]
+    - [0.2, 0.6]
+    - [0.4, 0.8]
+    - [0.6, 1.0]
+
+bootstrap:
+  mononet_checkpoint: null
+
+training:
+  save_dir: "results/CGL_LocalMultinet_PhysicsOnly_AmpPhase_alpha075_beta05_mu0_t1"
+  batch_states: 4
+  pde_points_per_state: 512
+  bc_states: 2
+  bc_points_per_state: 128
+  ic_states: 2
+  ic_points_per_state: 128
+  overlap_states: 2
+  overlap_points_per_state: 128
+  latest_bias: 0.7
+  stage_num_iters: 1400
+  proxy_eval_batches: 2
+  learning_rate: 2.0e-4
+  weight_decay: 1.0e-6
+  grad_clip: 1.0
+  log_every: 100
+  eval_every: 200
+  snapshot_every: 600
+  loss_weights:
+    pde: 1.0
+    bc: 0.5
+    ic: 0.05
+    overlap: 0.2
+  early_stop:
+    enabled: true
+    min_iters: 800
+    patience_evals: 4
+    min_delta: 0.01
+
+evaluation:
+  solver_nx: 256
+  snapshot_times: [0.1, 0.2, 0.5, 0.8, 1.0]
+  prediction_chunk_size: 32768
+  timing_repeats: 4

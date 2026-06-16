@@ -1,0 +1,84 @@
+experiment_name: "CGL_GlobalMultinet_PhysicsOnly_AmpPhase_alpha075_beta0_mu0_t1"
+device: "cuda"
+
+physics:
+  x_domain: [-40.0, 40.0]
+  t_max: 1.0
+  initial_conditions: [0]
+  bounds:
+    A: [0.25, 0.25]
+    w0: [1.25, 1.25]
+    x0: [0.0, 0.0]
+    k: [0.0, 0.0]
+  equation_params:
+    alpha: [0.75, 0.75]
+    beta: [0.0, 0.0]
+    mu: [0.0, 0.0]
+    V: [0.0, 0.0]
+
+model:
+  branch_input_dim: 9
+  trunk_input_dim: 2
+  latent_dim: 512
+  branch_layers: [512, 512, 512, 512, 512]
+  trunk_layers: [512, 512, 512, 512]
+  activation: "silu"
+  fourier_dim: 64
+  fourier_scales: [1.0, 2.0, 5.0, 10.0, 20.0]
+
+training:
+  logic_variant: "modern"
+  batch_size_ic: 8192
+  batch_size_pde: 8192
+  max_macro_loops: 1
+  weights:
+    bc_loss: 1.0
+  physics_losses:
+    pde_relative_weight: 0.75
+    weak_weight: 0.05
+    mass_weight: 0.03
+    continuity_weight: 0.35
+    mass_n_cases: 16
+    mass_n_x: 128
+    continuity_batch_size: 2048
+  early_stop:
+    enabled: true
+    min_iters: 4000
+    patience_audits: 4
+    min_score_improvement: 0.001
+    min_loss_improvement_rel: 0.03
+    audit_every: 500
+  hard_audit:
+    enabled: false
+  target_error_global: 0.05
+  save_dir: "results/CGL_GlobalMultinet_PhysicsOnly_AmpPhase_alpha075_beta0_mu0_t1"
+
+time_marching:
+  learning_rate: 2e-4
+  dt_min: 0.0125
+  lr_decay_step: 3000
+  lr_decay_gamma: 0.85
+
+multistage:
+  warm_start_interstage: true
+  time_blocks:
+    - [0.0, 0.5]
+    - [0.5, 1.0]
+
+multistage_training:
+  stage_num_iters: 12000
+  target_error_by_stage: [0.045, 0.05]
+  allow_relaxation: false
+  audit_cases: 1
+  log_every: 100
+  eval_every: 500
+  snapshot_every: 2000
+  grad_clip: 1.0
+  ema_alpha: 0.999
+  relaxation_delta: 0.005
+
+benchmark:
+  solver_nx: 256
+  eval_times: [0.1, 0.2, 0.5, 0.75, 1.0]
+  prediction_chunk_size: 32768
+  timing_repeats: 4

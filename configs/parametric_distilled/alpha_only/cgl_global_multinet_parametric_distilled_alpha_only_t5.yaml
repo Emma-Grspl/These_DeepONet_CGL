@@ -1,0 +1,167 @@
+experiment_name: "CGL_GlobalMultinet_ParametricDistilled_alpha_only_t5"
+device: "cuda"
+
+physics:
+  x_domain: [-40.0, 40.0]
+  t_max: 5.0
+  initial_conditions: [0]
+  bounds:
+    A: [0.1, 0.1]
+    w0: [0.6, 0.6]
+    x0: [0.0, 0.0]
+    k: [0.0, 0.0]
+  equation_params:
+    alpha: [0.5, 1.5]
+    beta: [0.0, 0.0]
+    mu: [0.0, 0.0]
+    V: [0.0, 0.0]
+
+model:
+  branch_input_dim: 9
+  trunk_input_dim: 2
+  latent_dim: 512
+  branch_layers: [512, 512, 512, 512, 512]
+  trunk_layers: [512, 512, 512, 512]
+  activation: "silu"
+  fourier_dim: 64
+  fourier_scales: [1.0, 2.0, 5.0, 10.0, 20.0]
+
+multistage:
+  time_blocks:
+    - [0.0, 1.0]
+    - [1.0, 1.5]
+    - [1.5, 2.0]
+    - [2.0, 3.0]
+    - [3.0, 3.5]
+    - [3.5, 4.0]
+    - [4.0, 4.5]
+    - [4.5, 5.0]
+
+data:
+  solver_nx: 256
+  solver_dt: 0.025
+
+parametric_dataset:
+  train_cases: 128
+  valid_cases: 32
+  seed: 7240
+
+teacher_distillation:
+  variable: "alpha"
+  anchor_fraction: 0.35
+  focus_fraction: 0.25
+  overlap_width: 0.05
+  anchors:
+    # Remplacer teacher_checkpoint par les checkpoints single-case non supervises correspondants.
+    - label: "alpha_min"
+      variable_value: 0.5
+      teacher_checkpoint: "FILL_ME_teacher_alpha_min_checkpoint.pth"
+      params:
+        alpha: 0.5
+        beta: 0.0
+        mu: 0.0
+        V: 0.0
+        A: 0.1
+        w0: 0.6
+        x0: 0.0
+        k: 0.0
+        type: 0
+    - label: "alpha_mid"
+      variable_value: 1.0
+      teacher_checkpoint: "FILL_ME_teacher_alpha_mid_checkpoint.pth"
+      params:
+        alpha: 1.0
+        beta: 0.0
+        mu: 0.0
+        V: 0.0
+        A: 0.1
+        w0: 0.6
+        x0: 0.0
+        k: 0.0
+        type: 0
+    - label: "alpha_max"
+      variable_value: 1.5
+      teacher_checkpoint: "FILL_ME_teacher_alpha_max_checkpoint.pth"
+      params:
+        alpha: 1.5
+        beta: 0.0
+        mu: 0.0
+        V: 0.0
+        A: 0.1
+        w0: 0.6
+        x0: 0.0
+        k: 0.0
+        type: 0
+
+focus_sampling:
+  enabled: true
+  focus_cases: 128
+  focus_seed_offset: 3000
+  physics:
+    equation_params:
+      alpha: [1.3, 1.5]
+
+spatial_focus_sampling:
+  enabled: true
+  center_fraction: 0.8
+
+temporal_focus_sampling:
+  enabled: true
+  start_fraction: 0.6
+  start_window_fraction: 0.25
+
+warm_start_interstage:
+  enabled: true
+
+training:
+  save_dir: "results/CGL_GlobalMultinet_ParametricDistilled_alpha_only_t5"
+  stage_num_epochs: 30000
+  stage_epoch_overrides: [30000, 30000, 30000, 30000, 30000, 30000, 30000, 50000]
+  learning_rate: 2.0e-4
+  weight_decay: 1.0e-6
+  grad_clip: 1.0
+  log_every: 200
+  eval_every: 1000
+  snapshot_every: 5000
+  lr_decay_step: 4000
+  lr_decay_gamma: 0.85
+  train_queries: 8192
+  valid_queries: 4096
+  boundary_queries: 1024
+  continuity_queries: 2048
+  overlap_queries: 2048
+  smooth_queries: 1024
+  smooth_delta_fraction: 0.05
+  valid_eval_batches: 2
+  loss_weights:
+    anchor: 1.0
+    boundary: 0.1
+    continuity: 0.5
+    overlap: 0.3
+    param_smooth: 0.02
+  early_stop:
+    enabled: true
+    min_epochs: 8000
+    patience_evals: 4
+    min_delta_rel: 0.005
+
+evaluation:
+  cases:
+    - label: "alpha_min"
+      A: 0.1
+      w0: 0.6
+      alpha: 0.5
+      beta: 0.0
+      mu: 0.0
+    - label: "alpha_mid"
+      A: 0.1
+      w0: 0.6
+      alpha: 1.0
+      beta: 0.0
+      mu: 0.0
+    - label: "alpha_max"
+      A: 0.1
+      w0: 0.6
+      alpha: 1.5
+      beta: 0.0
+      mu: 0.0

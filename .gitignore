@@ -29,3 +29,11 @@ outputs/*
 
 # Fichiers zip de transfert
 *.zip
+*.tar.gz
+
+# Caches matplotlib locaux
+.mplcache/
+.mplconfig/
+
+# Archives locales de runs
+run_assets/

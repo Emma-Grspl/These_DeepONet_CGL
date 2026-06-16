@@ -1,13 +1,24 @@
+import os
+
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-import os
 
 # Imports locaux nécessaires
 from src.utils.solver_cgl import get_ground_truth_CGL
 
 
-def plot_temporal_snapshots(cfg, params_dict, model=None, save_path=None, show=False, time_ratios=None, x_view=None):
+def plot_temporal_snapshots(
+    cfg,
+    params_dict,
+    model=None,
+    save_path=None,
+    show=False,
+    time_ratios=None,
+    x_view=None,
+    classical_color="black",
+    time_cmap="RdPu",
+):
     """
     Trace des snapshots de la solution sur une seule figure compacte.
     Par défaut : 3 instants (0, t/2, t_max).
@@ -77,7 +88,8 @@ def plot_temporal_snapshots(cfg, params_dict, model=None, save_path=None, show=F
     n_snapshots = len(time_indices)
 
     # --- 4. Plotting compact sur une seule figure ---
-    colors = plt.cm.RdPu(np.linspace(0.45, 0.9, n_snapshots))
+    cmap = plt.get_cmap(time_cmap)
+    colors = cmap(np.linspace(0.45, 0.9, n_snapshots))
     view_x_min, view_x_max = x_view if x_view is not None else (x_min, x_max)
     fig, axes = plt.subplots(3, 1, figsize=(11, 10), sharex=True)
     plt.subplots_adjust(hspace=0.28)
@@ -97,7 +109,7 @@ def plot_temporal_snapshots(cfg, params_dict, model=None, save_path=None, show=F
 
         # --- Ligne 1 : Module |u| ---
         ax_mod = axes[0]
-        ax_mod.plot(x, np.abs(u_true_t), "k:", alpha=0.7, linewidth=1.2)
+        ax_mod.plot(x, np.abs(u_true_t), linestyle=":", color=classical_color, alpha=0.7, linewidth=1.2)
         if U_pred is not None:
             ax_mod.plot(x, np.abs(u_pred_t), color=colors[i], label=label, linewidth=2.0)
         ax_mod.set_ylabel("|u|", fontsize=11, fontweight="bold")
@@ -106,7 +118,7 @@ def plot_temporal_snapshots(cfg, params_dict, model=None, save_path=None, show=F
 
         # --- Ligne 2 : Partie Réelle Re(u) ---
         ax_re = axes[1]
-        ax_re.plot(x, np.real(u_true_t), "k:", alpha=0.7, linewidth=1.2)
+        ax_re.plot(x, np.real(u_true_t), linestyle=":", color=classical_color, alpha=0.7, linewidth=1.2)
         if U_pred is not None:
             ax_re.plot(x, np.real(u_pred_t), color=colors[i], label=label, linewidth=2.0)
         ax_re.set_ylabel("Re(u)", fontsize=11, fontweight="bold")
@@ -115,7 +127,7 @@ def plot_temporal_snapshots(cfg, params_dict, model=None, save_path=None, show=F
 
         # --- Ligne 3 : Partie Imaginaire Im(u) ---
         ax_im = axes[2]
-        ax_im.plot(x, np.imag(u_true_t), "k:", alpha=0.7, linewidth=1.2)
+        ax_im.plot(x, np.imag(u_true_t), linestyle=":", color=classical_color, alpha=0.7, linewidth=1.2)
         if U_pred is not None:
             ax_im.plot(x, np.imag(u_pred_t), color=colors[i], label=label, linewidth=2.0)
         ax_im.set_ylabel("Im(u)", fontsize=11, fontweight="bold")
@@ -127,7 +139,16 @@ def plot_temporal_snapshots(cfg, params_dict, model=None, save_path=None, show=F
         ax.set_xlim(view_x_min, view_x_max)
 
     if U_pred is not None:
-        handles = [plt.Line2D([0], [0], color="k", linestyle=":", linewidth=1.5, label="Solveur classique")]
+        handles = [
+            plt.Line2D(
+                [0],
+                [0],
+                color=classical_color,
+                linestyle=":",
+                linewidth=1.5,
+                label="Solveur classique",
+            )
+        ]
         handles += [
             plt.Line2D([0], [0], color=colors[i], linewidth=2.0, label=f"DeepONet, t = {t[time_indices[i]]:.2f}")
             for i in range(n_snapshots)
