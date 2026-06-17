@@ -296,12 +296,12 @@ def build_bc_batch(state_bank, cfg_dict, params, x_sensor, periodic, window_dt, 
     x_left = float(cfg_dict["physics"]["x_domain"][0])
     x_right = float(cfg_dict["physics"]["x_domain"][1])
     coords_left = torch.tensor(
-        np.concatenate([np.full_like(tau, x_left)[:, None], tau], axis=1),
+        np.concatenate([np.full_like(tau, x_left), tau], axis=1),
         dtype=torch.float32,
         device=device,
     ).requires_grad_(True)
     coords_right = torch.tensor(
-        np.concatenate([np.full_like(tau, x_right)[:, None], tau], axis=1),
+        np.concatenate([np.full_like(tau, x_right), tau], axis=1),
         dtype=torch.float32,
         device=device,
     ).requires_grad_(True)
