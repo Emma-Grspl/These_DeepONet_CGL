@@ -22,8 +22,10 @@ from src.plot.postprocess_single_case import (
     plot_error_heatmap,
     plot_l2_curve,
     plot_snapshots,
+    relative_l2_curve_on_mask,
     save_comparison_gif,
     save_rel_l2_csv,
+    spatial_mask_from_bounds,
     write_rollout_summary,
 )
 from src.training.trainer_CGL_modern import (
@@ -93,6 +95,14 @@ def write_timing_summary(run_dir, start_iso, start_perf, status, stage_rows):
             handle.write(f"{prefix}_t_end={float(row['t_end']):.10f}\n")
             handle.write(f"{prefix}_best_score={float(row['best_score']):.10e}\n")
             handle.write(f"{prefix}_final_score={float(row['final_score']):.10e}\n")
+            if row.get("best_historical_mean") is not None:
+                handle.write(f"{prefix}_best_historical_mean={float(row['best_historical_mean']):.10e}\n")
+            if row.get("best_historical_max") is not None:
+                handle.write(f"{prefix}_best_historical_max={float(row['best_historical_max']):.10e}\n")
+            if row.get("final_historical_mean") is not None:
+                handle.write(f"{prefix}_final_historical_mean={float(row['final_historical_mean']):.10e}\n")
+            if row.get("final_historical_max") is not None:
+                handle.write(f"{prefix}_final_historical_max={float(row['final_historical_max']):.10e}\n")
             handle.write(f"{prefix}_wall_seconds={float(row['wall_seconds']):.6f}\n")
 
     csv_path = os.path.join(run_dir, "timing_stages.csv")
@@ -172,6 +182,105 @@ def stage_eval_cases(cfg_dict):
 
 def stage_allow_relaxation(cfg_dict):
     return bool(cfg_dict["multistage_training"].get("allow_relaxation", False))
+
+
+def historical_validation_cfg(cfg_dict):
+    return dict(cfg_dict["multistage_training"].get("historical_validation", {}))
+
+
+def historical_validation_enabled(cfg_dict):
+    return bool(historical_validation_cfg(cfg_dict).get("enabled", False))
+
+
+def historical_time_stride(cfg_dict):
+    return max(1, int(historical_validation_cfg(cfg_dict).get("time_stride", 1)))
+
+
+def historical_solver_nx(cfg_dict):
+    hist_cfg = historical_validation_cfg(cfg_dict)
+    if "solver_nx" in hist_cfg:
+        return int(hist_cfg["solver_nx"])
+    return int(cfg_dict.get("benchmark", {}).get("solver_nx", 256))
+
+
+def stage_historical_target(cfg_dict, stage_idx):
+    hist_cfg = historical_validation_cfg(cfg_dict)
+    by_stage = hist_cfg.get("target_by_stage")
+    if by_stage is not None:
+        return float(by_stage[stage_idx])
+    return float(hist_cfg.get("target", cfg_dict["training"].get("target_error_global", 0.055)))
+
+
+def stage_historical_max_target(cfg_dict, stage_idx):
+    hist_cfg = historical_validation_cfg(cfg_dict)
+    by_stage = hist_cfg.get("max_target_by_stage")
+    if by_stage is not None:
+        return float(by_stage[stage_idx])
+    value = hist_cfg.get("max_target")
+    return None if value is None else float(value)
+
+
+def historical_selection_metric(cfg_dict):
+    hist_cfg = historical_validation_cfg(cfg_dict)
+    return str(hist_cfg.get("selection_metric", "historical_mean_rel_l2"))
+
+
+def historical_selection_score(cfg_dict, hist_stats):
+    metric_name = historical_selection_metric(cfg_dict)
+    if metric_name == "historical_max_rel_l2":
+        return float(hist_stats["max_rel_l2"])
+    if metric_name == "historical_final_rel_l2":
+        return float(hist_stats["final_rel_l2"])
+    return float(hist_stats["mean_rel_l2"])
+
+
+def slice_reference_trajectory(reference, t_end, time_stride=1):
+    indices = np.flatnonzero(reference["t"] <= float(t_end) + 1.0e-10)
+    if len(indices) == 0:
+        indices = np.asarray([0], dtype=np.int64)
+    stride = max(1, int(time_stride))
+    if stride > 1 and len(indices) > 2:
+        indices = indices[::stride]
+        last_idx = np.flatnonzero(reference["t"] <= float(t_end) + 1.0e-10)[-1]
+        if indices[-1] != last_idx:
+            indices = np.concatenate([indices, np.asarray([last_idx], dtype=np.int64)], axis=0)
+
+    return {
+        "params": dict(reference["params"]),
+        "x": reference["x"],
+        "t": reference["t"][indices].astype(np.float32),
+        "u": reference["u"][:, indices].astype(np.complex64),
+    }
+
+
+def evaluate_historical_rollout(prefix_models, current_model, time_blocks, reference_full, stage_idx, cfg_dict, device):
+    if reference_full is None:
+        return None
+
+    ref = slice_reference_trajectory(
+        reference_full,
+        time_blocks[stage_idx][1],
+        time_stride=historical_time_stride(cfg_dict),
+    )
+    models = list(prefix_models) + [current_model]
+    active_blocks = time_blocks[: stage_idx + 1]
+
+    was_training = current_model.training
+    current_model.eval()
+    try:
+        rollout = rollout_multistage_models(models, active_blocks, ref, device)
+    finally:
+        if was_training:
+            current_model.train()
+
+    rel = np.asarray(rollout["rel_l2"], dtype=np.float64)
+    return {
+        "mean_rel_l2": float(np.mean(rel)),
+        "max_rel_l2": float(np.max(rel)),
+        "final_rel_l2": float(rel[-1]),
+        "n_times": int(len(rel)),
+        "t_end": float(active_blocks[-1][1]),
+    }
 
 
 def sample_stage_pde_batch(n_samples, cfg_dict, device, t_start, t_end):
@@ -278,10 +387,24 @@ def load_best_stage_model(cfg_dict, stage_dir, device):
     return model
 
 
-def train_one_stage(model, optimizer, cfg_dict, stage_idx, t_start, t_end, stage_dir, device, teacher_model=None):
+def train_one_stage(
+    model,
+    optimizer,
+    cfg_dict,
+    stage_idx,
+    t_start,
+    t_end,
+    stage_dir,
+    device,
+    teacher_model=None,
+    prefix_models=None,
+    time_blocks=None,
+    historical_reference=None,
+):
     loss_cfg = _get_physics_loss_cfg(cfg_dict)
     early_cfg = _get_early_stop_cfg(cfg_dict)
     stage_cfg = cfg_dict["multistage_training"]
+    hist_cfg = historical_validation_cfg(cfg_dict)
     num_iters = stage_num_iters(cfg_dict, stage_idx)
     log_every = int(stage_cfg.get("log_every", 100))
     eval_every = int(stage_cfg.get("eval_every", 1000))
@@ -291,6 +414,9 @@ def train_one_stage(model, optimizer, cfg_dict, stage_idx, t_start, t_end, stage
     target_error = stage_target_error(cfg_dict, stage_idx)
     audit_cases = stage_eval_cases(cfg_dict)
     allow_relaxation = stage_allow_relaxation(cfg_dict)
+    hist_enabled = historical_validation_enabled(cfg_dict) and historical_reference is not None and time_blocks is not None
+    hist_target = stage_historical_target(cfg_dict, stage_idx) if hist_enabled else None
+    hist_max_target = stage_historical_max_target(cfg_dict, stage_idx) if hist_enabled else None
 
     start_iter, best_score = load_stage_checkpoint_if_available(model, optimizer, stage_dir, device)
     print(
@@ -311,7 +437,11 @@ def train_one_stage(model, optimizer, cfg_dict, stage_idx, t_start, t_end, stage
     current_target = float(target_error)
     relax_iter = num_iters // 2
     best_metrics = {}
+    best_stage_score = float("inf")
+    best_hist_stats = None
+    final_hist_stats = None
     iteration = start_iter
+    prefix_models = [] if prefix_models is None else list(prefix_models)
 
     for param_group in optimizer.param_groups:
         param_group["lr"] = base_lr
@@ -376,26 +506,66 @@ def train_one_stage(model, optimizer, cfg_dict, stage_idx, t_start, t_end, stage
                 historical=False,
             )
             final_score = float(stage_score)
-            print(f"    📏 stage_score(t={t_end:.2f})={final_score:.3%}")
+            selection_score = final_score
+            hist_stats = None
+            if hist_enabled:
+                hist_stats = evaluate_historical_rollout(
+                    prefix_models,
+                    model,
+                    time_blocks,
+                    historical_reference,
+                    stage_idx,
+                    cfg_dict,
+                    device,
+                )
+                selection_score = historical_selection_score(cfg_dict, hist_stats)
+                print(
+                    f"    📏 stage_score(t={t_end:.2f})={final_score:.3%} "
+                    f"| hist_mean={hist_stats['mean_rel_l2']:.3%} "
+                    f"| hist_max={hist_stats['max_rel_l2']:.3%} "
+                    f"| hist_final={hist_stats['final_rel_l2']:.3%}"
+                )
+            else:
+                print(f"    📏 stage_score(t={t_end:.2f})={final_score:.3%}")
             save_stage_checkpoint(model, optimizer, iteration, best_score, stage_dir, "model_latest.pth")
 
-            improved = final_score < best_score
+            improved = selection_score < best_score
             if improved or not np.isfinite(best_score):
-                best_score = final_score
+                best_score = selection_score
+                best_stage_score = final_score
+                best_hist_stats = dict(hist_stats) if hist_stats is not None else None
                 best_metrics = {
                     "loss_pde": float(losses["loss_pde"].detach().item()),
                     "loss_bc": float(losses["loss_bc"].detach().item()),
                     "loss_mass": float(losses["loss_mass"].detach().item()),
                     "loss_continuity": float(losses["loss_continuity"].detach().item()),
                 }
+                if best_hist_stats is not None:
+                    best_metrics["historical_mean_rel_l2"] = float(best_hist_stats["mean_rel_l2"])
+                    best_metrics["historical_max_rel_l2"] = float(best_hist_stats["max_rel_l2"])
+                    best_metrics["historical_final_rel_l2"] = float(best_hist_stats["final_rel_l2"])
                 save_stage_checkpoint(model, optimizer, iteration, best_score, stage_dir, "model_best.pth")
                 plateau_count = 0
-                print(f"    ✅ Nouveau meilleur score : {best_score:.3%}")
+                print(f"    ✅ Nouveau meilleur score de selection : {best_score:.3%}")
             else:
                 plateau_count += 1
 
-            if final_score < current_target:
-                print(f"    🎯 Cible de stage atteinte ({final_score:.3%} < {current_target:.3%}).")
+            local_target_ok = final_score < current_target
+            hist_target_ok = True
+            hist_max_ok = True
+            if hist_stats is not None:
+                hist_target_ok = hist_stats["mean_rel_l2"] < hist_target
+                if hist_max_target is not None and bool(hist_cfg.get("require_max_target", True)):
+                    hist_max_ok = hist_stats["max_rel_l2"] < hist_max_target
+            if local_target_ok and hist_target_ok and hist_max_ok:
+                if hist_stats is not None:
+                    print(
+                        f"    🎯 Cibles stage+historique atteintes "
+                        f"(local={final_score:.3%}, hist_mean={hist_stats['mean_rel_l2']:.3%}, "
+                        f"hist_max={hist_stats['max_rel_l2']:.3%})."
+                    )
+                else:
+                    print(f"    🎯 Cible de stage atteinte ({final_score:.3%} < {current_target:.3%}).")
                 break
 
             if (
@@ -423,6 +593,16 @@ def train_one_stage(model, optimizer, cfg_dict, stage_idx, t_start, t_end, stage
         verbose=True,
         historical=False,
     )
+    if hist_enabled:
+        final_hist_stats = evaluate_historical_rollout(
+            prefix_models,
+            model,
+            time_blocks,
+            historical_reference,
+            stage_idx,
+            cfg_dict,
+            device,
+        )
     save_stage_checkpoint(model, optimizer, iteration, best_score, stage_dir, "model_final.pth")
     with open(os.path.join(stage_dir, "stage_summary.json"), "w", encoding="utf-8") as handle:
         json.dump(
@@ -431,7 +611,16 @@ def train_one_stage(model, optimizer, cfg_dict, stage_idx, t_start, t_end, stage
                 "t_start": float(t_start),
                 "t_end": float(t_end),
                 "best_score": float(best_score),
+                "best_selection_score": float(best_score),
+                "best_stage_score": float(best_stage_score),
+                "best_historical_mean": None if best_hist_stats is None else float(best_hist_stats["mean_rel_l2"]),
+                "best_historical_max": None if best_hist_stats is None else float(best_hist_stats["max_rel_l2"]),
+                "best_historical_final": None if best_hist_stats is None else float(best_hist_stats["final_rel_l2"]),
                 "final_score": float(final_score),
+                "final_stage_score": float(final_score),
+                "final_historical_mean": None if final_hist_stats is None else float(final_hist_stats["mean_rel_l2"]),
+                "final_historical_max": None if final_hist_stats is None else float(final_hist_stats["max_rel_l2"]),
+                "final_historical_final": None if final_hist_stats is None else float(final_hist_stats["final_rel_l2"]),
                 "completed_iters": int(iteration),
                 "best_metrics": best_metrics,
             },
@@ -440,7 +629,14 @@ def train_one_stage(model, optimizer, cfg_dict, stage_idx, t_start, t_end, stage
         )
     return {
         "best_score": float(best_score),
+        "best_selection_score": float(best_score),
+        "best_stage_score": float(best_stage_score),
+        "best_historical_mean": None if best_hist_stats is None else float(best_hist_stats["mean_rel_l2"]),
+        "best_historical_max": None if best_hist_stats is None else float(best_hist_stats["max_rel_l2"]),
         "final_score": float(final_score),
+        "final_stage_score": float(final_score),
+        "final_historical_mean": None if final_hist_stats is None else float(final_hist_stats["mean_rel_l2"]),
+        "final_historical_max": None if final_hist_stats is None else float(final_hist_stats["max_rel_l2"]),
         "wall_seconds": max(0.0, time.perf_counter() - stage_start_perf),
     }
 
@@ -505,11 +701,20 @@ def rollout_multistage_models(models, time_blocks, reference, device):
 def write_stage_manifest(run_dir, stage_rows):
     path = os.path.join(run_dir, "stage_manifest.csv")
     with open(path, "w", encoding="utf-8") as handle:
-        handle.write("stage_idx,t_start,t_end,best_score,final_score,wall_seconds\n")
+        handle.write(
+            "stage_idx,t_start,t_end,best_score,final_score,best_historical_mean,"
+            "best_historical_max,final_historical_mean,final_historical_max,wall_seconds\n"
+        )
         for row in stage_rows:
+            best_hist_mean = "" if row.get("best_historical_mean") is None else f"{float(row['best_historical_mean']):.10e}"
+            best_hist_max = "" if row.get("best_historical_max") is None else f"{float(row['best_historical_max']):.10e}"
+            final_hist_mean = "" if row.get("final_historical_mean") is None else f"{float(row['final_historical_mean']):.10e}"
+            final_hist_max = "" if row.get("final_historical_max") is None else f"{float(row['final_historical_max']):.10e}"
             handle.write(
                 f"{int(row['stage_idx'])},{float(row['t_start']):.10f},{float(row['t_end']):.10f},"
-                f"{float(row['best_score']):.10e},{float(row['final_score']):.10e},{float(row['wall_seconds']):.6f}\n"
+                f"{float(row['best_score']):.10e},{float(row['final_score']):.10e},"
+                f"{best_hist_mean},{best_hist_max},{final_hist_mean},{final_hist_max},"
+                f"{float(row['wall_seconds']):.6f}\n"
             )
 
 
@@ -525,11 +730,21 @@ def run_postprocess(cfg_dict, run_dir, stage_rows, device):
     eval_dir = os.path.join(run_dir, "evaluation")
     os.makedirs(eval_dir, exist_ok=True)
     save_rel_l2_csv(os.path.join(eval_dir, "rollout_metrics.csv"), rollout["t_values"], rollout["rel_l2"])
+    center_mask = spatial_mask_from_bounds(rollout["x"], -10.0, 10.0)
+    rel_l2_center = relative_l2_curve_on_mask(rollout["u_pred"], rollout["u_true"], center_mask)
+    save_rel_l2_csv(os.path.join(eval_dir, "rollout_metrics_center_xm10_xp10.csv"), rollout["t_values"], rel_l2_center)
     plot_l2_curve(
         rollout["t_values"],
         rollout["rel_l2"],
         "CGL global multireseau physics-only : erreur relative",
         os.path.join(eval_dir, "rollout_rel_l2.png"),
+        stage_markers=stage_markers_from_blocks(time_blocks),
+    )
+    plot_l2_curve(
+        rollout["t_values"],
+        rel_l2_center,
+        "CGL global multireseau physics-only : erreur relative au centre x in [-10, 10]",
+        os.path.join(eval_dir, "rollout_rel_l2_center_xm10_xp10.png"),
         stage_markers=stage_markers_from_blocks(time_blocks),
     )
     plot_error_heatmap(
@@ -550,14 +765,15 @@ def run_postprocess(cfg_dict, run_dir, stage_rows, device):
         os.path.join(eval_dir, "snapshots.png"),
         snapshot_times=list(cfg_dict.get("benchmark", {}).get("eval_times", [0.2, 0.5, 1.0, 2.0, 3.0, 5.0])),
     )
-    save_comparison_gif(
-        rollout["x"],
-        rollout["t_values"],
-        rollout["u_true"],
-        rollout["u_pred"],
-        "CGL global multireseau physics-only",
-        os.path.join(eval_dir, "comparison_animation.gif"),
-    )
+    if os.environ.get("CGL_SKIP_GIF", "0") != "1":
+        save_comparison_gif(
+            rollout["x"],
+            rollout["t_values"],
+            rollout["u_true"],
+            rollout["u_pred"],
+            "CGL global multireseau physics-only",
+            os.path.join(eval_dir, "comparison_animation.gif"),
+        )
     write_rollout_summary(
         os.path.join(eval_dir, "summary.txt"),
         rollout["rel_l2"],
@@ -566,18 +782,24 @@ def run_postprocess(cfg_dict, run_dir, stage_rows, device):
             "n_stages": len(time_blocks),
             "stage_markers": ",".join(str(float(x)) for x in stage_markers_from_blocks(time_blocks)),
             "final_stage_score": stage_rows[-1]["final_score"] if stage_rows else float("nan"),
+            "final_stage_historical_mean": stage_rows[-1].get("final_historical_mean", float("nan")) if stage_rows else float("nan"),
+            "final_stage_historical_max": stage_rows[-1].get("final_historical_max", float("nan")) if stage_rows else float("nan"),
+            "final_rel_l2_center_xm10_xp10": float(rel_l2_center[-1]),
+            "max_rel_l2_center_xm10_xp10": float(np.max(rel_l2_center)),
+            "mean_rel_l2_center_xm10_xp10": float(np.mean(rel_l2_center)),
         },
     )
     params = reference["params"]
     t_max = float(cfg_dict["physics"]["t_max"])
-    benchmark_inference(
-        "GlobalMultinet",
-        solver_callable=lambda: get_ground_truth_CGL(params, cfg_dict["physics"]["x_domain"][0], cfg_dict["physics"]["x_domain"][1], t_max, Nx=128, Nt=None),
-        model_callable=lambda: rollout_multistage_models(stage_models, time_blocks, reference, device)["u_pred"],
-        output_dir=eval_dir,
-        repeats=int(cfg_dict.get("benchmark", {}).get("timing_repeats", 4)),
-        warmup=1,
-    )
+    if os.environ.get("CGL_SKIP_BENCHMARK", "0") != "1":
+        benchmark_inference(
+            "GlobalMultinet",
+            solver_callable=lambda: get_ground_truth_CGL(params, cfg_dict["physics"]["x_domain"][0], cfg_dict["physics"]["x_domain"][1], t_max, Nx=128, Nt=None),
+            model_callable=lambda: rollout_multistage_models(stage_models, time_blocks, reference, device)["u_pred"],
+            output_dir=eval_dir,
+            repeats=int(cfg_dict.get("benchmark", {}).get("timing_repeats", 4)),
+            warmup=1,
+        )
 
 
 def main():
@@ -601,7 +823,13 @@ def main():
     print(f"🧾 Config : {args.config}")
 
     time_blocks = load_time_blocks(cfg_dict)
+    historical_reference = None
+    if historical_validation_enabled(cfg_dict):
+        hist_nx = historical_solver_nx(cfg_dict)
+        print(f"🕰️ Validation historique active | solver_nx={hist_nx} | time_stride={historical_time_stride(cfg_dict)}")
+        historical_reference = prepare_reference_trajectory(cfg_dict, nx_override=hist_nx)
     stage_rows = []
+    completed_stage_models = []
 
     try:
         for stage_idx, (t_start, t_end) in enumerate(time_blocks):
@@ -620,16 +848,17 @@ def main():
                         "t_end": float(t_end),
                         "best_score": float(summary["best_score"]),
                         "final_score": float(summary["final_score"]),
+                        "best_historical_mean": summary.get("best_historical_mean"),
+                        "best_historical_max": summary.get("best_historical_max"),
+                        "final_historical_mean": summary.get("final_historical_mean"),
+                        "final_historical_max": summary.get("final_historical_max"),
                         "wall_seconds": 0.0,
                     }
                 )
+                completed_stage_models.append(load_best_stage_model(cfg_dict, stage_dir, device))
                 continue
 
-            teacher_model = None
-            if stage_idx > 0:
-                prev_t_start, prev_t_end = time_blocks[stage_idx - 1]
-                prev_stage_dir = os.path.join(run_dir, stage_name(stage_idx - 1, prev_t_start, prev_t_end))
-                teacher_model = load_best_stage_model(cfg_dict, prev_stage_dir, device)
+            teacher_model = completed_stage_models[-1] if completed_stage_models else None
 
             model = CGL_PI_DeepONet_AmpPhase(cfg_dict).to(device)
             optimizer = torch.optim.AdamW(
@@ -644,7 +873,20 @@ def main():
                 print(f"🔗 Warm-start stage_{stage_idx:02d} depuis le meilleur checkpoint du stage precedent.")
 
             print(f"\n🚧 Stage {stage_idx + 1}/{len(time_blocks)} | bloc=[{t_start:.2f}, {t_end:.2f}]")
-            metrics = train_one_stage(model, optimizer, cfg_dict, stage_idx, t_start, t_end, stage_dir, device, teacher_model=teacher_model)
+            metrics = train_one_stage(
+                model,
+                optimizer,
+                cfg_dict,
+                stage_idx,
+                t_start,
+                t_end,
+                stage_dir,
+                device,
+                teacher_model=teacher_model,
+                prefix_models=completed_stage_models,
+                time_blocks=time_blocks,
+                historical_reference=historical_reference,
+            )
             stage_rows.append(
                 {
                     "stage_idx": stage_idx,
@@ -653,9 +895,14 @@ def main():
                     "t_end": float(t_end),
                     "best_score": float(metrics["best_score"]),
                     "final_score": float(metrics["final_score"]),
+                    "best_historical_mean": metrics.get("best_historical_mean"),
+                    "best_historical_max": metrics.get("best_historical_max"),
+                    "final_historical_mean": metrics.get("final_historical_mean"),
+                    "final_historical_max": metrics.get("final_historical_max"),
                     "wall_seconds": float(metrics["wall_seconds"]),
                 }
             )
+            completed_stage_models.append(load_best_stage_model(cfg_dict, stage_dir, device))
 
         write_stage_manifest(run_dir, stage_rows)
         run_postprocess(cfg_dict, run_dir, stage_rows, device)
