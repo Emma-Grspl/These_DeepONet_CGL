@@ -28,8 +28,10 @@ from src.plot.postprocess_single_case import (
     plot_error_heatmap,
     plot_l2_curve,
     plot_snapshots,
+    relative_l2_curve_on_mask,
     save_comparison_gif,
     save_rel_l2_csv,
+    spatial_mask_from_bounds,
     write_rollout_summary,
 )
 from src.utils.solver_cgl import get_ground_truth_CGL
@@ -115,6 +117,38 @@ def fixed_case_setup(cfg_dict):
 
 def load_time_blocks(cfg_dict):
     return [tuple(map(float, block)) for block in cfg_dict["multinet"]["time_blocks"]]
+
+
+def rebuild_state_bank_each_stage(cfg_dict):
+    return bool(cfg_dict["multinet"].get("rebuild_state_bank_each_stage", False))
+
+
+def rollout_validation_cfg(cfg_dict):
+    return dict(cfg_dict["multinet"].get("rollout_validation", {}))
+
+
+def rollout_validation_enabled(cfg_dict):
+    return bool(rollout_validation_cfg(cfg_dict).get("enabled", False))
+
+
+def rollout_selection_metric(cfg_dict):
+    return str(rollout_validation_cfg(cfg_dict).get("selection_metric", "max_rel_l2"))
+
+
+def rollout_secondary_metric(cfg_dict):
+    return str(rollout_validation_cfg(cfg_dict).get("secondary_metric", "final_rel_l2"))
+
+
+def rollout_min_improvement_rel(cfg_dict):
+    return float(rollout_validation_cfg(cfg_dict).get("min_improvement_rel", 0.0))
+
+
+def rollout_tie_tolerance_rel(cfg_dict):
+    return float(rollout_validation_cfg(cfg_dict).get("tie_tolerance_rel", 0.0))
+
+
+def rollout_rollback_on_reject(cfg_dict):
+    return bool(rollout_validation_cfg(cfg_dict).get("rollback_on_reject", True))
 
 
 def stage_name(stage_idx, t_start, t_end):
@@ -436,6 +470,13 @@ def save_stage_checkpoint(model, optimizer, iteration, best_proxy, stage_dir, na
     )
 
 
+def persist_models_to_stage_dirs(models, optimizers, time_blocks, run_dir):
+    for stage_idx, ((t_start, t_end), model, optimizer) in enumerate(zip(time_blocks, models, optimizers)):
+        stage_dir = os.path.join(run_dir, stage_name(stage_idx, t_start, t_end))
+        save_stage_checkpoint(model, optimizer, 0, float("nan"), stage_dir, "model_latest.pth")
+        save_stage_checkpoint(model, optimizer, 0, float("nan"), stage_dir, "model_final.pth")
+
+
 def load_stage_checkpoint_if_available(model, optimizer, stage_dir, device):
     ckpt_path = os.path.join(stage_dir, "checkpoints", "model_latest.pth")
     if not os.path.exists(ckpt_path):
@@ -456,11 +497,93 @@ def stage_models_file(run_dir):
     return os.path.join(run_dir, "run_state.json")
 
 
-def save_run_state(run_dir, next_pass_idx, next_stage_idx, history_rows):
+def best_pass_snapshot_dir(run_dir):
+    return os.path.join(run_dir, "best_pass_snapshot")
+
+
+def best_pass_summary_path(run_dir):
+    return os.path.join(run_dir, "best_pass_summary.json")
+
+
+def save_pass_snapshot(models, optimizers, snapshot_dir):
+    os.makedirs(snapshot_dir, exist_ok=True)
+    manifest = {"n_stages": len(models)}
+    for stage_idx, (model, optimizer) in enumerate(zip(models, optimizers)):
+        payload = {
+            "model_state": model.state_dict(),
+            "optimizer_state": optimizer.state_dict(),
+        }
+        atomic_torch_save(payload, os.path.join(snapshot_dir, f"stage_{stage_idx:02d}.pth"))
+    with open(os.path.join(snapshot_dir, "manifest.json"), "w", encoding="utf-8") as handle:
+        json.dump(manifest, handle, indent=2)
+
+
+def load_pass_snapshot(models, optimizers, snapshot_dir, device):
+    for stage_idx, (model, optimizer) in enumerate(zip(models, optimizers)):
+        ckpt_path = os.path.join(snapshot_dir, f"stage_{stage_idx:02d}.pth")
+        ckpt = torch.load(ckpt_path, map_location=device)
+        model.load_state_dict(ckpt["model_state"], strict=True)
+        optimizer.load_state_dict(ckpt["optimizer_state"])
+
+
+def save_best_pass_summary(run_dir, best_pass_idx, best_pass_metrics):
+    if best_pass_metrics is None:
+        return
+    payload = {
+        "best_pass_idx": None if best_pass_idx is None else int(best_pass_idx),
+        "metrics": dict(best_pass_metrics),
+    }
+    with open(best_pass_summary_path(run_dir), "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+
+
+def metric_value(metrics, metric_name):
+    value = metrics.get(metric_name)
+    if value is None or not np.isfinite(float(value)):
+        return float("inf")
+    return float(value)
+
+
+def is_pass_improved(candidate_metrics, best_metrics, cfg_dict):
+    if best_metrics is None:
+        return True
+
+    primary_metric = rollout_selection_metric(cfg_dict)
+    secondary_metric = rollout_secondary_metric(cfg_dict)
+    min_improvement_rel = rollout_min_improvement_rel(cfg_dict)
+    tie_tolerance_rel = rollout_tie_tolerance_rel(cfg_dict)
+
+    candidate_primary = metric_value(candidate_metrics, primary_metric)
+    best_primary = metric_value(best_metrics, primary_metric)
+    if candidate_primary < best_primary * (1.0 - min_improvement_rel):
+        return True
+
+    tie_band = max(1.0e-12, best_primary * tie_tolerance_rel)
+    if abs(candidate_primary - best_primary) <= tie_band:
+        candidate_secondary = metric_value(candidate_metrics, secondary_metric)
+        best_secondary = metric_value(best_metrics, secondary_metric)
+        if candidate_secondary < best_secondary * (1.0 - min_improvement_rel):
+            return True
+
+    return False
+
+
+def format_rollout_metrics(metrics):
+    return (
+        f"final={metric_value(metrics, 'final_rel_l2'):.3%} | "
+        f"max={metric_value(metrics, 'max_rel_l2'):.3%} | "
+        f"final_center={metric_value(metrics, 'final_rel_l2_center'):.3%} | "
+        f"max_center={metric_value(metrics, 'max_rel_l2_center'):.3%}"
+    )
+
+
+def save_run_state(run_dir, next_pass_idx, next_stage_idx, history_rows, best_pass_idx=None, best_pass_metrics=None):
     payload = {
         "next_pass_idx": int(next_pass_idx),
         "next_stage_idx": int(next_stage_idx),
         "history_rows": list(history_rows),
+        "best_pass_idx": None if best_pass_idx is None else int(best_pass_idx),
+        "best_pass_metrics": None if best_pass_metrics is None else dict(best_pass_metrics),
     }
     with open(stage_models_file(run_dir), "w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2)
@@ -823,11 +946,21 @@ def evaluate_and_save(models, time_blocks, cfg_dict, params, periodic, x_sensor,
     eval_dir = os.path.join(run_dir, label)
     os.makedirs(eval_dir, exist_ok=True)
     save_rel_l2_csv(os.path.join(eval_dir, "rollout_metrics.csv"), t_eval, rel_l2)
+    center_mask = spatial_mask_from_bounds(x_eval, -10.0, 10.0)
+    rel_l2_center = relative_l2_curve_on_mask(u_pred, u_true, center_mask)
+    save_rel_l2_csv(os.path.join(eval_dir, "rollout_metrics_center_xm10_xp10.csv"), t_eval, rel_l2_center)
     plot_l2_curve(
         t_eval,
         rel_l2,
         "CGL local multireseau physics-only : erreur relative",
         os.path.join(eval_dir, "rollout_rel_l2.png"),
+        stage_markers=[block[1] for block in time_blocks[:-1]],
+    )
+    plot_l2_curve(
+        t_eval,
+        rel_l2_center,
+        "CGL local multireseau physics-only : erreur relative au centre x in [-10, 10]",
+        os.path.join(eval_dir, "rollout_rel_l2_center_xm10_xp10.png"),
         stage_markers=[block[1] for block in time_blocks[:-1]],
     )
     plot_error_heatmap(
@@ -848,14 +981,15 @@ def evaluate_and_save(models, time_blocks, cfg_dict, params, periodic, x_sensor,
         os.path.join(eval_dir, "snapshots.png"),
         snapshot_times=list(cfg_dict["evaluation"].get("snapshot_times", [0.1, 0.2, 0.5, 1.0])),
     )
-    save_comparison_gif(
-        x_eval,
-        t_eval,
-        u_true,
-        u_pred,
-        "CGL local multireseau physics-only",
-        os.path.join(eval_dir, "comparison_animation.gif"),
-    )
+    if os.environ.get("CGL_SKIP_GIF", "0") != "1":
+        save_comparison_gif(
+            x_eval,
+            t_eval,
+            u_true,
+            u_pred,
+            "CGL local multireseau physics-only",
+            os.path.join(eval_dir, "comparison_animation.gif"),
+        )
     write_rollout_summary(
         os.path.join(eval_dir, "summary.txt"),
         rel_l2,
@@ -864,19 +998,33 @@ def evaluate_and_save(models, time_blocks, cfg_dict, params, periodic, x_sensor,
             "n_models": len(models),
             "window_dt": float(cfg_dict["local_physics"]["window_dt"]),
             "periodic_case": periodic,
+            "final_rel_l2_center_xm10_xp10": float(rel_l2_center[-1]),
+            "max_rel_l2_center_xm10_xp10": float(np.max(rel_l2_center)),
+            "mean_rel_l2_center_xm10_xp10": float(np.mean(rel_l2_center)),
         },
     )
     params_ref = reference["params"]
     t_max = float(cfg_dict["physics"]["t_max"])
-    benchmark_inference(
-        "LocalMultinet",
-        solver_callable=lambda: get_ground_truth_CGL(params_ref, cfg_dict["physics"]["x_domain"][0], cfg_dict["physics"]["x_domain"][1], t_max, Nx=128, Nt=None),
-        model_callable=lambda: rollout_multinet(models, time_blocks, cfg_dict, params, initial_sensor, x_sensor, x_eval, t_eval, device),
-        output_dir=eval_dir,
-        repeats=int(cfg_dict["evaluation"].get("timing_repeats", 4)),
-        warmup=1,
-    )
-    return float(rel_l2[-1]), float(np.max(rel_l2))
+    if os.environ.get("CGL_SKIP_BENCHMARK", "0") != "1":
+        benchmark_inference(
+            "LocalMultinet",
+            solver_callable=lambda: get_ground_truth_CGL(params_ref, cfg_dict["physics"]["x_domain"][0], cfg_dict["physics"]["x_domain"][1], t_max, Nx=128, Nt=None),
+            model_callable=lambda: rollout_multinet(models, time_blocks, cfg_dict, params, initial_sensor, x_sensor, x_eval, t_eval, device),
+            output_dir=eval_dir,
+            repeats=int(cfg_dict["evaluation"].get("timing_repeats", 4)),
+            warmup=1,
+        )
+    metrics = {
+        "final_rel_l2": float(rel_l2[-1]),
+        "max_rel_l2": float(np.max(rel_l2)),
+        "mean_rel_l2": float(np.mean(rel_l2)),
+        "final_rel_l2_center": float(rel_l2_center[-1]),
+        "max_rel_l2_center": float(np.max(rel_l2_center)),
+        "mean_rel_l2_center": float(np.mean(rel_l2_center)),
+    }
+    with open(os.path.join(eval_dir, "rollout_metrics_summary.json"), "w", encoding="utf-8") as handle:
+        json.dump(metrics, handle, indent=2)
+    return metrics
 
 
 def main():
@@ -899,12 +1047,16 @@ def main():
     history_rows = []
     next_pass_idx = 0
     next_stage_idx = 0
+    best_pass_idx = None
+    best_pass_metrics = None
 
     saved_state = load_run_state(run_dir)
     if saved_state is not None:
         history_rows = list(saved_state.get("history_rows", []))
         next_pass_idx = int(saved_state.get("next_pass_idx", 0))
         next_stage_idx = int(saved_state.get("next_stage_idx", 0))
+        best_pass_idx = saved_state.get("best_pass_idx")
+        best_pass_metrics = saved_state.get("best_pass_metrics")
         print(f"🔄 Resume state loaded | next_pass={next_pass_idx} | next_stage={next_stage_idx}")
 
     models = load_or_init_models(cfg_dict, run_dir, device)
@@ -926,6 +1078,10 @@ def main():
     print(f"📱 Device : {device}")
     print(f"📂 Run dir : {run_dir}")
     print(f"🧾 Config : {args.config}")
+    print(
+        f"🧭 Protocol local multinet | rebuild_each_stage={rebuild_state_bank_each_stage(cfg_dict)} "
+        f"| rollout_validation={rollout_validation_enabled(cfg_dict)}"
+    )
 
     try:
         for pass_idx in range(next_pass_idx, max_passes):
@@ -983,11 +1139,28 @@ def main():
                     }
                 )
                 save_stage_manifest(run_dir, history_rows)
-                save_run_state(run_dir, pass_idx, stage_idx + 1, history_rows)
+                if rebuild_state_bank_each_stage(cfg_dict):
+                    state_bank = build_state_bank(models, time_blocks, cfg_dict, params, u0_sensor, x_sensor, device)
+                    save_state_bank(state_bank_path, state_bank)
+                save_run_state(
+                    run_dir,
+                    pass_idx,
+                    stage_idx + 1,
+                    history_rows,
+                    best_pass_idx=best_pass_idx,
+                    best_pass_metrics=best_pass_metrics,
+                )
 
             next_stage_idx = 0
-            save_run_state(run_dir, pass_idx + 1, 0, history_rows)
-            final_rel_l2, max_rel_l2 = evaluate_and_save(
+            save_run_state(
+                run_dir,
+                pass_idx + 1,
+                0,
+                history_rows,
+                best_pass_idx=best_pass_idx,
+                best_pass_metrics=best_pass_metrics,
+            )
+            pass_metrics = evaluate_and_save(
                 models,
                 time_blocks,
                 cfg_dict,
@@ -999,9 +1172,39 @@ def main():
                 device,
                 label=f"pass_{pass_idx:02d}_evaluation",
             )
-            print(f"    📊 Pass {pass_idx + 1} evaluation | final_rel_l2={final_rel_l2:.3%} | max_rel_l2={max_rel_l2:.3%}")
+            pass_accepted = True
+            if rollout_validation_enabled(cfg_dict):
+                pass_accepted = is_pass_improved(pass_metrics, best_pass_metrics, cfg_dict)
+                if pass_accepted:
+                    best_pass_idx = pass_idx
+                    best_pass_metrics = dict(pass_metrics)
+                    save_pass_snapshot(models, optimizers, best_pass_snapshot_dir(run_dir))
+                    persist_models_to_stage_dirs(models, optimizers, time_blocks, run_dir)
+                    save_best_pass_summary(run_dir, best_pass_idx, best_pass_metrics)
+                    print(f"    ✅ Pass {pass_idx + 1} accepted | {format_rollout_metrics(pass_metrics)}")
+                else:
+                    if rollout_rollback_on_reject(cfg_dict):
+                        load_pass_snapshot(models, optimizers, best_pass_snapshot_dir(run_dir), device)
+                        persist_models_to_stage_dirs(models, optimizers, time_blocks, run_dir)
+                        print(
+                            f"    ↩️ Pass {pass_idx + 1} rejected, rollback to pass "
+                            f"{best_pass_idx + 1 if best_pass_idx is not None else '?'} | {format_rollout_metrics(pass_metrics)}"
+                        )
+                    else:
+                        print(f"    ⚠️ Pass {pass_idx + 1} rejected without rollback | {format_rollout_metrics(pass_metrics)}")
+            else:
+                print(f"    📊 Pass {pass_idx + 1} evaluation | {format_rollout_metrics(pass_metrics)}")
 
-        final_rel_l2, max_rel_l2 = evaluate_and_save(
+            save_run_state(
+                run_dir,
+                pass_idx + 1,
+                0,
+                history_rows,
+                best_pass_idx=best_pass_idx,
+                best_pass_metrics=best_pass_metrics,
+            )
+
+        final_metrics = evaluate_and_save(
             models,
             time_blocks,
             cfg_dict,
@@ -1014,7 +1217,7 @@ def main():
             label="evaluation",
         )
         write_timing_summary(run_dir, start_dt.isoformat(timespec="seconds"), start_perf, "completed", history_rows)
-        print(f"\n🏁 Local multireseau physics-only termine | final_rel_l2={final_rel_l2:.3%} | max_rel_l2={max_rel_l2:.3%}")
+        print(f"\n🏁 Local multireseau physics-only termine | {format_rollout_metrics(final_metrics)}")
     except Exception:
         save_stage_manifest(run_dir, history_rows)
         write_timing_summary(run_dir, start_dt.isoformat(timespec="seconds"), start_perf, "failed", history_rows)
