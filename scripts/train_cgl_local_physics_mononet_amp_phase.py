@@ -40,19 +40,70 @@ def _relative_l2_curve_on_mask_fallback(u_pred, u_true, spatial_mask):
     return rel_l2
 
 
-benchmark_inference = single_case_postprocess.benchmark_inference
-plot_error_heatmap = single_case_postprocess.plot_error_heatmap
-plot_l2_curve = single_case_postprocess.plot_l2_curve
-plot_snapshots = single_case_postprocess.plot_snapshots
+def _spatial_mask_from_bounds_fallback(x, x_min=None, x_max=None):
+    x = np.asarray(x, dtype=np.float64)
+    mask = np.ones(x.shape, dtype=bool)
+    if x_min is not None:
+        mask &= x >= float(x_min)
+    if x_max is not None:
+        mask &= x <= float(x_max)
+    if not np.any(mask):
+        raise ValueError(f"No spatial samples found inside window [{x_min}, {x_max}].")
+    return mask
+
+
+def _save_rel_l2_csv_fallback(path, t_values, rel_l2):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write("time,rel_l2\n")
+        for t_val, err in zip(t_values, rel_l2):
+            handle.write(f"{float(t_val):.8f},{float(err):.10f}\n")
+
+
+def _first_above_threshold(t_values, rel_l2, threshold):
+    mask = np.asarray(rel_l2) > float(threshold)
+    if not np.any(mask):
+        return np.nan
+    return float(np.asarray(t_values)[int(np.argmax(mask))])
+
+
+def _write_rollout_summary_fallback(path, rel_l2, t_values, extra=None):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(f"final_rel_l2={float(rel_l2[-1]):.10f}\n")
+        handle.write(f"max_rel_l2={float(np.max(rel_l2)):.10f}\n")
+        handle.write(f"mean_rel_l2={float(np.mean(rel_l2)):.10f}\n")
+        handle.write(f"first_t_gt_5pct={_first_above_threshold(t_values, rel_l2, 0.05)}\n")
+        if extra:
+            for key, value in extra.items():
+                handle.write(f"{key}={value}\n")
+
+
+def _save_comparison_gif_fallback(*args, **kwargs):
+    return None
+
+
+benchmark_inference = getattr(single_case_postprocess, "benchmark_inference")
+plot_error_heatmap = getattr(single_case_postprocess, "plot_error_heatmap")
+plot_l2_curve = getattr(single_case_postprocess, "plot_l2_curve")
+plot_snapshots = getattr(single_case_postprocess, "plot_snapshots")
 relative_l2_curve_on_mask = getattr(
     single_case_postprocess,
     "relative_l2_curve_on_mask",
     _relative_l2_curve_on_mask_fallback,
 )
-save_comparison_gif = single_case_postprocess.save_comparison_gif
-save_rel_l2_csv = single_case_postprocess.save_rel_l2_csv
-spatial_mask_from_bounds = single_case_postprocess.spatial_mask_from_bounds
-write_rollout_summary = single_case_postprocess.write_rollout_summary
+save_comparison_gif = getattr(single_case_postprocess, "save_comparison_gif", _save_comparison_gif_fallback)
+save_rel_l2_csv = getattr(single_case_postprocess, "save_rel_l2_csv", _save_rel_l2_csv_fallback)
+spatial_mask_from_bounds = getattr(
+    single_case_postprocess,
+    "spatial_mask_from_bounds",
+    _spatial_mask_from_bounds_fallback,
+)
+write_rollout_summary = getattr(
+    single_case_postprocess,
+    "write_rollout_summary",
+    _write_rollout_summary_fallback,
+)
 
 
 def find_latest_run_dir(base_results_dir):
