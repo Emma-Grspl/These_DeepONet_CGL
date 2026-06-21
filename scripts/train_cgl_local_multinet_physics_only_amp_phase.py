@@ -218,6 +218,25 @@ def rollout_rollback_on_reject(cfg_dict):
     return bool(rollout_validation_cfg(cfg_dict).get("rollback_on_reject", True))
 
 
+def rollout_cfg(cfg_dict):
+    return dict(cfg_dict.get("rollout", {}))
+
+
+def default_rollout_mode(cfg_dict):
+    return str(rollout_cfg(cfg_dict).get("mode", "smooth_overlap_blend"))
+
+
+def state_bank_rollout_mode(cfg_dict):
+    return str(rollout_cfg(cfg_dict).get("state_bank_mode", default_rollout_mode(cfg_dict)))
+
+
+def evaluation_rollout_modes(cfg_dict):
+    modes = cfg_dict.get("evaluation", {}).get("rollout_modes")
+    if not modes:
+        return [default_rollout_mode(cfg_dict)]
+    return [str(mode) for mode in modes]
+
+
 def stage_name(stage_idx, t_start, t_end):
     return f"stage_{stage_idx:02d}_t{t_start:.2f}_{t_end:.2f}"
 
@@ -692,6 +711,16 @@ def blend_weights_for_time(time_blocks, active_indices, t_current):
     return {idx: weight for idx in active_indices}
 
 
+def hard_switch_stage_index(time_blocks, active_indices, t_current):
+    if len(active_indices) == 1:
+        return active_indices[0]
+    centers = {
+        idx: 0.5 * (float(time_blocks[idx][0]) + float(time_blocks[idx][1]))
+        for idx in active_indices
+    }
+    return min(active_indices, key=lambda idx: abs(centers[idx] - float(t_current)))
+
+
 def predict_local_field(model, cfg_dict, params, sensor_state, x_query, local_times, window_dt, device):
     if len(local_times) == 0:
         return np.zeros((len(x_query), 0), dtype=np.complex64)
@@ -718,8 +747,26 @@ def predict_local_field(model, cfg_dict, params, sensor_state, x_query, local_ti
     return values.reshape(len(local_times), len(x_query)).T
 
 
-def predict_blended_window(models, time_blocks, cfg_dict, params, sensor_state, x_query, local_times, window_dt, t_current, device):
+def predict_blended_window(
+    models,
+    time_blocks,
+    cfg_dict,
+    params,
+    sensor_state,
+    x_query,
+    local_times,
+    window_dt,
+    t_current,
+    device,
+    mode=None,
+):
+    mode = default_rollout_mode(cfg_dict) if mode is None else str(mode)
     active = active_stage_indices(time_blocks, t_current)
+    if mode == "hard_switch":
+        idx = hard_switch_stage_index(time_blocks, active, t_current)
+        return predict_local_field(models[idx], cfg_dict, params, sensor_state, x_query, local_times, window_dt, device)
+    if mode not in ("smooth_overlap_blend", "blend"):
+        raise ValueError(f"Unsupported rollout mode: {mode}")
     weights = blend_weights_for_time(time_blocks, active, t_current)
     pred = np.zeros((len(x_query), len(local_times)), dtype=np.complex64)
     for idx in active:
@@ -727,7 +774,7 @@ def predict_blended_window(models, time_blocks, cfg_dict, params, sensor_state, 
     return pred
 
 
-def build_state_bank(models, time_blocks, cfg_dict, params, initial_sensor, x_sensor, device):
+def build_state_bank(models, time_blocks, cfg_dict, params, initial_sensor, x_sensor, device, mode=None):
     t_max = float(cfg_dict["physics"]["t_max"])
     window_dt = float(cfg_dict["local_physics"]["window_dt"])
     entries = [{"t_start": 0.0, "sensor": initial_sensor.astype(np.complex64)}]
@@ -746,6 +793,7 @@ def build_state_bank(models, time_blocks, cfg_dict, params, initial_sensor, x_se
             window_dt,
             current_t,
             device,
+            mode=state_bank_rollout_mode(cfg_dict) if mode is None else mode,
         )[:, 0]
         current_t = round(current_t + window_dt, 10)
         if current_t < t_max - 1.0e-10:
@@ -958,8 +1006,9 @@ def relative_l2_curve(u_pred, u_true):
     return rel_l2
 
 
-def rollout_multinet(models, time_blocks, cfg_dict, params, initial_sensor, x_sensor, x_eval, t_eval, device):
+def rollout_multinet(models, time_blocks, cfg_dict, params, initial_sensor, x_sensor, x_eval, t_eval, device, mode=None):
     window_dt = float(cfg_dict["local_physics"]["window_dt"])
+    mode = default_rollout_mode(cfg_dict) if mode is None else str(mode)
     u_pred = np.zeros((len(x_eval), len(t_eval)), dtype=np.complex64)
     current_sensor = initial_sensor.astype(np.complex64)
     current_t = 0.0
@@ -983,6 +1032,7 @@ def rollout_multinet(models, time_blocks, cfg_dict, params, initial_sensor, x_se
                 window_dt,
                 current_t,
                 device,
+                mode=mode,
             )
         next_sensor = predict_blended_window(
             models,
@@ -995,6 +1045,7 @@ def rollout_multinet(models, time_blocks, cfg_dict, params, initial_sensor, x_se
             window_dt,
             current_t,
             device,
+            mode=mode,
         )[:, 0]
         current_sensor = next_sensor.astype(np.complex64)
         current_t = round(current_t + window_dt, 10)
@@ -1002,12 +1053,124 @@ def rollout_multinet(models, time_blocks, cfg_dict, params, initial_sensor, x_se
     return u_pred
 
 
-def evaluate_and_save(models, time_blocks, cfg_dict, params, periodic, x_sensor, initial_sensor, run_dir, device, label):
+def save_one_step_metrics(models, time_blocks, cfg_dict, params, x_sensor, reference, eval_dir, device, mode):
+    window_dt = float(cfg_dict["local_physics"]["window_dt"])
+    t_max = float(cfg_dict["physics"]["t_max"])
+    x_ref = reference["x"]
+    t_ref = reference["t"]
+    u_ref = reference["u"]
+    rows = []
+    current_t = 0.0
+    while current_t + window_dt <= t_max + 1.0e-10:
+        next_t = round(current_t + window_dt, 10)
+        start_idx = int(np.argmin(np.abs(t_ref - current_t)))
+        end_idx = int(np.argmin(np.abs(t_ref - next_t)))
+        start_sensor = interp_complex_field(x_ref, u_ref[:, start_idx], x_sensor, is_periodic_case(params))
+        true_next = interp_complex_field(x_ref, u_ref[:, end_idx], x_sensor, is_periodic_case(params))
+        pred_next = predict_blended_window(
+            models,
+            time_blocks,
+            cfg_dict,
+            params,
+            start_sensor,
+            x_sensor,
+            np.asarray([window_dt], dtype=np.float32),
+            window_dt,
+            current_t,
+            device,
+            mode=mode,
+        )[:, 0]
+        rel_l2 = float(np.linalg.norm(pred_next - true_next) / (np.linalg.norm(true_next) + 1.0e-12))
+        rows.append((current_t, next_t, rel_l2))
+        current_t = next_t
+
+    path = os.path.join(eval_dir, f"one_step_metrics_{mode}.csv")
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write("t_start,t_end,rel_l2\n")
+        for t_start, t_end, rel_l2 in rows:
+            handle.write(f"{t_start:.8f},{t_end:.8f},{rel_l2:.10f}\n")
+    return {
+        "one_step_mean_rel_l2": float(np.mean([row[2] for row in rows])) if rows else float("nan"),
+        "one_step_max_rel_l2": float(np.max([row[2] for row in rows])) if rows else float("nan"),
+    }
+
+
+def save_interface_consistency(models, time_blocks, cfg_dict, params, x_sensor, initial_sensor, eval_dir, device):
+    window_dt = float(cfg_dict["local_physics"]["window_dt"])
+    state_bank = build_state_bank(
+        models,
+        time_blocks,
+        cfg_dict,
+        params,
+        initial_sensor,
+        x_sensor,
+        device,
+        mode=state_bank_rollout_mode(cfg_dict),
+    )
+    path = os.path.join(eval_dir, "interface_consistency.csv")
+    rows = []
+    for left_idx in range(len(time_blocks) - 1):
+        right_idx = left_idx + 1
+        overlap = compute_overlap_interval(time_blocks[left_idx], time_blocks[right_idx])
+        if overlap is None:
+            continue
+        entries = select_bank_entries_for_block(state_bank, overlap[0], overlap[1])
+        diffs = []
+        for entry in entries:
+            pred_left = predict_local_field(
+                models[left_idx],
+                cfg_dict,
+                params,
+                entry["sensor"],
+                x_sensor,
+                np.asarray([window_dt], dtype=np.float32),
+                window_dt,
+                device,
+            )[:, 0]
+            pred_right = predict_local_field(
+                models[right_idx],
+                cfg_dict,
+                params,
+                entry["sensor"],
+                x_sensor,
+                np.asarray([window_dt], dtype=np.float32),
+                window_dt,
+                device,
+            )[:, 0]
+            denom = np.linalg.norm(pred_left) + 1.0e-12
+            diffs.append(float(np.linalg.norm(pred_left - pred_right) / denom))
+        rows.append(
+            {
+                "left_stage": left_idx,
+                "right_stage": right_idx,
+                "overlap_start": overlap[0],
+                "overlap_end": overlap[1],
+                "n_entries": len(entries),
+                "mean_rel_diff": float(np.mean(diffs)) if diffs else float("nan"),
+                "max_rel_diff": float(np.max(diffs)) if diffs else float("nan"),
+            }
+        )
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write("left_stage,right_stage,overlap_start,overlap_end,n_entries,mean_rel_diff,max_rel_diff\n")
+        for row in rows:
+            handle.write(
+                f"{row['left_stage']},{row['right_stage']},{row['overlap_start']:.8f},"
+                f"{row['overlap_end']:.8f},{row['n_entries']},{row['mean_rel_diff']:.10f},"
+                f"{row['max_rel_diff']:.10f}\n"
+            )
+    return {
+        "interface_mean_rel_diff": float(np.nanmean([row["mean_rel_diff"] for row in rows])) if rows else float("nan"),
+        "interface_max_rel_diff": float(np.nanmax([row["max_rel_diff"] for row in rows])) if rows else float("nan"),
+    }
+
+
+def evaluate_and_save(models, time_blocks, cfg_dict, params, periodic, x_sensor, initial_sensor, run_dir, device, label, mode=None):
+    mode = default_rollout_mode(cfg_dict) if mode is None else str(mode)
     reference = prepare_reference_trajectory(cfg_dict, nx_override=int(cfg_dict["evaluation"].get("solver_nx", 256)))
     x_eval = reference["x"]
     t_eval = reference["t"]
     u_true = reference["u"]
-    u_pred = rollout_multinet(models, time_blocks, cfg_dict, params, initial_sensor, x_sensor, x_eval, t_eval, device)
+    u_pred = rollout_multinet(models, time_blocks, cfg_dict, params, initial_sensor, x_sensor, x_eval, t_eval, device, mode=mode)
     rel_l2 = relative_l2_curve(u_pred, u_true)
 
     eval_dir = os.path.join(run_dir, label)
@@ -1057,17 +1220,22 @@ def evaluate_and_save(models, time_blocks, cfg_dict, params, periodic, x_sensor,
             "CGL local multireseau physics-only",
             os.path.join(eval_dir, "comparison_animation.gif"),
         )
+    one_step_metrics = save_one_step_metrics(models, time_blocks, cfg_dict, params, x_sensor, reference, eval_dir, device, mode)
+    interface_metrics = save_interface_consistency(models, time_blocks, cfg_dict, params, x_sensor, initial_sensor, eval_dir, device)
     write_rollout_summary(
         os.path.join(eval_dir, "summary.txt"),
         rel_l2,
         t_eval,
         extra={
+            "rollout_mode": mode,
             "n_models": len(models),
             "window_dt": float(cfg_dict["local_physics"]["window_dt"]),
             "periodic_case": periodic,
             "final_rel_l2_center_xm10_xp10": float(rel_l2_center[-1]),
             "max_rel_l2_center_xm10_xp10": float(np.max(rel_l2_center)),
             "mean_rel_l2_center_xm10_xp10": float(np.mean(rel_l2_center)),
+            **one_step_metrics,
+            **interface_metrics,
         },
     )
     params_ref = reference["params"]
@@ -1076,18 +1244,21 @@ def evaluate_and_save(models, time_blocks, cfg_dict, params, periodic, x_sensor,
         benchmark_inference(
             "LocalMultinet",
             solver_callable=lambda: get_ground_truth_CGL(params_ref, cfg_dict["physics"]["x_domain"][0], cfg_dict["physics"]["x_domain"][1], t_max, Nx=128, Nt=None),
-            model_callable=lambda: rollout_multinet(models, time_blocks, cfg_dict, params, initial_sensor, x_sensor, x_eval, t_eval, device),
+            model_callable=lambda: rollout_multinet(models, time_blocks, cfg_dict, params, initial_sensor, x_sensor, x_eval, t_eval, device, mode=mode),
             output_dir=eval_dir,
             repeats=int(cfg_dict["evaluation"].get("timing_repeats", 4)),
             warmup=1,
         )
     metrics = {
+        "rollout_mode": mode,
         "final_rel_l2": float(rel_l2[-1]),
         "max_rel_l2": float(np.max(rel_l2)),
         "mean_rel_l2": float(np.mean(rel_l2)),
         "final_rel_l2_center": float(rel_l2_center[-1]),
         "max_rel_l2_center": float(np.max(rel_l2_center)),
         "mean_rel_l2_center": float(np.mean(rel_l2_center)),
+        **one_step_metrics,
+        **interface_metrics,
     }
     with open(os.path.join(eval_dir, "rollout_metrics_summary.json"), "w", encoding="utf-8") as handle:
         json.dump(metrics, handle, indent=2)
@@ -1147,7 +1318,9 @@ def main():
     print(f"🧾 Config : {args.config}")
     print(
         f"🧭 Protocol local multinet | rebuild_each_stage={rebuild_state_bank_each_stage(cfg_dict)} "
-        f"| rollout_validation={rollout_validation_enabled(cfg_dict)}"
+        f"| rollout_validation={rollout_validation_enabled(cfg_dict)} "
+        f"| rollout_mode={default_rollout_mode(cfg_dict)} "
+        f"| state_bank_mode={state_bank_rollout_mode(cfg_dict)}"
     )
 
     try:
@@ -1282,7 +1455,22 @@ def main():
             run_dir,
             device,
             label="evaluation",
+            mode=default_rollout_mode(cfg_dict),
         )
+        for mode in evaluation_rollout_modes(cfg_dict):
+            evaluate_and_save(
+                models,
+                time_blocks,
+                cfg_dict,
+                params,
+                periodic,
+                x_sensor,
+                u0_sensor,
+                run_dir,
+                device,
+                label=f"evaluation_{mode}",
+                mode=mode,
+            )
         write_timing_summary(run_dir, start_dt.isoformat(timespec="seconds"), start_perf, "completed", history_rows)
         print(f"\n🏁 Local multireseau physics-only termine | {format_rollout_metrics(final_metrics)}")
     except Exception:

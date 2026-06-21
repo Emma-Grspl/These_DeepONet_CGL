@@ -17,8 +17,10 @@ from src.plot.postprocess_single_case import (
     plot_error_heatmap,
     plot_l2_curve,
     plot_snapshots,
+    relative_l2_curve_on_mask,
     save_comparison_gif,
     save_rel_l2_csv,
+    spatial_mask_from_bounds,
     write_rollout_summary,
 )
 from src.utils.solver_cgl import get_ground_truth_CGL
@@ -115,18 +117,31 @@ def main():
     model, ckpt, cfg_dict = load_direct_model(args.checkpoint, cfg_dict, device)
     params = fixed_case_params(cfg_dict)
     reached_t = float(args.reached_t) if args.reached_t is not None else float(ckpt.get("t_curr", cfg_dict["physics"]["t_max"]))
+    solver_nx = int(os.environ.get("CGL_EVAL_NX", "256"))
+    solver_nt_env = os.environ.get("CGL_EVAL_NT")
+    solver_nt = int(solver_nt_env) if solver_nt_env not in (None, "") else None
 
     x_min, x_max = cfg_dict["physics"]["x_domain"]
-    X, T, U_true = get_ground_truth_CGL(params, x_min, x_max, reached_t, Nx=256, Nt=None)
+    X, T, U_true = get_ground_truth_CGL(params, x_min, x_max, reached_t, Nx=solver_nx, Nt=solver_nt)
     x = X[:, 0]
     t_values = T[0, :]
     U_pred = predict_grid(model, params, x, t_values, device)
     rel_l2 = relative_l2_curve(U_pred, U_true)
+    center_mask = spatial_mask_from_bounds(x, -10.0, 10.0)
+    rel_l2_center = relative_l2_curve_on_mask(U_pred, U_true, center_mask)
 
     os.makedirs(args.output_dir, exist_ok=True)
     csv_path = os.path.join(args.output_dir, "rollout_metrics.csv")
     save_rel_l2_csv(csv_path, t_values, rel_l2)
+    csv_center_path = os.path.join(args.output_dir, "rollout_metrics_center_xm10_xp10.csv")
+    save_rel_l2_csv(csv_center_path, t_values, rel_l2_center)
     plot_l2_curve(t_values, rel_l2, "Monoreseau direct : erreur relative vs solveur classique", os.path.join(args.output_dir, "rollout_rel_l2.png"))
+    plot_l2_curve(
+        t_values,
+        rel_l2_center,
+        "Monoreseau direct : erreur relative au centre x in [-10, 10]",
+        os.path.join(args.output_dir, "rollout_rel_l2_center_xm10_xp10.png"),
+    )
     plot_error_heatmap(x, t_values, U_true, U_pred, "Monoreseau direct : heatmap erreur", os.path.join(args.output_dir, "error_heatmap.png"))
     plot_snapshots(
         x,
@@ -137,28 +152,38 @@ def main():
         os.path.join(args.output_dir, "snapshots.png"),
         snapshot_times=list(cfg_dict.get("evaluation", {}).get("snapshot_times", [0.0, 1.0, 2.0, 3.0, 4.0, 5.0])),
     )
-    save_comparison_gif(
-        x,
-        t_values,
-        U_true,
-        U_pred,
-        "Monoreseau direct : solveur vs prediction",
-        os.path.join(args.output_dir, "comparison_animation.gif"),
-    )
+    if os.environ.get("CGL_SKIP_GIF", "0") != "1":
+        save_comparison_gif(
+            x,
+            t_values,
+            U_true,
+            U_pred,
+            "Monoreseau direct : solveur vs prediction",
+            os.path.join(args.output_dir, "comparison_animation.gif"),
+        )
     write_rollout_summary(
         os.path.join(args.output_dir, "summary.txt"),
         rel_l2,
         t_values,
-        extra={"checkpoint": args.checkpoint, "metrics_csv": csv_path, "reached_t": reached_t},
+        extra={
+            "checkpoint": args.checkpoint,
+            "metrics_csv": csv_path,
+            "metrics_csv_center_xm10_xp10": csv_center_path,
+            "reached_t": reached_t,
+            "final_rel_l2_center_xm10_xp10": float(rel_l2_center[-1]),
+            "max_rel_l2_center_xm10_xp10": float(np.max(rel_l2_center)),
+            "mean_rel_l2_center_xm10_xp10": float(np.mean(rel_l2_center)),
+        },
     )
-    benchmark_inference(
-        "Monoreseau direct",
-        solver_callable=lambda: get_ground_truth_CGL(params, x_min, x_max, reached_t, Nx=128, Nt=None),
-        model_callable=lambda: predict_grid(model, params, x, t_values, device),
-        output_dir=args.output_dir,
-        repeats=8,
-        warmup=1,
-    )
+    if os.environ.get("CGL_SKIP_BENCHMARK", "0") != "1":
+        benchmark_inference(
+            "Monoreseau direct",
+            solver_callable=lambda: get_ground_truth_CGL(params, x_min, x_max, reached_t, Nx=128, Nt=None),
+            model_callable=lambda: predict_grid(model, params, x, t_values, device),
+            output_dir=args.output_dir,
+            repeats=8,
+            warmup=1,
+        )
 
 
 if __name__ == "__main__":

@@ -14,6 +14,29 @@ def save_rel_l2_csv(path, t_values, rel_l2):
             handle.write(f"{float(t_val):.8f},{float(err):.10f}\n")
 
 
+def spatial_mask_from_bounds(x, x_min=None, x_max=None):
+    x = np.asarray(x, dtype=np.float64)
+    mask = np.ones(x.shape, dtype=bool)
+    if x_min is not None:
+        mask &= x >= float(x_min)
+    if x_max is not None:
+        mask &= x <= float(x_max)
+    if not np.any(mask):
+        raise ValueError(f"No spatial samples found inside window [{x_min}, {x_max}].")
+    return mask
+
+
+def relative_l2_curve_on_mask(u_pred, u_true, spatial_mask):
+    mask = np.asarray(spatial_mask, dtype=bool)
+    rel_l2 = np.zeros(u_true.shape[1], dtype=np.float64)
+    for idx in range(u_true.shape[1]):
+        u_true_slice = u_true[mask, idx]
+        u_pred_slice = u_pred[mask, idx]
+        denom = np.linalg.norm(u_true_slice) + 1.0e-12
+        rel_l2[idx] = np.linalg.norm(u_pred_slice - u_true_slice) / denom
+    return rel_l2
+
+
 def write_rollout_summary(path, rel_l2, t_values, extra=None):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as handle:
@@ -202,4 +225,3 @@ def benchmark_inference(model_label, solver_callable, model_callable, output_dir
         handle.write(f"mean_model_seconds={mean_model:.10f}\n")
         handle.write(f"speedup_vs_solver={speedup:.10f}\n")
         handle.write(f"timing_plot={fig_path}\n")
-

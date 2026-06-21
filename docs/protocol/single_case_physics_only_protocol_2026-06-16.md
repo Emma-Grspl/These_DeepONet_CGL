@@ -18,8 +18,8 @@ Reference :
 
 Statut :
 
-- actif
-- relancable tout de suite
+- fige le 2026-06-21
+- ne plus relancer
 - `physics-only`
 
 Code actif :
@@ -40,12 +40,11 @@ Launchers presents :
 - `launch/jz_submit_CGL_amp_phase_alpha075_beta05_mu0_global_direct_t5_20h.slurm`
 - `launch/jz_submit_CGL_amp_phase_alpha075_beta05_mu1_global_direct_t5_20h.slurm`
 
-Objectif de figement :
+Etat de figement :
 
-- relancer les 4 single cases
-- conserver les runs bruts
-- regenerer les figures benchmark
-- figer ensuite la famille comme baseline `physics-only`
+- les 4 single cases sont conserves tels quels
+- les runs bruts, analyses, configs, slurms et assets utiles sont references dans `run_registry/single_case_physics_only_runs.csv`
+- cette famille sert uniquement de baseline constatee, pas de protocole a optimiser
 
 Artefacts a conserver apres relance :
 
@@ -54,11 +53,11 @@ Artefacts a conserver apres relance :
 - manifeste minimal dans `run_registry/single_case_physics_only_runs.csv`
 - copie minimale dans `run_assets/single_case_physics_only/`
 
-Critere de figement :
+Critere de conservation :
 
 - les 4 cas tournent sans supervision
-- pas d'instabilite manifeste
 - comparaison exploitable avec `global curriculum`
+- aucune nouvelle relance prevue
 
 ### 2. `monoreseau global curriculum`
 
@@ -110,14 +109,15 @@ Critere de figement :
 
 Statut :
 
-- protocole `physics-only` prepare
-- pret a etre teste sur single case
-- pas encore valide experimentalement
+- fige le 2026-06-21
+- ne plus relancer
+- `physics-only`
 
-Constat :
+Constat conserve :
 
 - toute l'ancienne branche locale reposait sur des cibles solveur directes
-- la nouvelle branche locale repart de zero sans solveur dans la loss
+- la nouvelle branche locale utilise uniquement une loss physics-only
+- les runs locaux evalues restent mauvais/instables, mais ils sont conserves comme etat final de cette famille
 
 Code prepare :
 
@@ -142,7 +142,7 @@ Launchers prepares :
 - `launch/jz_submit_CGL_local_physics_mononet_amp_phase_alpha075_beta0_mu0_t5_20h.slurm`
 - `launch/jz_submit_CGL_local_physics_mononet_amp_phase_resume_20h.slurm`
 
-Protocole retenu :
+Protocole retenu, maintenant fige :
 
 1. entrainer un seul reseau local partage sur une fenetre courte `Delta t`
 2. utiliser uniquement :
@@ -157,11 +157,12 @@ Reference detaillee :
 
 - `docs/protocol/local_monoreseau_single_case_physics_only_2026-06-16.md`
 
-Condition de passage :
+Etat de conservation :
 
-- commencer par `alpha=0.75, beta=0.0, mu=0.0`
-- valider `t=1`
-- ensuite seulement tenter `t=5`
+- 8 runs evalues conserves : 4 cas `t1` et 4 cas `t5`
+- checkpoint utile conserve : `model_final_local_physics_mononet_amp_phase.pth`
+- assets, configs, slurm generique et scripts copies sous `run_assets/single_case_physics_only/local_mononet/`
+- aucune nouvelle relance prevue
 
 ### 4. `multireseau global`
 

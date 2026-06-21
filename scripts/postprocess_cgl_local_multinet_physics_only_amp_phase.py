@@ -11,6 +11,7 @@ sys.path.insert(0, PROJECT_DIR)
 
 from scripts.train_cgl_local_multinet_physics_only_amp_phase import (
     evaluate_and_save,
+    evaluation_rollout_modes,
     fixed_case_setup,
     load_or_init_models,
     load_time_blocks,
@@ -31,6 +32,20 @@ def main():
     models = load_or_init_models(cfg_dict, args.run_dir, device)
     time_blocks = load_time_blocks(cfg_dict)
     evaluate_and_save(models, time_blocks, cfg_dict, params, periodic, x_sensor, u0_sensor, args.run_dir, device, label="evaluation")
+    for mode in evaluation_rollout_modes(cfg_dict):
+        evaluate_and_save(
+            models,
+            time_blocks,
+            cfg_dict,
+            params,
+            periodic,
+            x_sensor,
+            u0_sensor,
+            args.run_dir,
+            device,
+            label=f"evaluation_{mode}",
+            mode=mode,
+        )
 
 
 if __name__ == "__main__":
