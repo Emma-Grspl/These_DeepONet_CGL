@@ -23,18 +23,34 @@ from src.data.local_physics_single_case import (
     prepare_reference_trajectory,
 )
 from src.models.cgl_local_physics_deeponet_amp_phase import CGL_LocalPhysics_DeepONet_AmpPhase
-from src.plot.postprocess_single_case import (
-    benchmark_inference,
-    plot_error_heatmap,
-    plot_l2_curve,
-    plot_snapshots,
-    relative_l2_curve_on_mask,
-    save_comparison_gif,
-    save_rel_l2_csv,
-    spatial_mask_from_bounds,
-    write_rollout_summary,
-)
+from src.plot import postprocess_single_case as single_case_postprocess
 from src.utils.solver_cgl import get_ground_truth_CGL
+
+
+def _relative_l2_curve_on_mask_fallback(u_pred, u_true, spatial_mask):
+    mask = np.asarray(spatial_mask, dtype=bool)
+    rel_l2 = np.zeros(u_true.shape[1], dtype=np.float64)
+    for idx in range(u_true.shape[1]):
+        u_true_slice = u_true[mask, idx]
+        u_pred_slice = u_pred[mask, idx]
+        denom = np.linalg.norm(u_true_slice) + 1.0e-12
+        rel_l2[idx] = np.linalg.norm(u_pred_slice - u_true_slice) / denom
+    return rel_l2
+
+
+benchmark_inference = single_case_postprocess.benchmark_inference
+plot_error_heatmap = single_case_postprocess.plot_error_heatmap
+plot_l2_curve = single_case_postprocess.plot_l2_curve
+plot_snapshots = single_case_postprocess.plot_snapshots
+relative_l2_curve_on_mask = getattr(
+    single_case_postprocess,
+    "relative_l2_curve_on_mask",
+    _relative_l2_curve_on_mask_fallback,
+)
+save_comparison_gif = single_case_postprocess.save_comparison_gif
+save_rel_l2_csv = single_case_postprocess.save_rel_l2_csv
+spatial_mask_from_bounds = single_case_postprocess.spatial_mask_from_bounds
+write_rollout_summary = single_case_postprocess.write_rollout_summary
 
 
 def atomic_torch_save(state, path):

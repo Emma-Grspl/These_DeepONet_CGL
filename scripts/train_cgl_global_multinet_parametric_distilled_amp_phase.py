@@ -270,15 +270,36 @@ def load_anchor_teachers(cfg_dict, device):
         raise ValueError("teacher_distillation.anchors doit contenir au moins 2 anchors.")
 
     variable = free_variable_name(cfg_dict)
-    anchors = []
+    prepared_anchors = []
+    missing_anchors = []
     for anchor_cfg in anchors_cfg:
         params = _normalize_anchor_params(cfg_dict, anchor_cfg.get("params", {}))
-        checkpoint = resolve_project_path(anchor_cfg.get("teacher_checkpoint"))
-        if checkpoint is None or not os.path.exists(checkpoint):
-            raise FileNotFoundError(
-                "Checkpoint teacher introuvable. "
-                f"Compléter teacher_checkpoint pour {anchor_cfg.get('label', '<sans_label>')}."
+        raw_checkpoint = anchor_cfg.get("teacher_checkpoint")
+        raw_checkpoint_str = "" if raw_checkpoint is None else str(raw_checkpoint)
+        checkpoint = resolve_project_path(raw_checkpoint) if raw_checkpoint_str else None
+        unresolved_placeholder = raw_checkpoint_str.startswith("FILL_ME_")
+        if unresolved_placeholder or checkpoint is None or not os.path.exists(checkpoint):
+            missing_anchors.append(
+                {
+                    "label": str(anchor_cfg.get("label", "<sans_label>")),
+                    "variable_value": float(anchor_cfg.get("variable_value", params[variable])),
+                    "checkpoint": raw_checkpoint_str or "<vide>",
+                }
             )
+            continue
+        prepared_anchors.append((anchor_cfg, params, checkpoint))
+
+    if missing_anchors:
+        details = "; ".join(
+            f"{row['label']}@{row['variable_value']}: {row['checkpoint']}" for row in missing_anchors
+        )
+        raise FileNotFoundError(
+            "Teachers distilles introuvables ou non renseignes. "
+            f"Verifier teacher_distillation.anchors dans le YAML: {details}"
+        )
+
+    anchors = []
+    for anchor_cfg, params, checkpoint in prepared_anchors:
         payload = torch.load(checkpoint, map_location=device)
         model = CGL_PI_DeepONet_AmpPhase(cfg_dict).to(device)
         model.load_state_dict(_extract_model_state(payload), strict=True)

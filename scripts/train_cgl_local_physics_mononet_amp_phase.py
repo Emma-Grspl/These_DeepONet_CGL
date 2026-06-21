@@ -25,16 +25,34 @@ from src.data.local_physics_single_case import (
     prepare_reference_trajectory,
 )
 from src.models.cgl_local_physics_deeponet_amp_phase import CGL_LocalPhysics_DeepONet_AmpPhase
-from src.plot.postprocess_single_case import (
-    benchmark_inference,
-    plot_error_heatmap,
-    plot_l2_curve,
-    plot_snapshots,
-    save_comparison_gif,
-    save_rel_l2_csv,
-    write_rollout_summary,
-)
+from src.plot import postprocess_single_case as single_case_postprocess
 from src.utils.solver_cgl import get_ground_truth_CGL
+
+
+def _relative_l2_curve_on_mask_fallback(u_pred, u_true, spatial_mask):
+    mask = np.asarray(spatial_mask, dtype=bool)
+    rel_l2 = np.zeros(u_true.shape[1], dtype=np.float64)
+    for idx in range(u_true.shape[1]):
+        u_true_slice = u_true[mask, idx]
+        u_pred_slice = u_pred[mask, idx]
+        denom = np.linalg.norm(u_true_slice) + 1.0e-12
+        rel_l2[idx] = np.linalg.norm(u_pred_slice - u_true_slice) / denom
+    return rel_l2
+
+
+benchmark_inference = single_case_postprocess.benchmark_inference
+plot_error_heatmap = single_case_postprocess.plot_error_heatmap
+plot_l2_curve = single_case_postprocess.plot_l2_curve
+plot_snapshots = single_case_postprocess.plot_snapshots
+relative_l2_curve_on_mask = getattr(
+    single_case_postprocess,
+    "relative_l2_curve_on_mask",
+    _relative_l2_curve_on_mask_fallback,
+)
+save_comparison_gif = single_case_postprocess.save_comparison_gif
+save_rel_l2_csv = single_case_postprocess.save_rel_l2_csv
+spatial_mask_from_bounds = single_case_postprocess.spatial_mask_from_bounds
+write_rollout_summary = single_case_postprocess.write_rollout_summary
 
 
 def find_latest_run_dir(base_results_dir):
@@ -206,6 +224,41 @@ def state_sampling_weights(n_states, latest_bias):
     return weights / weights.sum()
 
 
+def sanitize_sensor_state(sensor_state, fallback_state=None):
+    sensor = np.asarray(sensor_state, dtype=np.complex64).copy()
+    finite_mask = np.isfinite(np.real(sensor)) & np.isfinite(np.imag(sensor))
+    if np.all(finite_mask):
+        return sensor
+
+    if fallback_state is not None:
+        fallback = np.asarray(fallback_state, dtype=np.complex64)
+        if fallback.shape == sensor.shape:
+            sensor[~finite_mask] = fallback[~finite_mask]
+            finite_mask = np.isfinite(np.real(sensor)) & np.isfinite(np.imag(sensor))
+
+    if not np.all(finite_mask):
+        sensor[~finite_mask] = np.complex64(0.0 + 0.0j)
+    return sensor
+
+
+def safe_sampling_probabilities(sensor_state):
+    amp = np.abs(sensor_state).astype(np.float64)
+    amp = np.where(np.isfinite(amp), np.maximum(amp, 0.0), 0.0)
+    if amp.size == 0:
+        raise ValueError("Etat capteur vide: impossible d'echantillonner les points spatiaux.")
+
+    total_amp = float(np.sum(amp))
+    if not np.isfinite(total_amp) or total_amp <= 0.0:
+        return np.full(amp.shape[0], 1.0 / float(amp.shape[0]), dtype=np.float64)
+
+    scale = max(float(np.max(amp)), 1.0)
+    probs = amp + 1.0e-4 * scale + 1.0e-8
+    total = float(np.sum(probs))
+    if not np.isfinite(total) or total <= 0.0:
+        return np.full(amp.shape[0], 1.0 / float(amp.shape[0]), dtype=np.float64)
+    return probs / total
+
+
 def sample_spatial_points(sensor_state, x_sensor, periodic, n_points, focus_mix):
     n_points = int(n_points)
     focus_mix = float(focus_mix)
@@ -215,9 +268,8 @@ def sample_spatial_points(sensor_state, x_sensor, periodic, n_points, focus_mix)
 
     n_focus = int(round(focus_mix * n_points))
     n_uniform = n_points - n_focus
-    amp = np.abs(sensor_state).astype(np.float64)
-    probs = amp + 1.0e-4 * max(float(np.max(amp)), 1.0) + 1.0e-8
-    probs /= probs.sum()
+    sensor_state = sanitize_sensor_state(sensor_state)
+    probs = safe_sampling_probabilities(sensor_state)
 
     values = []
     if n_focus > 0:
@@ -240,6 +292,7 @@ def sample_spatial_points(sensor_state, x_sensor, periodic, n_points, focus_mix)
 
 
 def build_branch_tensor(cfg_dict, sensor_state, params, window_dt, repeat_count, device):
+    sensor_state = sanitize_sensor_state(sensor_state)
     branch_vec = build_branch_features(cfg_dict, sensor_state, window_dt, params)
     branch_tensor = torch.tensor(branch_vec[None, :], dtype=torch.float32, device=device)
     return branch_tensor.repeat(int(repeat_count), 1)
@@ -259,9 +312,10 @@ def build_pde_batch(state_bank, cfg_dict, params, x_sensor, periodic, window_dt,
     coords_rows = []
     for idx in selected_idx:
         entry = state_bank[int(idx)]
-        x_vals = sample_spatial_points(entry["sensor"], x_sensor, periodic, points_per_state, focus_mix)
+        sensor_state = sanitize_sensor_state(entry["sensor"])
+        x_vals = sample_spatial_points(sensor_state, x_sensor, periodic, points_per_state, focus_mix)
         tau_vals = np.random.uniform(tau_eps, window_dt, size=points_per_state).astype(np.float32)
-        branch_rows.append(build_branch_tensor(cfg_dict, entry["sensor"], params, window_dt, points_per_state, device))
+        branch_rows.append(build_branch_tensor(cfg_dict, sensor_state, params, window_dt, points_per_state, device))
         coords_rows.append(np.stack([x_vals, tau_vals], axis=1))
 
     branch = torch.cat(branch_rows, dim=0)
@@ -282,11 +336,12 @@ def build_bc_batch(state_bank, cfg_dict, params, x_sensor, periodic, window_dt, 
     right_targets = []
     for idx in selected_idx:
         entry = state_bank[int(idx)]
+        sensor_state = sanitize_sensor_state(entry["sensor"])
         tau_vals = np.random.uniform(0.0, window_dt, size=points_per_state).astype(np.float32)
-        branch_rows.append(build_branch_tensor(cfg_dict, entry["sensor"], params, window_dt, points_per_state, device))
+        branch_rows.append(build_branch_tensor(cfg_dict, sensor_state, params, window_dt, points_per_state, device))
         tau_rows.append(tau_vals[:, None])
-        left_targets.append(np.repeat(entry["sensor"][0:1], points_per_state).astype(np.complex64))
-        right_targets.append(np.repeat(entry["sensor"][-1:], points_per_state).astype(np.complex64))
+        left_targets.append(np.repeat(sensor_state[0:1], points_per_state).astype(np.complex64))
+        right_targets.append(np.repeat(sensor_state[-1:], points_per_state).astype(np.complex64))
 
     branch = torch.cat(branch_rows, dim=0)
     tau = np.concatenate(tau_rows, axis=0).astype(np.float32)
@@ -327,9 +382,10 @@ def build_ic_batch(state_bank, cfg_dict, params, x_sensor, periodic, window_dt, 
     target_rows = []
     for idx in selected_idx:
         entry = state_bank[int(idx)]
-        x_vals = sample_spatial_points(entry["sensor"], x_sensor, periodic, points_per_state, focus_mix)
-        targets = interp_complex_field(x_sensor, entry["sensor"], x_vals, periodic)
-        branch_rows.append(build_branch_tensor(cfg_dict, entry["sensor"], params, window_dt, points_per_state, device))
+        sensor_state = sanitize_sensor_state(entry["sensor"])
+        x_vals = sample_spatial_points(sensor_state, x_sensor, periodic, points_per_state, focus_mix)
+        targets = interp_complex_field(x_sensor, sensor_state, x_vals, periodic)
+        branch_rows.append(build_branch_tensor(cfg_dict, sensor_state, params, window_dt, points_per_state, device))
         coords_rows.append(np.stack([x_vals, np.zeros(points_per_state, dtype=np.float32)], axis=1))
         target_rows.append(targets)
 
@@ -447,6 +503,7 @@ def evaluate_proxy_loss(model, state_bank, cfg_dict, params, x_sensor, periodic,
 
 
 def predict_sensor_state(model, cfg_dict, params, sensor_state, x_sensor, window_dt, device):
+    sensor_state = sanitize_sensor_state(sensor_state)
     branch = build_branch_tensor(cfg_dict, sensor_state, params, window_dt, len(x_sensor), device)
     coords = torch.tensor(
         np.stack([x_sensor, np.full(len(x_sensor), float(window_dt), dtype=np.float32)], axis=1),
@@ -456,7 +513,8 @@ def predict_sensor_state(model, cfg_dict, params, sensor_state, x_sensor, window
     model.eval()
     with torch.no_grad():
         pred_re, pred_im = model(branch, coords)
-    return (pred_re[:, 0].cpu().numpy() + 1j * pred_im[:, 0].cpu().numpy()).astype(np.complex64)
+    predicted = (pred_re[:, 0].cpu().numpy() + 1j * pred_im[:, 0].cpu().numpy()).astype(np.complex64)
+    return sanitize_sensor_state(predicted, fallback_state=sensor_state)
 
 
 def train_one_stage(model, optimizer, state_bank, cfg_dict, params, x_sensor, periodic, stage_dir, stage_window, device):
@@ -577,7 +635,7 @@ def predict_window_grid(model, cfg_dict, params, sensor_state, x_eval, local_tim
 
 def rollout_shared_model(model, cfg_dict, params, initial_sensor, x_sensor, x_eval, t_eval, device):
     window_schedule = build_window_schedule(cfg_dict["physics"]["t_max"], cfg_dict["local_physics"]["window_dt"])
-    start_states = [initial_sensor.astype(np.complex64)]
+    start_states = [sanitize_sensor_state(initial_sensor.astype(np.complex64))]
     for stage_idx, (t_start, t_end) in enumerate(window_schedule[:-1]):
         next_sensor = predict_sensor_state(
             model,
@@ -660,11 +718,21 @@ def run_benchmark_and_postprocess(model, cfg_dict, params, periodic, x_sensor, i
     os.makedirs(eval_dir, exist_ok=True)
 
     save_rel_l2_csv(os.path.join(eval_dir, "rollout_metrics.csv"), t_eval, rel_l2)
+    center_mask = spatial_mask_from_bounds(x_eval, -10.0, 10.0)
+    rel_l2_center = relative_l2_curve_on_mask(u_pred, u_true, center_mask)
+    save_rel_l2_csv(os.path.join(eval_dir, "rollout_metrics_center_xm10_xp10.csv"), t_eval, rel_l2_center)
     plot_l2_curve(
         t_eval,
         rel_l2,
         "CGL local monoreseau physics-only : erreur relative",
         os.path.join(eval_dir, "rollout_rel_l2.png"),
+        stage_markers=[t_end for _, t_end in window_schedule[:-1]],
+    )
+    plot_l2_curve(
+        t_eval,
+        rel_l2_center,
+        "CGL local monoreseau physics-only : erreur relative au centre x in [-10, 10]",
+        os.path.join(eval_dir, "rollout_rel_l2_center_xm10_xp10.png"),
         stage_markers=[t_end for _, t_end in window_schedule[:-1]],
     )
     plot_error_heatmap(
@@ -701,6 +769,9 @@ def run_benchmark_and_postprocess(model, cfg_dict, params, periodic, x_sensor, i
             "n_windows": len(window_schedule),
             "window_dt_nominal": float(cfg_dict["local_physics"]["window_dt"]),
             "periodic_case": periodic,
+            "final_rel_l2_center_xm10_xp10": float(rel_l2_center[-1]),
+            "max_rel_l2_center_xm10_xp10": float(np.max(rel_l2_center)),
+            "mean_rel_l2_center_xm10_xp10": float(np.mean(rel_l2_center)),
         },
     )
 
@@ -796,6 +867,7 @@ def main():
             )
 
             latest_state = active_bank[-1]["sensor"]
+            latest_state = sanitize_sensor_state(active_bank[-1]["sensor"])
             next_sensor = predict_sensor_state(model, cfg_dict, params, latest_state, x_sensor, float(t_end - t_start), device)
             np.savez(
                 os.path.join(stage_dir, "state_transition.npz"),
