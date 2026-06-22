@@ -290,6 +290,32 @@ def build_branch_tensor(cfg_dict, sensor_state, params, window_dt, repeat_count,
     return branch_tensor.repeat(int(repeat_count), 1)
 
 
+def build_branch_tensor_from_sensor_tensor(cfg_dict, sensor_re, sensor_im, params, window_dt, repeat_count, device):
+    local_cfg = cfg_dict["local_physics"]
+    sensor_re = sensor_re.detach().to(device=device, dtype=torch.float32).flatten()
+    sensor_im = sensor_im.detach().to(device=device, dtype=torch.float32).flatten()
+    amp_floor = float(local_cfg.get("amp_floor", 1.0e-6))
+    amp = torch.sqrt(sensor_re ** 2 + sensor_im ** 2)
+    denom = amp + amp_floor
+    state_features = torch.cat(
+        [
+            torch.log(amp + amp_floor),
+            sensor_re / denom,
+            sensor_im / denom,
+        ],
+        dim=0,
+    )
+    params_norm = torch.tensor(
+        build_branch_features(cfg_dict, np.zeros_like(sensor_re.detach().cpu().numpy(), dtype=np.complex64), window_dt, params)[
+            3 * int(local_cfg["sensor_nx"]) :
+        ],
+        dtype=torch.float32,
+        device=device,
+    )
+    branch_vec = torch.cat([state_features, params_norm], dim=0)
+    return branch_vec.unsqueeze(0).repeat(int(repeat_count), 1)
+
+
 def local_pde_residual(model, branch, coords, params):
     alpha = torch.full_like(coords[:, 0:1], float(params["alpha"]))
     beta = torch.full_like(coords[:, 0:1], float(params["beta"]))
@@ -459,7 +485,86 @@ def compute_overlap_consistency_loss(student_model, teacher_models, overlap_entr
     return torch.stack(losses).mean()
 
 
-def compute_proxy_components(model, block_entries, overlap_entries, teacher_models, cfg_dict, params, x_sensor, periodic, window_dt, device):
+def rollout_finetune_cfg(cfg_dict):
+    return dict(cfg_dict["training"].get("rollout_finetune", {}))
+
+
+def rollout_finetune_active(cfg_dict, pass_idx):
+    cfg = rollout_finetune_cfg(cfg_dict)
+    return bool(cfg.get("enabled", False)) and int(pass_idx) >= int(cfg.get("start_pass_idx", 1))
+
+
+def compute_multistep_consistency_loss(model, entries, cfg_dict, params, x_sensor, periodic, window_dt, device):
+    if not entries:
+        return torch.zeros((), dtype=torch.float32, device=device)
+
+    ft_cfg = rollout_finetune_cfg(cfg_dict)
+    steps = max(2, int(ft_cfg.get("multistep_steps", 2)))
+    sub_dt = float(window_dt) / float(steps)
+    n_states = min(len(entries), int(ft_cfg.get("multistep_states", 4)))
+    points_per_state = int(ft_cfg.get("multistep_points_per_state", 256))
+    focus_mix = float(cfg_dict["local_physics"].get("focus_mix", 0.8))
+    latest_bias = float(ft_cfg.get("latest_bias", cfg_dict["training"].get("latest_bias", 0.7)))
+    weights = state_sampling_weights(len(entries), latest_bias)
+    chosen_idx = np.random.choice(len(entries), size=n_states, replace=True, p=weights)
+
+    losses = []
+    sensor_x = torch.tensor(x_sensor[:, None], dtype=torch.float32, device=device)
+    sensor_tau = torch.full((len(x_sensor), 1), sub_dt, dtype=torch.float32, device=device)
+    sensor_coords = torch.cat([sensor_x, sensor_tau], dim=1)
+
+    for idx in chosen_idx:
+        entry = entries[int(idx)]
+        sensor_state = entry["sensor"]
+        with torch.no_grad():
+            branch_sensor = build_branch_tensor(cfg_dict, sensor_state, params, window_dt, len(x_sensor), device)
+            pred_sensor_re, pred_sensor_im = model(branch_sensor, sensor_coords)
+            branch_next_sensor = build_branch_tensor_from_sensor_tensor(
+                cfg_dict,
+                pred_sensor_re[:, 0],
+                pred_sensor_im[:, 0],
+                params,
+                window_dt,
+                points_per_state,
+                device,
+            )
+
+        x_vals = sample_spatial_points(sensor_state, x_sensor, periodic, points_per_state, focus_mix)
+        coords_direct = torch.tensor(
+            np.stack(
+                [
+                    x_vals,
+                    np.full(points_per_state, min(float(window_dt), steps * sub_dt), dtype=np.float32),
+                ],
+                axis=1,
+            ),
+            dtype=torch.float32,
+            device=device,
+        )
+        coords_step = torch.tensor(
+            np.stack(
+                [
+                    x_vals,
+                    np.full(points_per_state, sub_dt, dtype=np.float32),
+                ],
+                axis=1,
+            ),
+            dtype=torch.float32,
+            device=device,
+        )
+        with torch.no_grad():
+            branch_direct = build_branch_tensor(cfg_dict, sensor_state, params, window_dt, points_per_state, device)
+            target_re, target_im = model(branch_direct, coords_direct)
+
+        pred_re, pred_im = model(branch_next_sensor, coords_step)
+        diff_sq = (pred_re - target_re.detach()) ** 2 + (pred_im - target_im.detach()) ** 2
+        ref_sq = target_re.detach() ** 2 + target_im.detach() ** 2
+        losses.append(torch.mean(diff_sq / (ref_sq + 1.0e-6)))
+
+    return torch.stack(losses).mean() if losses else torch.zeros((), dtype=torch.float32, device=device)
+
+
+def compute_proxy_components(model, block_entries, overlap_entries, teacher_models, cfg_dict, params, x_sensor, periodic, window_dt, device, pass_idx=0):
     loss_weights = cfg_dict["training"]["loss_weights"]
     branch_pde, coords_pde = build_pde_batch_from_entries(block_entries, cfg_dict, params, x_sensor, periodic, window_dt, device)
     res_re, res_im = local_pde_residual(model, branch_pde, coords_pde, params)
@@ -503,24 +608,41 @@ def compute_proxy_components(model, block_entries, overlap_entries, teacher_mode
     else:
         loss_overlap = torch.zeros((), dtype=torch.float32, device=device)
 
+    multistep_weight = float(loss_weights.get("multistep", 0.0))
+    if multistep_weight > 0.0 and rollout_finetune_active(cfg_dict, pass_idx):
+        loss_multistep = compute_multistep_consistency_loss(
+            model,
+            block_entries,
+            cfg_dict,
+            params,
+            x_sensor,
+            periodic,
+            window_dt,
+            device,
+        )
+    else:
+        loss_multistep = torch.zeros((), dtype=torch.float32, device=device)
+
     total = (
         float(loss_weights["pde"]) * loss_pde
         + float(loss_weights["bc"]) * loss_bc
         + ic_weight * loss_ic
         + overlap_weight * loss_overlap
+        + multistep_weight * loss_multistep
     )
     return total, {
         "pde": loss_pde,
         "bc": loss_bc,
         "ic": loss_ic,
         "overlap": loss_overlap,
+        "multistep": loss_multistep,
     }
 
 
-def compute_proxy_loss(model, block_entries, overlap_entries, teacher_models, cfg_dict, params, x_sensor, periodic, window_dt, device):
+def compute_proxy_loss(model, block_entries, overlap_entries, teacher_models, cfg_dict, params, x_sensor, periodic, window_dt, device, pass_idx=0):
     eval_batches = int(cfg_dict["training"].get("proxy_eval_batches", 2))
     values = []
-    components = {"pde": [], "bc": [], "ic": [], "overlap": []}
+    components = {"pde": [], "bc": [], "ic": [], "overlap": [], "multistep": []}
     model.eval()
     for _ in range(eval_batches):
         with torch.enable_grad():
@@ -535,6 +657,7 @@ def compute_proxy_loss(model, block_entries, overlap_entries, teacher_models, cf
                 periodic,
                 window_dt,
                 device,
+                pass_idx=pass_idx,
             )
         values.append(float(total.detach().item()))
         for key in components:
@@ -848,7 +971,7 @@ def build_overlap_entries(state_bank, time_blocks, stage_idx):
     return list(unique.values()), sorted(set(neighbors))
 
 
-def train_one_stage(model, optimizer, block_entries, overlap_entries, teacher_models, cfg_dict, params, x_sensor, periodic, stage_dir, device):
+def train_one_stage(model, optimizer, block_entries, overlap_entries, teacher_models, cfg_dict, params, x_sensor, periodic, stage_dir, device, pass_idx=0):
     train_cfg = cfg_dict["training"]
     window_dt = float(cfg_dict["local_physics"]["window_dt"])
     max_iters = int(train_cfg["stage_num_iters"])
@@ -861,12 +984,19 @@ def train_one_stage(model, optimizer, block_entries, overlap_entries, teacher_mo
     start_iter, best_proxy = load_stage_checkpoint_if_available(model, optimizer, stage_dir, device)
     patience_count = 0
     stage_start_perf = time.perf_counter()
-    best_proxy_components = {"pde": float("nan"), "bc": float("nan"), "ic": float("nan"), "overlap": float("nan")}
+    best_proxy_components = {
+        "pde": float("nan"),
+        "bc": float("nan"),
+        "ic": float("nan"),
+        "overlap": float("nan"),
+        "multistep": float("nan"),
+    }
     iteration = start_iter
 
     print(
         f"🔁 Stage={os.path.basename(stage_dir)} | resume_iter={start_iter} | "
-        f"bank_block={len(block_entries)} | bank_overlap={len(overlap_entries)}"
+        f"bank_block={len(block_entries)} | bank_overlap={len(overlap_entries)} | "
+        f"rollout_finetune={rollout_finetune_active(cfg_dict, pass_idx)}"
     )
 
     for iteration in range(start_iter + 1, max_iters + 1):
@@ -883,6 +1013,7 @@ def train_one_stage(model, optimizer, block_entries, overlap_entries, teacher_mo
             periodic,
             window_dt,
             device,
+            pass_idx=pass_idx,
         )
         total.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
@@ -892,7 +1023,8 @@ def train_one_stage(model, optimizer, block_entries, overlap_entries, teacher_mo
             print(
                 f"[{os.path.basename(stage_dir)} | iter {iteration}] total={float(total.item()):.3e} "
                 f"| pde={float(losses['pde'].item()):.3e} | bc={float(losses['bc'].item()):.3e} "
-                f"| ic={float(losses['ic'].item()):.3e} | overlap={float(losses['overlap'].item()):.3e}"
+                f"| ic={float(losses['ic'].item()):.3e} | overlap={float(losses['overlap'].item()):.3e} "
+                f"| multistep={float(losses['multistep'].item()):.3e}"
             )
 
         if iteration % eval_every == 0 or iteration == max_iters:
@@ -907,10 +1039,12 @@ def train_one_stage(model, optimizer, block_entries, overlap_entries, teacher_mo
                 periodic,
                 window_dt,
                 device,
+                pass_idx=pass_idx,
             )
             print(
                 f"    📏 proxy={proxy:.3e} | pde={proxy_components['pde']:.3e} | bc={proxy_components['bc']:.3e} "
-                f"| ic={proxy_components['ic']:.3e} | overlap={proxy_components['overlap']:.3e}"
+                f"| ic={proxy_components['ic']:.3e} | overlap={proxy_components['overlap']:.3e} "
+                f"| multistep={proxy_components['multistep']:.3e}"
             )
             save_stage_checkpoint(model, optimizer, iteration, best_proxy, stage_dir, "model_latest.pth")
             improved = proxy < best_proxy * (1.0 - float(early_cfg.get("min_delta", 0.01))) or not np.isfinite(best_proxy)
@@ -948,6 +1082,7 @@ def train_one_stage(model, optimizer, block_entries, overlap_entries, teacher_mo
                 "completed_iters": int(iteration),
                 "block_entries": int(len(block_entries)),
                 "overlap_entries": int(len(overlap_entries)),
+                "rollout_finetune_active": bool(rollout_finetune_active(cfg_dict, pass_idx)),
             },
             handle,
             indent=2,
@@ -1368,6 +1503,7 @@ def main():
                     periodic,
                     stage_dir,
                     device,
+                    pass_idx=pass_idx,
                 )
                 history_rows.append(
                     {

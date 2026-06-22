@@ -1,0 +1,114 @@
+experiment_name: "CGL_LocalMultinet_PhysicsOnly_V4RolloutB_AmpPhase_alpha075_beta0_mu0_t1"
+device: "cuda"
+
+physics:
+  x_domain: [-40.0, 40.0]
+  t_max: 1.0
+  initial_conditions: [0]
+  bounds:
+    A: [0.25, 0.25]
+    w0: [1.25, 1.25]
+    x0: [0.0, 0.0]
+    k: [0.0, 0.0]
+  equation_params:
+    alpha: [0.75, 0.75]
+    beta: [0.0, 0.0]
+    mu: [0.0, 0.0]
+    V: [0.0, 0.0]
+
+local_physics:
+  sensor_nx: 256
+  solver_nx: 256
+  window_dt: 0.05
+  amp_floor: 1.0e-6
+  tau_epsilon: 1.0e-4
+  focus_mix: 0.90
+
+model_local:
+  latent_dim: 256
+  branch_layers: [512, 512, 512]
+  trunk_layers: [256, 256, 256]
+  fourier_dim: 64
+  fourier_scales: [1.0, 2.0, 5.0, 10.0]
+  delta_bounds:
+    log_amp: 3.0
+    phase: 7.5
+  phase_gate:
+    enabled: true
+    relative_floor: 0.05
+    absolute_floor: 1.0e-6
+    exponent: 1.0
+
+rollout:
+  mode: "smooth_overlap_blend"
+  state_bank_mode: "smooth_overlap_blend"
+
+multinet:
+  warm_start_interstage: true
+  max_passes: 2
+  rebuild_state_bank_each_stage: true
+  rollout_validation:
+    enabled: true
+    selection_metric: "max_rel_l2"
+    secondary_metric: "one_step_max_rel_l2"
+    min_improvement_rel: 0.005
+    tie_tolerance_rel: 0.005
+    rollback_on_reject: true
+  time_blocks:
+    - [0.0, 0.25]
+    - [0.125, 0.375]
+    - [0.25, 0.5]
+    - [0.375, 0.625]
+    - [0.5, 0.75]
+    - [0.625, 0.875]
+    - [0.75, 1.0]
+
+bootstrap:
+  mononet_checkpoint: null
+
+training:
+  save_dir: "results/CGL_LocalMultinet_PhysicsOnly_V4RolloutB_AmpPhase_alpha075_beta0_mu0_t1"
+  batch_states: 5
+  pde_points_per_state: 768
+  bc_states: 3
+  bc_points_per_state: 128
+  ic_states: 4
+  ic_points_per_state: 256
+  overlap_states: 5
+  overlap_points_per_state: 384
+  latest_bias: 0.88
+  stage_num_iters: 1800
+  proxy_eval_batches: 2
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-6
+  grad_clip: 0.75
+  log_every: 100
+  eval_every: 200
+  snapshot_every: 900
+  rollout_finetune:
+    enabled: true
+    start_pass_idx: 1
+    multistep_steps: 2
+    multistep_states: 4
+    multistep_points_per_state: 320
+    latest_bias: 0.90
+  loss_weights:
+    pde: 1.0
+    bc: 0.5
+    ic: 0.2
+    overlap: 0.8
+    multistep: 0.6
+  early_stop:
+    enabled: true
+    min_iters: 1000
+    patience_evals: 5
+    min_delta: 0.006
+
+evaluation:
+  solver_nx: 256
+  snapshot_times: [0.05, 0.1, 0.25, 0.5, 0.75, 1.0]
+  prediction_chunk_size: 32768
+  timing_repeats: 4
+  rollout_modes:
+    - "smooth_overlap_blend"
+    - "hard_switch"
