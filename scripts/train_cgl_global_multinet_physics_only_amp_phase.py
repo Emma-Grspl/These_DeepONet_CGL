@@ -251,6 +251,45 @@ def stage_allow_relaxation(cfg_dict):
     return bool(cfg_dict["multistage_training"].get("allow_relaxation", False))
 
 
+def internal_curriculum_cfg(cfg_dict):
+    return dict(cfg_dict["multistage_training"].get("internal_curriculum", {}))
+
+
+def internal_curriculum_enabled(cfg_dict):
+    return bool(internal_curriculum_cfg(cfg_dict).get("enabled", False))
+
+
+def internal_curriculum_fractions(cfg_dict):
+    cur_cfg = internal_curriculum_cfg(cfg_dict)
+    fractions = [float(v) for v in cur_cfg.get("fractions", [1.0])]
+    fractions = sorted({min(1.0, max(1.0e-6, value)) for value in fractions})
+    if not fractions or fractions[-1] < 1.0:
+        fractions.append(1.0)
+    return fractions
+
+
+def internal_curriculum_target_scale(cfg_dict, phase_idx):
+    cur_cfg = internal_curriculum_cfg(cfg_dict)
+    scales = cur_cfg.get("target_scale_by_phase")
+    if scales is None:
+        return 1.0
+    if phase_idx < len(scales):
+        return float(scales[phase_idx])
+    return float(scales[-1])
+
+
+def stage_curriculum_state(cfg_dict, t_start, t_end, iteration, num_iters):
+    if not internal_curriculum_enabled(cfg_dict):
+        return float(t_end), 1.0, 0
+
+    fractions = internal_curriculum_fractions(cfg_dict)
+    phase_len = max(1, int(np.ceil(float(num_iters) / float(len(fractions)))))
+    phase_idx = min((max(1, int(iteration)) - 1) // phase_len, len(fractions) - 1)
+    fraction = float(fractions[phase_idx])
+    active_t_end = float(t_start) + fraction * (float(t_end) - float(t_start))
+    return active_t_end, fraction, int(phase_idx)
+
+
 def historical_validation_cfg(cfg_dict):
     return dict(cfg_dict["multistage_training"].get("historical_validation", {}))
 
@@ -320,13 +359,23 @@ def slice_reference_trajectory(reference, t_end, time_stride=1):
     }
 
 
-def evaluate_historical_rollout(prefix_models, current_model, time_blocks, reference_full, stage_idx, cfg_dict, device):
+def evaluate_historical_rollout(
+    prefix_models,
+    current_model,
+    time_blocks,
+    reference_full,
+    stage_idx,
+    cfg_dict,
+    device,
+    t_end_override=None,
+):
     if reference_full is None:
         return None
 
+    active_t_end = time_blocks[stage_idx][1] if t_end_override is None else float(t_end_override)
     ref = slice_reference_trajectory(
         reference_full,
-        time_blocks[stage_idx][1],
+        active_t_end,
         time_stride=historical_time_stride(cfg_dict),
     )
     models = list(prefix_models) + [current_model]
@@ -346,7 +395,7 @@ def evaluate_historical_rollout(prefix_models, current_model, time_blocks, refer
         "max_rel_l2": float(np.max(rel)),
         "final_rel_l2": float(rel[-1]),
         "n_times": int(len(rel)),
-        "t_end": float(active_blocks[-1][1]),
+        "t_end": float(active_t_end),
     }
 
 
@@ -509,6 +558,8 @@ def train_one_stage(
     final_hist_stats = None
     iteration = start_iter
     prefix_models = [] if prefix_models is None else list(prefix_models)
+    curriculum_enabled = internal_curriculum_enabled(cfg_dict)
+    last_curriculum_phase_idx = None
 
     for param_group in optimizer.param_groups:
         param_group["lr"] = base_lr
@@ -523,9 +574,26 @@ def train_one_stage(
             current_target = relaxed_target
             print(f"    ⚠️ Cible relaxee a {current_target:.2%} a mi-stage.")
 
+        active_t_end, curriculum_fraction, curriculum_phase_idx = stage_curriculum_state(
+            cfg_dict,
+            t_start,
+            t_end,
+            iteration,
+            num_iters,
+        )
+        active_target = current_target * internal_curriculum_target_scale(cfg_dict, curriculum_phase_idx)
+        can_select_best = (not curriculum_enabled) or (active_t_end >= float(t_end) - 1.0e-10)
+        if curriculum_enabled and curriculum_phase_idx != last_curriculum_phase_idx:
+            print(
+                f"    🧭 Curriculum interne phase {curriculum_phase_idx + 1}/"
+                f"{len(internal_curriculum_fractions(cfg_dict))} | "
+                f"fraction={curriculum_fraction:.2f} | t_end_actif={active_t_end:.4f}"
+            )
+            last_curriculum_phase_idx = curriculum_phase_idx
+
         model.train()
         optimizer.zero_grad(set_to_none=True)
-        losses = compute_stage_loss_components(model, cfg_dict, t_start, t_end, device, teacher_model=teacher_model)
+        losses = compute_stage_loss_components(model, cfg_dict, t_start, active_t_end, device, teacher_model=teacher_model)
 
         with torch.no_grad():
             if loss_pde_ema is None:
@@ -566,8 +634,8 @@ def train_one_stage(
             _, stage_score = run_audit(
                 model,
                 cfg_dict,
-                t_end,
-                threshold=current_target,
+                active_t_end,
+                threshold=active_target,
                 n_global=audit_cases,
                 verbose=False,
                 historical=False,
@@ -584,40 +652,45 @@ def train_one_stage(
                     stage_idx,
                     cfg_dict,
                     device,
+                    t_end_override=active_t_end,
                 )
                 selection_score = historical_selection_score(cfg_dict, hist_stats)
                 print(
-                    f"    📏 stage_score(t={t_end:.2f})={final_score:.3%} "
+                    f"    📏 stage_score(t={active_t_end:.2f})={final_score:.3%} "
                     f"| hist_mean={hist_stats['mean_rel_l2']:.3%} "
                     f"| hist_max={hist_stats['max_rel_l2']:.3%} "
                     f"| hist_final={hist_stats['final_rel_l2']:.3%}"
                 )
             else:
-                print(f"    📏 stage_score(t={t_end:.2f})={final_score:.3%}")
+                print(f"    📏 stage_score(t={active_t_end:.2f})={final_score:.3%}")
             save_stage_checkpoint(model, optimizer, iteration, best_score, stage_dir, "model_latest.pth")
 
-            improved = selection_score < best_score
+            improved = can_select_best and selection_score < best_score
             if improved or not np.isfinite(best_score):
-                best_score = selection_score
-                best_stage_score = final_score
-                best_hist_stats = dict(hist_stats) if hist_stats is not None else None
-                best_metrics = {
-                    "loss_pde": float(losses["loss_pde"].detach().item()),
-                    "loss_bc": float(losses["loss_bc"].detach().item()),
-                    "loss_mass": float(losses["loss_mass"].detach().item()),
-                    "loss_continuity": float(losses["loss_continuity"].detach().item()),
-                }
-                if best_hist_stats is not None:
-                    best_metrics["historical_mean_rel_l2"] = float(best_hist_stats["mean_rel_l2"])
-                    best_metrics["historical_max_rel_l2"] = float(best_hist_stats["max_rel_l2"])
-                    best_metrics["historical_final_rel_l2"] = float(best_hist_stats["final_rel_l2"])
-                save_stage_checkpoint(model, optimizer, iteration, best_score, stage_dir, "model_best.pth")
-                plateau_count = 0
-                print(f"    ✅ Nouveau meilleur score de selection : {best_score:.3%}")
+                if can_select_best:
+                    best_score = selection_score
+                    best_stage_score = final_score
+                    best_hist_stats = dict(hist_stats) if hist_stats is not None else None
+                    best_metrics = {
+                        "loss_pde": float(losses["loss_pde"].detach().item()),
+                        "loss_bc": float(losses["loss_bc"].detach().item()),
+                        "loss_mass": float(losses["loss_mass"].detach().item()),
+                        "loss_continuity": float(losses["loss_continuity"].detach().item()),
+                    }
+                    if best_hist_stats is not None:
+                        best_metrics["historical_mean_rel_l2"] = float(best_hist_stats["mean_rel_l2"])
+                        best_metrics["historical_max_rel_l2"] = float(best_hist_stats["max_rel_l2"])
+                        best_metrics["historical_final_rel_l2"] = float(best_hist_stats["final_rel_l2"])
+                    save_stage_checkpoint(model, optimizer, iteration, best_score, stage_dir, "model_best.pth")
+                    plateau_count = 0
+                    print(f"    ✅ Nouveau meilleur score de selection : {best_score:.3%}")
+                else:
+                    print("    ℹ️ Audit curriculum hors intervalle final : checkpoint non eligible comme best final.")
             else:
-                plateau_count += 1
+                if can_select_best:
+                    plateau_count += 1
 
-            local_target_ok = final_score < current_target
+            local_target_ok = can_select_best and final_score < active_target
             hist_target_ok = True
             hist_max_ok = True
             if hist_stats is not None:
@@ -669,6 +742,7 @@ def train_one_stage(
             stage_idx,
             cfg_dict,
             device,
+            t_end_override=t_end,
         )
     save_stage_checkpoint(model, optimizer, iteration, best_score, stage_dir, "model_final.pth")
     with open(os.path.join(stage_dir, "stage_summary.json"), "w", encoding="utf-8") as handle:

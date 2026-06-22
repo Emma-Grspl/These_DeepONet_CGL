@@ -26,6 +26,62 @@ def _params_dict_from_branch(branch):
     return {"alpha": branch[:, 0:1], "beta": branch[:, 1:2], "mu": branch[:, 2:3], "V": branch[:, 3:4]}
 
 
+def _spatial_sampling_cfg(cfg):
+    training = cfg['training'] if isinstance(cfg, dict) else cfg.training
+    sampling = training.get('spatial_sampling', {}) if isinstance(training, dict) else {}
+    return {
+        'gaussian_fraction': float(sampling.get('gaussian_fraction', sampling.get('center_fraction', 0.8))),
+        'core_fraction': float(sampling.get('core_fraction', 0.0)),
+        'core_bounds': sampling.get('core_bounds', [-10.0, 10.0]),
+        'gaussian_scale': float(sampling.get('gaussian_scale', 1.5)),
+    }
+
+
+def _sample_spatial_points_from_branch(branch, t, cfg, device):
+    x_min, x_max = cfg['physics']['x_domain'] if isinstance(cfg, dict) else cfg.physics['x_domain']
+    sampling = _spatial_sampling_cfg(cfg)
+    n_samples = branch.shape[0]
+    if n_samples <= 0:
+        return torch.empty((0, 1), device=device)
+
+    gaussian_fraction = max(0.0, sampling['gaussian_fraction'])
+    core_fraction = max(0.0, sampling['core_fraction'])
+    if gaussian_fraction + core_fraction > 1.0:
+        total = gaussian_fraction + core_fraction
+        gaussian_fraction /= total
+        core_fraction /= total
+
+    n_gaussian = int(round(n_samples * gaussian_fraction))
+    n_core = int(round(n_samples * core_fraction))
+    if n_gaussian + n_core > n_samples:
+        n_core = max(0, n_samples - n_gaussian)
+    n_global = n_samples - n_gaussian - n_core
+
+    chunks = []
+    cursor = 0
+    if n_gaussian > 0:
+        branch_g = branch[cursor: cursor + n_gaussian]
+        t_g = t[cursor: cursor + n_gaussian]
+        w0 = branch_g[:, 5:6]
+        x0 = branch_g[:, 6:7]
+        W_t = w0 * torch.sqrt(1.0 + (2.0 * t_g) ** 2)
+        chunks.append(x0 + torch.randn(n_gaussian, 1, device=device) * W_t * sampling['gaussian_scale'])
+        cursor += n_gaussian
+
+    if n_core > 0:
+        core_min, core_max = sampling['core_bounds']
+        core_min = max(float(x_min), float(core_min))
+        core_max = min(float(x_max), float(core_max))
+        chunks.append(torch.rand(n_core, 1, device=device) * (core_max - core_min) + core_min)
+        cursor += n_core
+
+    if n_global > 0:
+        chunks.append(torch.rand(n_global, 1, device=device) * (float(x_max) - float(x_min)) + float(x_min))
+
+    x = torch.cat(chunks, dim=0)
+    return torch.clamp(x, float(x_min), float(x_max))
+
+
 def _sample_causal_times(n_samples, device, t_prev, t_curr):
     if t_prev <= 1e-5:
         return torch.rand(n_samples, 1, device=device) * t_curr
@@ -37,18 +93,9 @@ def _sample_causal_times(n_samples, device, t_prev, t_curr):
 
 
 def _sample_coords_from_branch(branch, cfg, device, t_prev, t_curr):
-    x_min, x_max = cfg['physics']['x_domain'] if isinstance(cfg, dict) else cfg.physics['x_domain']
     n_samples = branch.shape[0]
-    w0 = branch[:, 5:6]
-    x0 = branch[:, 6:7]
     t = _sample_causal_times(n_samples, device, t_prev, t_curr)
-
-    n_center = int(0.8 * n_samples)
-    W_t = w0[:n_center] * torch.sqrt(1.0 + (2.0 * t[:n_center])**2)
-    x_center = x0[:n_center] + torch.randn(n_center, 1, device=device) * W_t * 1.5
-    x_uniform = torch.rand(n_samples - n_center, 1, device=device) * (x_max - x_min) + x_min
-    x = torch.cat([x_center, x_uniform], dim=0)
-    x = torch.clamp(x, x_min, x_max)
+    x = _sample_spatial_points_from_branch(branch, t, cfg, device)
 
     idx = torch.randperm(n_samples, device=device)
     branch, x, t = branch[idx], x[idx], t[idx]
@@ -158,29 +205,18 @@ def get_pde_batch_cgle_causal_mixed(n_samples, cfg, device, t_prev, t_curr, case
 def get_pde_batch_cgle_global(n_samples, cfg, device, t_max_local):
     """
     Générateur PDE Global (Uniforme sur tout [0, t_max_local]).
-    Avec Focus Spatial Dynamique adapté au temps.
+    Avec focus spatial dynamique configurable.
     """
-    x_min, x_max = cfg['physics']['x_domain'] if isinstance(cfg, dict) else cfg.physics['x_domain']
     branch = _sample_cgl_branch(n_samples, cfg, device)
-    w0 = branch[:, 5:6]
-    x0 = branch[:, 6:7]
 
     # 3. Échantillonnage Temporel Uniforme D'ABORD
     t = torch.rand(n_samples, 1, device=device) * t_max_local
 
-    # 4. Échantillonnage Spatial Focus DYNAMIQUE (80% centre)
-    n_center = int(0.8 * n_samples)
-    
-    W_t = w0[:n_center] * torch.sqrt(1.0 + (2.0 * t[:n_center])**2)
-    
-    x_center = x0[:n_center] + torch.randn(n_center, 1, device=device) * W_t * 1.5
-    x_uniform = torch.rand(n_samples - n_center, 1, device=device) * (x_max - x_min) + x_min
-    
-    x = torch.cat([x_center, x_uniform], dim=0)
-    x = torch.clamp(x, x_min, x_max)
+    # 4. Échantillonnage spatial : gaussienne dynamique + coeur + domaine global.
+    x = _sample_spatial_points_from_branch(branch, t, cfg, device)
 
     # 5. Shuffle final
-    idx = torch.randperm(n_samples)
+    idx = torch.randperm(n_samples, device=device)
     branch, x, t = branch[idx], x[idx], t[idx]
 
     coords = torch.cat([x, t], dim=1).requires_grad_(True)
@@ -189,21 +225,11 @@ def get_pde_batch_cgle_global(n_samples, cfg, device, t_max_local):
 
 def get_interface_batch_cgle(n_samples, cfg, device, t_value):
     """Batch pour les pertes intégrales et la continuité causale à temps fixé."""
-    x_min, x_max = cfg['physics']['x_domain'] if isinstance(cfg, dict) else cfg.physics['x_domain']
     t_tensor = torch.tensor(float(t_value), device=device)
 
     branch = _sample_cgl_branch(n_samples, cfg, device)
-    w0 = branch[:, 5:6]
-    x0 = branch[:, 6:7]
-
-    W_t = w0 * torch.sqrt(1.0 + (2.0 * t_tensor) ** 2)
-    n_center = int(0.8 * n_samples)
-    x_center = x0[:n_center] + torch.randn(n_center, 1, device=device) * W_t[:n_center] * 1.5
-    x_uniform = torch.rand(n_samples - n_center, 1, device=device) * (x_max - x_min) + x_min
-    x = torch.cat([x_center, x_uniform], dim=0)
-    x = torch.clamp(x, x_min, x_max)
-
     t = torch.full((n_samples, 1), float(t_value), device=device)
+    x = _sample_spatial_points_from_branch(branch, t, cfg, device)
     idx = torch.randperm(n_samples, device=device)
     branch = branch[idx]
     coords = torch.cat([x[idx], t[idx]], dim=1).requires_grad_(True)
