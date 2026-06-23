@@ -186,8 +186,13 @@ def load_time_blocks(cfg_dict):
     return [tuple(map(float, block)) for block in cfg_dict["multinet"]["time_blocks"]]
 
 
-def rebuild_state_bank_each_stage(cfg_dict):
-    return bool(cfg_dict["multinet"].get("rebuild_state_bank_each_stage", False))
+def rebuild_state_bank_each_stage(cfg_dict, pass_idx=None):
+    multinet_cfg = cfg_dict["multinet"]
+    pass_list = multinet_cfg.get("rebuild_state_bank_passes")
+    if pass_list is not None and pass_idx is not None:
+        allowed = {int(v) for v in pass_list}
+        return int(pass_idx) in allowed
+    return bool(multinet_cfg.get("rebuild_state_bank_each_stage", False))
 
 
 def rollout_validation_cfg(cfg_dict):
@@ -216,6 +221,36 @@ def rollout_tie_tolerance_rel(cfg_dict):
 
 def rollout_rollback_on_reject(cfg_dict):
     return bool(rollout_validation_cfg(cfg_dict).get("rollback_on_reject", True))
+
+
+def stage_rollout_audit_cfg(cfg_dict):
+    return dict(cfg_dict["multinet"].get("stage_rollout_audit", {}))
+
+
+def stage_rollout_audit_enabled(cfg_dict):
+    return bool(stage_rollout_audit_cfg(cfg_dict).get("enabled", False))
+
+
+def stage_rollout_audit_mode(cfg_dict):
+    return str(stage_rollout_audit_cfg(cfg_dict).get("mode", default_rollout_mode(cfg_dict)))
+
+
+def stage_rollout_audit_time_stride(cfg_dict):
+    return max(1, int(stage_rollout_audit_cfg(cfg_dict).get("time_stride", 1)))
+
+
+def stage_rollout_audit_metric(cfg_dict):
+    return str(stage_rollout_audit_cfg(cfg_dict).get("selection_metric", "tail_guard"))
+
+
+def stage_rollout_audit_weights(cfg_dict):
+    raw = stage_rollout_audit_cfg(cfg_dict).get("selection_weights", {})
+    return {
+        "max": float(raw.get("max", 1.0)),
+        "final": float(raw.get("final", 0.35)),
+        "mean": float(raw.get("mean", 0.10)),
+        "center_max": float(raw.get("center_max", 0.25)),
+    }
 
 
 def rollout_cfg(cfg_dict):
@@ -665,18 +700,18 @@ def compute_proxy_loss(model, block_entries, overlap_entries, teacher_models, cf
     return float(np.mean(values)), {key: float(np.mean(vals)) for key, vals in components.items()}
 
 
-def save_stage_checkpoint(model, optimizer, iteration, best_proxy, stage_dir, name):
+def save_stage_checkpoint(model, optimizer, iteration, best_proxy, stage_dir, name, extra_state=None):
     ckpt_dir = os.path.join(stage_dir, "checkpoints")
     os.makedirs(ckpt_dir, exist_ok=True)
-    atomic_torch_save(
-        {
-            "model_state": model.state_dict(),
-            "optimizer_state": optimizer.state_dict(),
-            "iteration": int(iteration),
-            "best_proxy": float(best_proxy),
-        },
-        os.path.join(ckpt_dir, name),
-    )
+    payload = {
+        "model_state": model.state_dict(),
+        "optimizer_state": optimizer.state_dict(),
+        "iteration": int(iteration),
+        "best_proxy": float(best_proxy),
+    }
+    if extra_state:
+        payload.update(extra_state)
+    atomic_torch_save(payload, os.path.join(ckpt_dir, name))
 
 
 def persist_models_to_stage_dirs(models, optimizers, time_blocks, run_dir):
@@ -689,11 +724,11 @@ def persist_models_to_stage_dirs(models, optimizers, time_blocks, run_dir):
 def load_stage_checkpoint_if_available(model, optimizer, stage_dir, device):
     ckpt_path = os.path.join(stage_dir, "checkpoints", "model_latest.pth")
     if not os.path.exists(ckpt_path):
-        return 0, float("inf")
+        return 0, float("inf"), {}
     ckpt = torch.load(ckpt_path, map_location=device)
     model.load_state_dict(ckpt["model_state"], strict=True)
     optimizer.load_state_dict(ckpt["optimizer_state"])
-    return int(ckpt.get("iteration", 0)), float(ckpt.get("best_proxy", float("inf")))
+    return int(ckpt.get("iteration", 0)), float(ckpt.get("best_proxy", float("inf"))), dict(ckpt)
 
 
 def load_model_state_only(model, path, device):
@@ -751,6 +786,19 @@ def metric_value(metrics, metric_name):
     if value is None or not np.isfinite(float(value)):
         return float("inf")
     return float(value)
+
+
+def stage_rollout_audit_selection_score(cfg_dict, metrics):
+    metric_name = stage_rollout_audit_metric(cfg_dict)
+    if metric_name != "tail_guard":
+        return metric_value(metrics, metric_name)
+    weights = stage_rollout_audit_weights(cfg_dict)
+    return (
+        weights["max"] * metric_value(metrics, "max_rel_l2")
+        + weights["final"] * metric_value(metrics, "final_rel_l2")
+        + weights["mean"] * metric_value(metrics, "mean_rel_l2")
+        + weights["center_max"] * metric_value(metrics, "max_rel_l2_center")
+    )
 
 
 def is_pass_improved(candidate_metrics, best_metrics, cfg_dict):
@@ -818,6 +866,15 @@ def active_stage_indices(time_blocks, t_current):
     return active
 
 
+def limit_active_stage_indices(active_indices, max_stage_idx):
+    if max_stage_idx is None:
+        return list(active_indices)
+    filtered = [idx for idx in active_indices if idx <= int(max_stage_idx)]
+    if filtered:
+        return filtered
+    return [max(0, int(max_stage_idx))]
+
+
 def blend_weights_for_time(time_blocks, active_indices, t_current):
     if len(active_indices) == 1:
         return {active_indices[0]: 1.0}
@@ -882,9 +939,10 @@ def predict_blended_window(
     t_current,
     device,
     mode=None,
+    max_stage_idx=None,
 ):
     mode = default_rollout_mode(cfg_dict) if mode is None else str(mode)
-    active = active_stage_indices(time_blocks, t_current)
+    active = limit_active_stage_indices(active_stage_indices(time_blocks, t_current), max_stage_idx)
     if mode == "hard_switch":
         idx = hard_switch_stage_index(time_blocks, active, t_current)
         return predict_local_field(models[idx], cfg_dict, params, sensor_state, x_query, local_times, window_dt, device)
@@ -971,7 +1029,25 @@ def build_overlap_entries(state_bank, time_blocks, stage_idx):
     return list(unique.values()), sorted(set(neighbors))
 
 
-def train_one_stage(model, optimizer, block_entries, overlap_entries, teacher_models, cfg_dict, params, x_sensor, periodic, stage_dir, device, pass_idx=0):
+def train_one_stage(
+    model,
+    optimizer,
+    block_entries,
+    overlap_entries,
+    teacher_models,
+    cfg_dict,
+    params,
+    x_sensor,
+    periodic,
+    stage_dir,
+    device,
+    pass_idx=0,
+    models=None,
+    stage_idx=None,
+    time_blocks=None,
+    initial_sensor=None,
+    reference=None,
+):
     train_cfg = cfg_dict["training"]
     window_dt = float(cfg_dict["local_physics"]["window_dt"])
     max_iters = int(train_cfg["stage_num_iters"])
@@ -980,10 +1056,19 @@ def train_one_stage(model, optimizer, block_entries, overlap_entries, teacher_mo
     snapshot_every = int(train_cfg["snapshot_every"])
     grad_clip = float(train_cfg["grad_clip"])
     early_cfg = train_cfg.get("early_stop", {})
+    audit_enabled = (
+        stage_rollout_audit_enabled(cfg_dict)
+        and models is not None
+        and stage_idx is not None
+        and time_blocks is not None
+        and initial_sensor is not None
+        and reference is not None
+    )
 
-    start_iter, best_proxy = load_stage_checkpoint_if_available(model, optimizer, stage_dir, device)
+    start_iter, best_proxy, resume_state = load_stage_checkpoint_if_available(model, optimizer, stage_dir, device)
     patience_count = 0
     stage_start_perf = time.perf_counter()
+    best_selection_score = float(resume_state.get("best_selection_score", best_proxy))
     best_proxy_components = {
         "pde": float("nan"),
         "bc": float("nan"),
@@ -991,6 +1076,7 @@ def train_one_stage(model, optimizer, block_entries, overlap_entries, teacher_mo
         "overlap": float("nan"),
         "multistep": float("nan"),
     }
+    best_stage_audit_metrics = dict(resume_state.get("best_stage_audit_metrics", {}))
     iteration = start_iter
 
     print(
@@ -1041,19 +1127,69 @@ def train_one_stage(model, optimizer, block_entries, overlap_entries, teacher_mo
                 device,
                 pass_idx=pass_idx,
             )
+            selection_score = float(proxy)
+            stage_audit_metrics = None
+            if audit_enabled:
+                stage_audit_metrics = evaluate_stage_rollout_audit(
+                    models,
+                    int(stage_idx),
+                    time_blocks,
+                    cfg_dict,
+                    params,
+                    initial_sensor,
+                    x_sensor,
+                    reference,
+                    device,
+                )
+                selection_score = stage_rollout_audit_selection_score(cfg_dict, stage_audit_metrics)
             print(
                 f"    📏 proxy={proxy:.3e} | pde={proxy_components['pde']:.3e} | bc={proxy_components['bc']:.3e} "
                 f"| ic={proxy_components['ic']:.3e} | overlap={proxy_components['overlap']:.3e} "
                 f"| multistep={proxy_components['multistep']:.3e}"
             )
-            save_stage_checkpoint(model, optimizer, iteration, best_proxy, stage_dir, "model_latest.pth")
-            improved = proxy < best_proxy * (1.0 - float(early_cfg.get("min_delta", 0.01))) or not np.isfinite(best_proxy)
+            if stage_audit_metrics is not None:
+                print(
+                    f"    🎯 audit_stage(t={stage_audit_metrics['t_stop']:.2f}) "
+                    f"| final={stage_audit_metrics['final_rel_l2']:.3%} "
+                    f"| max={stage_audit_metrics['max_rel_l2']:.3%} "
+                    f"| max_center={stage_audit_metrics['max_rel_l2_center']:.3%} "
+                    f"| score={selection_score:.3e}"
+                )
+            save_stage_checkpoint(
+                model,
+                optimizer,
+                iteration,
+                best_proxy,
+                stage_dir,
+                "model_latest.pth",
+                extra_state={
+                    "best_selection_score": float(best_selection_score),
+                    "best_stage_audit_metrics": dict(best_stage_audit_metrics),
+                },
+            )
+            improved = selection_score < best_selection_score * (1.0 - float(early_cfg.get("min_delta", 0.01))) or not np.isfinite(best_selection_score)
             if improved:
+                best_selection_score = float(selection_score)
                 best_proxy = proxy
                 best_proxy_components = dict(proxy_components)
-                save_stage_checkpoint(model, optimizer, iteration, best_proxy, stage_dir, "model_best.pth")
+                best_stage_audit_metrics = {} if stage_audit_metrics is None else dict(stage_audit_metrics)
+                save_stage_checkpoint(
+                    model,
+                    optimizer,
+                    iteration,
+                    best_proxy,
+                    stage_dir,
+                    "model_best.pth",
+                    extra_state={
+                        "best_selection_score": float(best_selection_score),
+                        "best_stage_audit_metrics": dict(best_stage_audit_metrics),
+                    },
+                )
                 patience_count = 0
-                print(f"    ✅ Nouveau meilleur proxy : {best_proxy:.3e}")
+                if stage_audit_metrics is not None:
+                    print(f"    ✅ Nouveau meilleur audit stage : {best_selection_score:.3e}")
+                else:
+                    print(f"    ✅ Nouveau meilleur proxy : {best_proxy:.3e}")
             else:
                 patience_count += 1
 
@@ -1066,19 +1202,59 @@ def train_one_stage(model, optimizer, block_entries, overlap_entries, teacher_mo
                 break
 
         if iteration % snapshot_every == 0:
-            save_stage_checkpoint(model, optimizer, iteration, best_proxy, stage_dir, f"ckpt_iter_{iteration:06d}.pth")
+            save_stage_checkpoint(
+                model,
+                optimizer,
+                iteration,
+                best_proxy,
+                stage_dir,
+                f"ckpt_iter_{iteration:06d}.pth",
+                extra_state={
+                    "best_selection_score": float(best_selection_score),
+                    "best_stage_audit_metrics": dict(best_stage_audit_metrics),
+                },
+            )
 
     best_path = os.path.join(stage_dir, "checkpoints", "model_best.pth")
     if os.path.exists(best_path):
         best_ckpt = torch.load(best_path, map_location=device)
         model.load_state_dict(best_ckpt["model_state"], strict=True)
 
-    save_stage_checkpoint(model, optimizer, iteration, best_proxy, stage_dir, "model_final.pth")
+    final_stage_audit_metrics = None
+    if audit_enabled:
+        final_stage_audit_metrics = evaluate_stage_rollout_audit(
+            models,
+            int(stage_idx),
+            time_blocks,
+            cfg_dict,
+            params,
+            initial_sensor,
+            x_sensor,
+            reference,
+            device,
+        )
+
+    save_stage_checkpoint(
+        model,
+        optimizer,
+        iteration,
+        best_proxy,
+        stage_dir,
+        "model_final.pth",
+        extra_state={
+            "best_selection_score": float(best_selection_score),
+            "best_stage_audit_metrics": dict(best_stage_audit_metrics),
+            "final_stage_audit_metrics": {} if final_stage_audit_metrics is None else dict(final_stage_audit_metrics),
+        },
+    )
     with open(os.path.join(stage_dir, "stage_summary.json"), "w", encoding="utf-8") as handle:
         json.dump(
             {
                 "best_proxy": float(best_proxy),
+                "best_selection_score": float(best_selection_score),
                 "best_proxy_components": best_proxy_components,
+                "best_stage_audit_metrics": best_stage_audit_metrics,
+                "final_stage_audit_metrics": final_stage_audit_metrics,
                 "completed_iters": int(iteration),
                 "block_entries": int(len(block_entries)),
                 "overlap_entries": int(len(overlap_entries)),
@@ -1089,6 +1265,7 @@ def train_one_stage(model, optimizer, block_entries, overlap_entries, teacher_mo
         )
     return {
         "best_proxy": float(best_proxy),
+        "best_selection_score": float(best_selection_score),
         "wall_seconds": max(0.0, time.perf_counter() - stage_start_perf),
     }
 
@@ -1141,16 +1318,17 @@ def relative_l2_curve(u_pred, u_true):
     return rel_l2
 
 
-def rollout_multinet(models, time_blocks, cfg_dict, params, initial_sensor, x_sensor, x_eval, t_eval, device, mode=None):
+def rollout_multinet(models, time_blocks, cfg_dict, params, initial_sensor, x_sensor, x_eval, t_eval, device, mode=None, t_stop=None, max_stage_idx=None):
     window_dt = float(cfg_dict["local_physics"]["window_dt"])
     mode = default_rollout_mode(cfg_dict) if mode is None else str(mode)
+    t_stop = float(cfg_dict["physics"]["t_max"] if t_stop is None else t_stop)
     u_pred = np.zeros((len(x_eval), len(t_eval)), dtype=np.complex64)
     current_sensor = initial_sensor.astype(np.complex64)
     current_t = 0.0
 
-    while current_t < float(cfg_dict["physics"]["t_max"]) - 1.0e-10:
-        step_end = min(current_t + window_dt, float(cfg_dict["physics"]["t_max"]))
-        if step_end >= float(cfg_dict["physics"]["t_max"]) - 1.0e-10:
+    while current_t < t_stop - 1.0e-10:
+        step_end = min(current_t + window_dt, t_stop)
+        if step_end >= t_stop - 1.0e-10:
             mask = (t_eval >= current_t - 1.0e-10) & (t_eval <= step_end + 1.0e-10)
         else:
             mask = (t_eval >= current_t - 1.0e-10) & (t_eval < step_end - 1.0e-10)
@@ -1168,6 +1346,7 @@ def rollout_multinet(models, time_blocks, cfg_dict, params, initial_sensor, x_se
                 current_t,
                 device,
                 mode=mode,
+                max_stage_idx=max_stage_idx,
             )
         next_sensor = predict_blended_window(
             models,
@@ -1181,11 +1360,61 @@ def rollout_multinet(models, time_blocks, cfg_dict, params, initial_sensor, x_se
             current_t,
             device,
             mode=mode,
+            max_stage_idx=max_stage_idx,
         )[:, 0]
         current_sensor = next_sensor.astype(np.complex64)
         current_t = round(current_t + window_dt, 10)
 
     return u_pred
+
+
+def stage_audit_reference_subset(reference, t_stop, time_stride):
+    indices = np.flatnonzero(reference["t"] <= float(t_stop) + 1.0e-10)
+    if len(indices) == 0:
+        indices = np.asarray([0], dtype=np.int64)
+    stride = max(1, int(time_stride))
+    if stride > 1 and len(indices) > 2:
+        sampled = indices[::stride]
+        if sampled[-1] != indices[-1]:
+            sampled = np.concatenate([sampled, indices[-1:]], axis=0)
+        indices = sampled
+    return {
+        "x": reference["x"],
+        "t": reference["t"][indices],
+        "u": reference["u"][:, indices],
+    }
+
+
+def evaluate_stage_rollout_audit(models, stage_idx, time_blocks, cfg_dict, params, initial_sensor, x_sensor, reference, device):
+    t_stop = float(time_blocks[stage_idx][1])
+    ref_view = stage_audit_reference_subset(reference, t_stop, stage_rollout_audit_time_stride(cfg_dict))
+    u_pred = rollout_multinet(
+        models,
+        time_blocks,
+        cfg_dict,
+        params,
+        initial_sensor,
+        x_sensor,
+        ref_view["x"],
+        ref_view["t"],
+        device,
+        mode=stage_rollout_audit_mode(cfg_dict),
+        t_stop=t_stop,
+        max_stage_idx=stage_idx,
+    )
+    rel_l2 = relative_l2_curve(u_pred, ref_view["u"])
+    center_mask = spatial_mask_from_bounds(ref_view["x"], -10.0, 10.0)
+    rel_l2_center = relative_l2_curve_on_mask(u_pred, ref_view["u"], center_mask)
+    return {
+        "t_stop": float(t_stop),
+        "final_rel_l2": float(rel_l2[-1]),
+        "max_rel_l2": float(np.max(rel_l2)),
+        "mean_rel_l2": float(np.mean(rel_l2)),
+        "final_rel_l2_center": float(rel_l2_center[-1]),
+        "max_rel_l2_center": float(np.max(rel_l2_center)),
+        "mean_rel_l2_center": float(np.mean(rel_l2_center)),
+        "first_t_gt_5pct": _first_above_threshold(ref_view["t"], rel_l2, 0.05),
+    }
 
 
 def save_one_step_metrics(models, time_blocks, cfg_dict, params, x_sensor, reference, eval_dir, device, mode):
@@ -1417,6 +1646,9 @@ def main():
     params, periodic, x_sensor, u0_sensor = fixed_case_setup(cfg_dict)
     time_blocks = load_time_blocks(cfg_dict)
     max_passes = int(cfg_dict["multinet"]["max_passes"])
+    reference = None
+    if stage_rollout_audit_enabled(cfg_dict):
+        reference = prepare_reference_trajectory(cfg_dict, nx_override=int(cfg_dict["evaluation"].get("solver_nx", 256)))
     history_rows = []
     next_pass_idx = 0
     next_stage_idx = 0
@@ -1452,7 +1684,8 @@ def main():
     print(f"📂 Run dir : {run_dir}")
     print(f"🧾 Config : {args.config}")
     print(
-        f"🧭 Protocol local multinet | rebuild_each_stage={rebuild_state_bank_each_stage(cfg_dict)} "
+        f"🧭 Protocol local multinet | rebuild_each_stage_pass0={rebuild_state_bank_each_stage(cfg_dict, 0)} "
+        f"| stage_rollout_audit={stage_rollout_audit_enabled(cfg_dict)} "
         f"| rollout_validation={rollout_validation_enabled(cfg_dict)} "
         f"| rollout_mode={default_rollout_mode(cfg_dict)} "
         f"| state_bank_mode={state_bank_rollout_mode(cfg_dict)}"
@@ -1504,6 +1737,11 @@ def main():
                     stage_dir,
                     device,
                     pass_idx=pass_idx,
+                    models=models,
+                    stage_idx=stage_idx,
+                    time_blocks=time_blocks,
+                    initial_sensor=u0_sensor,
+                    reference=reference,
                 )
                 history_rows.append(
                     {
@@ -1515,7 +1753,7 @@ def main():
                     }
                 )
                 save_stage_manifest(run_dir, history_rows)
-                if rebuild_state_bank_each_stage(cfg_dict):
+                if rebuild_state_bank_each_stage(cfg_dict, pass_idx):
                     state_bank = build_state_bank(models, time_blocks, cfg_dict, params, u0_sensor, x_sensor, device)
                     save_state_bank(state_bank_path, state_bank)
                 save_run_state(
