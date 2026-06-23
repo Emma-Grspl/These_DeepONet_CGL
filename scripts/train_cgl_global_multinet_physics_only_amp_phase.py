@@ -14,7 +14,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_DIR = os.path.dirname(SCRIPT_DIR)
 sys.path.insert(0, PROJECT_DIR)
 
-from src.data.generators import get_pde_batch_cgle_global
+from src.data.generators import get_interface_batch_cgle, get_pde_batch_cgle_global
 from src.models.cgl_deeponet_amp_phase import CGL_PI_DeepONet_AmpPhase
 from src.physics.pde_cgl import pde_residual_cgle
 from src.plot import postprocess_single_case as single_case_postprocess
@@ -326,9 +326,23 @@ def stage_historical_max_target(cfg_dict, stage_idx):
     return None if value is None else float(value)
 
 
+def stage_requires_target_pass(cfg_dict):
+    return bool(cfg_dict["multistage_training"].get("require_stage_targets_to_advance", True))
+
+
 def historical_selection_metric(cfg_dict):
     hist_cfg = historical_validation_cfg(cfg_dict)
-    return str(hist_cfg.get("selection_metric", "historical_mean_rel_l2"))
+    return str(hist_cfg.get("selection_metric", "historical_tail_guard"))
+
+
+def historical_selection_weights(cfg_dict):
+    hist_cfg = historical_validation_cfg(cfg_dict)
+    raw = hist_cfg.get("selection_weights", {})
+    return {
+        "max": float(raw.get("max", 1.0)),
+        "final": float(raw.get("final", 0.35)),
+        "mean": float(raw.get("mean", 0.10)),
+    }
 
 
 def historical_selection_score(cfg_dict, hist_stats):
@@ -337,7 +351,26 @@ def historical_selection_score(cfg_dict, hist_stats):
         return float(hist_stats["max_rel_l2"])
     if metric_name == "historical_final_rel_l2":
         return float(hist_stats["final_rel_l2"])
+    if metric_name in {"historical_tail_guard", "historical_weighted_tail"}:
+        weights = historical_selection_weights(cfg_dict)
+        return (
+            weights["max"] * float(hist_stats["max_rel_l2"])
+            + weights["final"] * float(hist_stats["final_rel_l2"])
+            + weights["mean"] * float(hist_stats["mean_rel_l2"])
+        )
     return float(hist_stats["mean_rel_l2"])
+
+
+def stage_targets_met(cfg_dict, can_select_best, stage_score, hist_stats, active_target, hist_target, hist_max_target):
+    local_target_ok = can_select_best and stage_score < active_target
+    hist_target_ok = True
+    hist_max_ok = True
+    if hist_stats is not None:
+        hist_target_ok = hist_stats["mean_rel_l2"] < hist_target
+        hist_cfg = historical_validation_cfg(cfg_dict)
+        if hist_max_target is not None and bool(hist_cfg.get("require_max_target", True)):
+            hist_max_ok = hist_stats["max_rel_l2"] < hist_max_target
+    return local_target_ok, hist_target_ok, hist_max_ok
 
 
 def slice_reference_trajectory(reference, t_end, time_stride=1):
@@ -408,6 +441,49 @@ def sample_stage_pde_batch(n_samples, cfg_dict, device, t_start, t_end):
     return branch, coords, params_dict
 
 
+def compute_stage_continuity_loss(model, teacher_model, cfg_dict, device, t_start, t_end, loss_cfg):
+    if teacher_model is None or float(t_start) <= 1.0e-8:
+        return torch.tensor(0.0, device=device)
+
+    mode = str(loss_cfg.get("continuity_mode", "window_overlap")).strip().lower()
+    if mode in {"point", "interface_point"}:
+        return _compute_continuity_loss(model, teacher_model, cfg_dict, device, t_start, loss_cfg)
+
+    stage_span = max(0.0, float(t_end) - float(t_start))
+    if stage_span <= 1.0e-10:
+        return _compute_continuity_loss(model, teacher_model, cfg_dict, device, t_start, loss_cfg)
+
+    frac = float(loss_cfg.get("continuity_window_fraction", 0.35))
+    window = stage_span * frac
+    window = max(window, float(loss_cfg.get("continuity_window_min", min(0.05, stage_span))))
+    max_window = loss_cfg.get("continuity_window_max")
+    if max_window is not None:
+        window = min(window, float(max_window))
+    overlap_end = min(float(t_end), float(t_start) + window)
+    if overlap_end <= float(t_start) + 1.0e-10:
+        return _compute_continuity_loss(model, teacher_model, cfg_dict, device, t_start, loss_cfg)
+
+    n_times = max(2, int(loss_cfg.get("continuity_window_points", 4)))
+    batch_size = max(1, int(loss_cfg.get("continuity_batch_size", 2048)))
+    batch_per_time = max(1, batch_size // n_times)
+    weights = torch.linspace(1.0, 1.5, steps=n_times, device=device)
+    loss_acc = torch.tensor(0.0, device=device)
+    weight_acc = torch.tensor(0.0, device=device)
+
+    for idx, t_value in enumerate(np.linspace(float(t_start), overlap_end, n_times)):
+        branch, coords, _ = get_interface_batch_cgle(batch_per_time, cfg_dict, device, float(t_value))
+        with torch.no_grad():
+            teacher_re, teacher_im = teacher_model(branch, coords.detach())
+        student_re, student_im = model(branch, coords)
+        diff_sq = (student_re - teacher_re) ** 2 + (student_im - teacher_im) ** 2
+        ref_sq = teacher_re ** 2 + teacher_im ** 2
+        sample_loss = torch.mean(diff_sq / (ref_sq + 1.0e-6))
+        loss_acc = loss_acc + weights[idx] * sample_loss
+        weight_acc = weight_acc + weights[idx]
+
+    return loss_acc / weight_acc.clamp_min(1.0e-12)
+
+
 def compute_stage_loss_components(model, cfg_dict, t_start, t_end, device, teacher_model=None):
     bs_pde = int(cfg_dict["training"]["batch_size_pde"])
     loss_cfg = _get_physics_loss_cfg(cfg_dict)
@@ -450,7 +526,7 @@ def compute_stage_loss_components(model, cfg_dict, t_start, t_end, device, teach
         + (grad_im_left - grad_im_right) ** 2
     )
     loss_mass = _compute_mass_balance_loss(model, cfg_dict, device, t_start, t_end, loss_cfg)
-    loss_continuity = _compute_continuity_loss(model, teacher_model, cfg_dict, device, t_start, loss_cfg)
+    loss_continuity = compute_stage_continuity_loss(model, teacher_model, cfg_dict, device, t_start, t_end, loss_cfg)
     aux_loss = loss_bc + float(loss_cfg["mass_weight"]) * loss_mass + float(loss_cfg["continuity_weight"]) * loss_continuity
     return {
         "loss_pde_abs": loss_pde_abs,
@@ -556,6 +632,7 @@ def train_one_stage(
     best_stage_score = float("inf")
     best_hist_stats = None
     final_hist_stats = None
+    stage_passed = False
     iteration = start_iter
     prefix_models = [] if prefix_models is None else list(prefix_models)
     curriculum_enabled = internal_curriculum_enabled(cfg_dict)
@@ -690,13 +767,15 @@ def train_one_stage(
                 if can_select_best:
                     plateau_count += 1
 
-            local_target_ok = can_select_best and final_score < active_target
-            hist_target_ok = True
-            hist_max_ok = True
-            if hist_stats is not None:
-                hist_target_ok = hist_stats["mean_rel_l2"] < hist_target
-                if hist_max_target is not None and bool(hist_cfg.get("require_max_target", True)):
-                    hist_max_ok = hist_stats["max_rel_l2"] < hist_max_target
+            local_target_ok, hist_target_ok, hist_max_ok = stage_targets_met(
+                cfg_dict,
+                can_select_best,
+                final_score,
+                hist_stats,
+                active_target,
+                hist_target,
+                hist_max_target,
+            )
             if local_target_ok and hist_target_ok and hist_max_ok:
                 if hist_stats is not None:
                     print(
@@ -744,6 +823,16 @@ def train_one_stage(
             device,
             t_end_override=t_end,
         )
+    final_local_ok, final_hist_mean_ok, final_hist_max_ok = stage_targets_met(
+        cfg_dict,
+        True,
+        final_score,
+        final_hist_stats,
+        target_error,
+        hist_target,
+        hist_max_target,
+    )
+    stage_passed = final_local_ok and final_hist_mean_ok and final_hist_max_ok
     save_stage_checkpoint(model, optimizer, iteration, best_score, stage_dir, "model_final.pth")
     with open(os.path.join(stage_dir, "stage_summary.json"), "w", encoding="utf-8") as handle:
         json.dump(
@@ -763,6 +852,10 @@ def train_one_stage(
                 "final_historical_max": None if final_hist_stats is None else float(final_hist_stats["max_rel_l2"]),
                 "final_historical_final": None if final_hist_stats is None else float(final_hist_stats["final_rel_l2"]),
                 "completed_iters": int(iteration),
+                "passed_targets": bool(stage_passed),
+                "final_local_target_ok": bool(final_local_ok),
+                "final_hist_mean_target_ok": bool(final_hist_mean_ok),
+                "final_hist_max_target_ok": bool(final_hist_max_ok),
                 "best_metrics": best_metrics,
             },
             handle,
@@ -778,6 +871,7 @@ def train_one_stage(
         "final_stage_score": float(final_score),
         "final_historical_mean": None if final_hist_stats is None else float(final_hist_stats["mean_rel_l2"]),
         "final_historical_max": None if final_hist_stats is None else float(final_hist_stats["max_rel_l2"]),
+        "passed_targets": bool(stage_passed),
         "wall_seconds": max(0.0, time.perf_counter() - stage_start_perf),
     }
 
@@ -844,7 +938,7 @@ def write_stage_manifest(run_dir, stage_rows):
     with open(path, "w", encoding="utf-8") as handle:
         handle.write(
             "stage_idx,t_start,t_end,best_score,final_score,best_historical_mean,"
-            "best_historical_max,final_historical_mean,final_historical_max,wall_seconds\n"
+            "best_historical_max,final_historical_mean,final_historical_max,passed_targets,wall_seconds\n"
         )
         for row in stage_rows:
             best_hist_mean = "" if row.get("best_historical_mean") is None else f"{float(row['best_historical_mean']):.10e}"
@@ -855,7 +949,7 @@ def write_stage_manifest(run_dir, stage_rows):
                 f"{int(row['stage_idx'])},{float(row['t_start']):.10f},{float(row['t_end']):.10f},"
                 f"{float(row['best_score']):.10e},{float(row['final_score']):.10e},"
                 f"{best_hist_mean},{best_hist_max},{final_hist_mean},{final_hist_max},"
-                f"{float(row['wall_seconds']):.6f}\n"
+                f"{int(bool(row.get('passed_targets', False)))},{float(row['wall_seconds']):.6f}\n"
             )
 
 
@@ -979,7 +1073,12 @@ def main():
 
             summary = load_stage_summary(stage_dir)
             final_ckpt = os.path.join(stage_dir, "checkpoints", "model_final.pth")
-            if summary is not None and os.path.exists(final_ckpt):
+            already_passed = bool(summary.get("passed_targets", True)) if summary is not None else False
+            if (
+                summary is not None
+                and os.path.exists(final_ckpt)
+                and (not stage_requires_target_pass(cfg_dict) or already_passed)
+            ):
                 print(f"\n⏭️ Stage {stage_idx + 1}/{len(time_blocks)} deja termine, on passe au suivant.")
                 stage_rows.append(
                     {
@@ -993,11 +1092,17 @@ def main():
                         "best_historical_max": summary.get("best_historical_max"),
                         "final_historical_mean": summary.get("final_historical_mean"),
                         "final_historical_max": summary.get("final_historical_max"),
+                        "passed_targets": already_passed,
                         "wall_seconds": 0.0,
                     }
                 )
                 completed_stage_models.append(load_best_stage_model(cfg_dict, stage_dir, device))
                 continue
+            if summary is not None and os.path.exists(final_ckpt) and stage_requires_target_pass(cfg_dict) and not already_passed:
+                print(
+                    f"\n🔁 Stage {stage_idx + 1}/{len(time_blocks)} present mais non valide "
+                    f"(passed_targets=false). Reprise du stage."
+                )
 
             teacher_model = completed_stage_models[-1] if completed_stage_models else None
 
@@ -1040,9 +1145,18 @@ def main():
                     "best_historical_max": metrics.get("best_historical_max"),
                     "final_historical_mean": metrics.get("final_historical_mean"),
                     "final_historical_max": metrics.get("final_historical_max"),
+                    "passed_targets": bool(metrics.get("passed_targets", False)),
                     "wall_seconds": float(metrics["wall_seconds"]),
                 }
             )
+            if stage_requires_target_pass(cfg_dict) and not bool(metrics.get("passed_targets", False)):
+                raise RuntimeError(
+                    f"Stage {stage_idx:02d} bloque: cibles non atteintes sur "
+                    f"[{t_start:.2f}, {t_end:.2f}] "
+                    f"(final={float(metrics['final_score']):.3%}, "
+                    f"hist_mean={metrics.get('final_historical_mean')}, "
+                    f"hist_max={metrics.get('final_historical_max')})."
+                )
             completed_stage_models.append(load_best_stage_model(cfg_dict, stage_dir, device))
 
         write_stage_manifest(run_dir, stage_rows)
