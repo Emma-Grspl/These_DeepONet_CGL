@@ -1073,7 +1073,7 @@ def main():
 
             summary = load_stage_summary(stage_dir)
             final_ckpt = os.path.join(stage_dir, "checkpoints", "model_final.pth")
-            already_passed = bool(summary.get("passed_targets", True)) if summary is not None else False
+            already_passed = bool(summary.get("passed_targets", False)) if summary is not None else False
             if (
                 summary is not None
                 and os.path.exists(final_ckpt)
