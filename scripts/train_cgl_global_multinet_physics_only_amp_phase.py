@@ -259,6 +259,14 @@ def internal_curriculum_enabled(cfg_dict):
     return bool(internal_curriculum_cfg(cfg_dict).get("enabled", False))
 
 
+def internal_curriculum_promote_fraction_best(cfg_dict):
+    return bool(internal_curriculum_cfg(cfg_dict).get("promote_fraction_best", False))
+
+
+def internal_curriculum_rollback_to_best_fraction(cfg_dict):
+    return bool(internal_curriculum_cfg(cfg_dict).get("rollback_to_best_fraction", False))
+
+
 def internal_curriculum_fractions(cfg_dict):
     cur_cfg = internal_curriculum_cfg(cfg_dict)
     fractions = [float(v) for v in cur_cfg.get("fractions", [1.0])]
@@ -266,6 +274,10 @@ def internal_curriculum_fractions(cfg_dict):
     if not fractions or fractions[-1] < 1.0:
         fractions.append(1.0)
     return fractions
+
+
+def internal_curriculum_fraction_ckpt_name(phase_idx):
+    return f"model_best_fraction_{int(phase_idx) + 1:02d}.pth"
 
 
 def internal_curriculum_target_scale(cfg_dict, phase_idx):
@@ -347,11 +359,11 @@ def historical_selection_weights(cfg_dict):
 
 def historical_selection_score(cfg_dict, hist_stats):
     metric_name = historical_selection_metric(cfg_dict)
-    if metric_name == "historical_max_rel_l2":
+    if metric_name in {"historical_max_rel_l2", "max_rel_l2"}:
         return float(hist_stats["max_rel_l2"])
-    if metric_name == "historical_final_rel_l2":
+    if metric_name in {"historical_final_rel_l2", "final_rel_l2"}:
         return float(hist_stats["final_rel_l2"])
-    if metric_name in {"historical_tail_guard", "historical_weighted_tail"}:
+    if metric_name in {"historical_tail_guard", "historical_weighted_tail", "tail_guard", "weighted_tail"}:
         weights = historical_selection_weights(cfg_dict)
         return (
             weights["max"] * float(hist_stats["max_rel_l2"])
@@ -540,27 +552,33 @@ def compute_stage_loss_components(model, cfg_dict, t_start, t_end, device, teach
     }
 
 
-def save_stage_checkpoint(model, optimizer, iteration, best_score, stage_dir, name):
+def save_stage_checkpoint(model, optimizer, iteration, best_score, stage_dir, name, extra_state=None):
     ckpt_dir = os.path.join(stage_dir, "checkpoints")
     os.makedirs(ckpt_dir, exist_ok=True)
-    atomic_torch_save(
-        {
-            "model_state": model.state_dict(),
-            "optimizer_state": optimizer.state_dict(),
-            "iteration": int(iteration),
-            "best_score": float(best_score),
-        },
-        os.path.join(ckpt_dir, name),
-    )
+    payload = {
+        "model_state": model.state_dict(),
+        "optimizer_state": optimizer.state_dict(),
+        "iteration": int(iteration),
+        "best_score": float(best_score),
+    }
+    if extra_state:
+        payload.update(dict(extra_state))
+    atomic_torch_save(payload, os.path.join(ckpt_dir, name))
+
+
+def restore_stage_checkpoint(path, model, optimizer, device):
+    ckpt = torch.load(path, map_location=device)
+    model.load_state_dict(ckpt["model_state"], strict=True)
+    if optimizer is not None and "optimizer_state" in ckpt:
+        optimizer.load_state_dict(ckpt["optimizer_state"])
+    return ckpt
 
 
 def load_stage_checkpoint_if_available(model, optimizer, stage_dir, device):
     ckpt_path = os.path.join(stage_dir, "checkpoints", "model_latest.pth")
     if not os.path.exists(ckpt_path):
         return 0, float("inf")
-    ckpt = torch.load(ckpt_path, map_location=device)
-    model.load_state_dict(ckpt["model_state"], strict=True)
-    optimizer.load_state_dict(ckpt["optimizer_state"])
+    ckpt = restore_stage_checkpoint(ckpt_path, model, optimizer, device)
     return int(ckpt.get("iteration", 0)), float(ckpt.get("best_score", float("inf")))
 
 
@@ -636,7 +654,11 @@ def train_one_stage(
     iteration = start_iter
     prefix_models = [] if prefix_models is None else list(prefix_models)
     curriculum_enabled = internal_curriculum_enabled(cfg_dict)
+    promote_fraction_best = curriculum_enabled and internal_curriculum_promote_fraction_best(cfg_dict)
+    rollback_to_best_fraction = curriculum_enabled and internal_curriculum_rollback_to_best_fraction(cfg_dict)
     last_curriculum_phase_idx = None
+    fraction_best_scores = {}
+    fraction_best_records = {}
 
     for param_group in optimizer.param_groups:
         param_group["lr"] = base_lr
@@ -661,11 +683,36 @@ def train_one_stage(
         active_target = current_target * internal_curriculum_target_scale(cfg_dict, curriculum_phase_idx)
         can_select_best = (not curriculum_enabled) or (active_t_end >= float(t_end) - 1.0e-10)
         if curriculum_enabled and curriculum_phase_idx != last_curriculum_phase_idx:
+            previous_phase_idx = last_curriculum_phase_idx
             print(
                 f"    🧭 Curriculum interne phase {curriculum_phase_idx + 1}/"
                 f"{len(internal_curriculum_fractions(cfg_dict))} | "
                 f"fraction={curriculum_fraction:.2f} | t_end_actif={active_t_end:.4f}"
             )
+            if (
+                rollback_to_best_fraction
+                and previous_phase_idx is not None
+                and curriculum_phase_idx > previous_phase_idx
+            ):
+                fraction_ckpt_path = os.path.join(
+                    stage_dir,
+                    "checkpoints",
+                    internal_curriculum_fraction_ckpt_name(previous_phase_idx),
+                )
+                if os.path.exists(fraction_ckpt_path):
+                    ckpt = restore_stage_checkpoint(fraction_ckpt_path, model, optimizer, device)
+                    save_stage_checkpoint(
+                        model,
+                        optimizer,
+                        int(ckpt.get("iteration", iteration - 1)),
+                        best_score,
+                        stage_dir,
+                        "model_latest.pth",
+                    )
+                    print(
+                        f"    ↩️ Reprise depuis le meilleur checkpoint de la fraction "
+                        f"{previous_phase_idx + 1} avant ouverture de la fraction {curriculum_phase_idx + 1}."
+                    )
             last_curriculum_phase_idx = curriculum_phase_idx
 
         model.train()
@@ -742,6 +789,55 @@ def train_one_stage(
                 print(f"    📏 stage_score(t={active_t_end:.2f})={final_score:.3%}")
             save_stage_checkpoint(model, optimizer, iteration, best_score, stage_dir, "model_latest.pth")
 
+            local_target_ok, hist_target_ok, hist_max_ok = stage_targets_met(
+                cfg_dict,
+                can_select_best,
+                final_score,
+                hist_stats,
+                active_target,
+                hist_target,
+                hist_max_target,
+            )
+
+            if promote_fraction_best:
+                fraction_score = float(fraction_best_scores.get(curriculum_phase_idx, float("inf")))
+                if selection_score < fraction_score or not np.isfinite(fraction_score):
+                    fraction_best_scores[curriculum_phase_idx] = float(selection_score)
+                    fraction_best_records[curriculum_phase_idx] = {
+                        "phase_idx": int(curriculum_phase_idx),
+                        "fraction": float(curriculum_fraction),
+                        "active_t_end": float(active_t_end),
+                        "iteration": int(iteration),
+                        "selection_score": float(selection_score),
+                        "stage_score": float(final_score),
+                        "historical_mean_rel_l2": None if hist_stats is None else float(hist_stats["mean_rel_l2"]),
+                        "historical_max_rel_l2": None if hist_stats is None else float(hist_stats["max_rel_l2"]),
+                        "historical_final_rel_l2": None if hist_stats is None else float(hist_stats["final_rel_l2"]),
+                        "local_target_ok": bool(local_target_ok),
+                        "hist_target_ok": bool(hist_target_ok),
+                        "hist_max_ok": bool(hist_max_ok),
+                        "checkpoint": internal_curriculum_fraction_ckpt_name(curriculum_phase_idx),
+                    }
+                    save_stage_checkpoint(
+                        model,
+                        optimizer,
+                        iteration,
+                        selection_score,
+                        stage_dir,
+                        internal_curriculum_fraction_ckpt_name(curriculum_phase_idx),
+                        extra_state={
+                            "curriculum_phase_idx": int(curriculum_phase_idx),
+                            "curriculum_fraction": float(curriculum_fraction),
+                            "active_t_end": float(active_t_end),
+                            "selection_score": float(selection_score),
+                            "stage_score": float(final_score),
+                        },
+                    )
+                    print(
+                        f"    ✅ Meilleur checkpoint fraction {curriculum_phase_idx + 1} "
+                        f"sauvegarde : score={selection_score:.3%}"
+                    )
+
             improved = can_select_best and selection_score < best_score
             if improved or not np.isfinite(best_score):
                 if can_select_best:
@@ -762,20 +858,12 @@ def train_one_stage(
                     plateau_count = 0
                     print(f"    ✅ Nouveau meilleur score de selection : {best_score:.3%}")
                 else:
-                    print("    ℹ️ Audit curriculum hors intervalle final : checkpoint non eligible comme best final.")
+                    if not promote_fraction_best:
+                        print("    ℹ️ Audit curriculum hors intervalle final : checkpoint non eligible comme best final.")
             else:
                 if can_select_best:
                     plateau_count += 1
 
-            local_target_ok, hist_target_ok, hist_max_ok = stage_targets_met(
-                cfg_dict,
-                can_select_best,
-                final_score,
-                hist_stats,
-                active_target,
-                hist_target,
-                hist_max_target,
-            )
             if local_target_ok and hist_target_ok and hist_max_ok:
                 if hist_stats is not None:
                     print(
@@ -857,6 +945,9 @@ def train_one_stage(
                 "final_hist_mean_target_ok": bool(final_hist_mean_ok),
                 "final_hist_max_target_ok": bool(final_hist_max_ok),
                 "best_metrics": best_metrics,
+                "fraction_best_records": [
+                    fraction_best_records[idx] for idx in sorted(fraction_best_records.keys())
+                ],
             },
             handle,
             indent=2,
