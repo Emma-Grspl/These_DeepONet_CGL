@@ -1029,6 +1029,75 @@ def build_overlap_entries(state_bank, time_blocks, stage_idx):
     return list(unique.values()), sorted(set(neighbors))
 
 
+
+def local_causal_bootstrap_cfg(cfg_dict):
+    return dict(cfg_dict.get("local_causal_bootstrap", {}))
+
+
+def local_causal_bootstrap_enabled(cfg_dict):
+    return bool(local_causal_bootstrap_cfg(cfg_dict).get("enabled", False))
+
+
+def causal_pass0_block_entries(state_bank, time_blocks, stage_idx, cfg_dict):
+    """
+    Pass 0 causal, physics-only.
+
+    The local model already imposes u(x, tau=0)=u_branch(x) in hard form.
+    This helper controls which branch state is used during pass 0.
+
+    stage 0:
+        only analytical initial condition at t=0.
+    stage i>0:
+        only entries in the left overlap with the already-trained stage i-1.
+    """
+    if not local_causal_bootstrap_enabled(cfg_dict):
+        t_start, t_end = time_blocks[stage_idx]
+        return select_bank_entries_for_block(state_bank, t_start, t_end)
+
+    if int(stage_idx) == 0:
+        selected = [
+            entry for entry in state_bank
+            if abs(float(entry["t_start"]) - float(time_blocks[0][0])) <= 1.0e-10
+        ]
+        return selected if selected else state_bank[:1]
+
+    left_overlap = compute_overlap_interval(time_blocks[stage_idx], time_blocks[stage_idx - 1])
+    if left_overlap is None:
+        t_start, t_end = time_blocks[stage_idx]
+        return select_bank_entries_for_block(state_bank, t_start, t_end)
+
+    selected = select_bank_entries_for_block(state_bank, left_overlap[0], left_overlap[1])
+    if selected:
+        return selected
+
+    t_start, _ = time_blocks[stage_idx]
+    closest = min(state_bank, key=lambda row: abs(float(row["t_start"]) - float(t_start)))
+    return [closest]
+
+
+def causal_pass0_overlap_entries(state_bank, time_blocks, stage_idx, cfg_dict):
+    """
+    During pass 0, use only the left trained neighbor as teacher.
+    This avoids matching an untrained right neighbor.
+    """
+    if not local_causal_bootstrap_enabled(cfg_dict):
+        return build_overlap_entries(state_bank, time_blocks, stage_idx)
+
+    if int(stage_idx) <= 0:
+        return [], []
+
+    left_overlap = compute_overlap_interval(time_blocks[stage_idx], time_blocks[stage_idx - 1])
+    if left_overlap is None:
+        return [], []
+
+    entries = select_bank_entries_for_block(state_bank, left_overlap[0], left_overlap[1])
+    unique = {}
+    for entry in entries:
+        unique[round(float(entry["t_start"]), 8)] = entry
+
+    return list(unique.values()), [int(stage_idx) - 1]
+
+
 def train_one_stage(
     model,
     optimizer,
@@ -1709,8 +1778,12 @@ def main():
             for stage_idx in range(stage_start_idx, len(time_blocks)):
                 t_start, t_end = time_blocks[stage_idx]
                 stage_dir = os.path.join(run_dir, stage_name(stage_idx, t_start, t_end))
-                block_entries = select_bank_entries_for_block(state_bank, t_start, t_end)
-                overlap_entries, neighbor_indices = build_overlap_entries(state_bank, time_blocks, stage_idx)
+                if pass_idx == 0 and local_causal_bootstrap_enabled(cfg_dict):
+                    block_entries = causal_pass0_block_entries(state_bank, time_blocks, stage_idx, cfg_dict)
+                    overlap_entries, neighbor_indices = causal_pass0_overlap_entries(state_bank, time_blocks, stage_idx, cfg_dict)
+                else:
+                    block_entries = select_bank_entries_for_block(state_bank, t_start, t_end)
+                    overlap_entries, neighbor_indices = build_overlap_entries(state_bank, time_blocks, stage_idx)
                 teacher_models = []
                 for neighbor_idx in neighbor_indices:
                     teacher = CGL_LocalPhysics_DeepONet_AmpPhase(cfg_dict).to(device)
